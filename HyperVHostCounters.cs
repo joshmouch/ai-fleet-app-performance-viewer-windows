@@ -68,8 +68,8 @@ internal sealed class HyperVHostCounters : IDisposable
 
             using var document = JsonDocument.Parse(Marshal.PtrToStringUni(result));
             // A shape HCS did not promise is "topology unavailable" (the host-counters fallback), never an unhandled exception.
-            if (!document.RootElement.TryGetProperty("Properties", out var properties) || properties.ValueKind != JsonValueKind.Array
-                || properties.GetArrayLength() == 0 || !properties[0].TryGetProperty("LogicalProcessors", out var topology)
+            if (!document.RootElement.TryGetProperty("Properties", out var propertyList) || propertyList.ValueKind != JsonValueKind.Array
+                || propertyList.GetArrayLength() == 0 || !propertyList[0].TryGetProperty("LogicalProcessors", out var topology)
                 || topology.ValueKind != JsonValueKind.Array)
                 throw new InvalidOperationException("Hyper-V returned an unexpected processor topology.");
             var roots = new Dictionary<int, int>();
