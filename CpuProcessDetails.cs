@@ -1,34 +1,31 @@
 using System;
-using System.Collections.Generic;
-using System.ComponentModel;
 using System.Diagnostics;
 using System.Drawing;
 using System.Linq;
-using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 
-internal sealed record CpuProcessRow(int Pid, string Process, double Cores);
-internal sealed record CpuProcessSample(int LogicalProcessors, double Seconds, CpuProcessRow[] Rows);
-
 internal sealed class CpuProcessDetails : Panel
 {
-    private const int TopRows = 50;
-    private readonly ComboBox machine = new() { DropDownStyle = ComboBoxStyle.DropDownList, AccessibleName = "Machine" };
+    private readonly CheckedListBox targets = new()
+    {
+        CheckOnClick = true, Dock = DockStyle.Fill, IntegralHeight = false, AccessibleName = "Expand guest CPU"
+    };
+    private readonly ComboBox ranking = new() { DropDownStyle = ComboBoxStyle.DropDownList, AccessibleName = "CPU ranking" };
+    private readonly NumericUpDown limit = new() { Minimum = 1, Maximum = 50, Value = 10, AccessibleName = "Number of top processes" };
     private readonly Label status = new() { AutoEllipsis = true };
     private readonly ListView table = new() { View = View.Details, FullRowSelect = true, Dock = DockStyle.Fill };
     private readonly Button close = new() { Text = "Close" };
     private readonly Func<int> interval;
     private CancellationTokenSource lifetime;
     private CancellationTokenSource sample;
-    private string inventoryError;
+    private CpuExpansionTarget[] selected = Array.Empty<CpuExpansionTarget>();
+    private ClusterCpuSample latest;
+    private bool updatingTargets;
 
     public bool IsOpen => lifetime != null;
     public event EventHandler CloseRequested;
-
-    [DllImport("kernel32.dll")]
-    private static extern uint GetActiveProcessorCount(ushort groupNumber);
 
     public CpuProcessDetails(Func<int> interval)
     {
@@ -36,25 +33,43 @@ internal sealed class CpuProcessDetails : Panel
         AccessibleName = "CPU processes";
         Visible = false;
         Size = new Size(600, 300);
-        var header = new Panel { Dock = DockStyle.Top, Height = 59, Width = Width };
+        var header = new Panel { Dock = DockStyle.Top, Height = 55, Width = Width };
         var title = new Label { Text = "CPU processes", AutoSize = true, Location = new Point(8, 10) };
-        machine.SetBounds(110, 5, 255, 25);
-        machine.Items.Add(Environment.MachineName + " (Windows host)");
-        machine.SelectedIndex = 0;
+        ranking.SetBounds(110, 5, 128, 25);
+        ranking.Items.AddRange(new object[] { "Top per machine", "Merged top" });
+        ranking.SelectedIndex = 0;
+        var topLabel = new Label { Text = "Top", AutoSize = true, Location = new Point(250, 10) };
+        limit.SetBounds(280, 5, 52, 25);
         close.SetBounds(header.Width - 72, 2, 64, 26);
         close.Anchor = AnchorStyles.Top | AnchorStyles.Right;
         close.Click += (_, _) => CloseRequested?.Invoke(this, EventArgs.Empty);
-        status.SetBounds(8, 34, Width - 16, 21);
+        status.SetBounds(8, 33, Width - 16, 20);
         status.Anchor = AnchorStyles.Left | AnchorStyles.Top | AnchorStyles.Right;
-        header.Controls.AddRange(new Control[] { title, machine, close, status });
-        var name = table.Columns.Add("Process", 235);
-        table.Columns.Add("PID", 85, HorizontalAlignment.Right);
-        table.Columns.Add("CPU %", 95, HorizontalAlignment.Right);
-        table.Columns.Add("Cores used", 105, HorizontalAlignment.Right);
-        table.SizeChanged += (_, _) => name.Width = Math.Max(160, table.ClientSize.Width - 310);
-        Controls.Add(table);
+        header.Controls.AddRange(new Control[] { title, ranking, topLabel, limit, close, status });
+
+        var body = new Panel { Dock = DockStyle.Fill };
+        var sidebar = new Panel { Dock = DockStyle.Left, Width = 160, Padding = new Padding(0, 0, 6, 0) };
+        var sidebarTitle = new Label { Text = "Expand guest CPU", Dock = DockStyle.Top, Height = 22, Padding = new Padding(5, 2, 0, 0) };
+        sidebar.Controls.Add(targets);
+        sidebar.Controls.Add(sidebarTitle);
+        var name = table.Columns.Add("Process", 200);
+        table.Columns.Add("Machine", 130);
+        table.Columns.Add("PID", 58, HorizontalAlignment.Right);
+        table.Columns.Add("CPU %", 66, HorizontalAlignment.Right);
+        table.Columns.Add("Cores used", 84, HorizontalAlignment.Right);
+        table.SizeChanged += (_, _) => name.Width = Math.Max(70, table.ClientSize.Width - 355);
+        body.Controls.Add(table);
+        body.Controls.Add(sidebar);
+        Controls.Add(body);
         Controls.Add(header);
-        machine.SelectedIndexChanged += (_, _) => StartSampling();
+
+        ranking.SelectedIndexChanged += (_, _) => Render();
+        limit.ValueChanged += (_, _) => Render();
+        targets.ItemCheck += (_, _) =>
+        {
+            if (!updatingTargets && IsOpen)
+                BeginInvoke((Action)StartSampling);
+        };
     }
 
     public void SetOpen(bool open)
@@ -71,50 +86,65 @@ internal sealed class CpuProcessDetails : Panel
         }
 
         lifetime = new CancellationTokenSource();
-        inventoryError = null;
         StartSampling();
-        _ = RefreshMachines(lifetime.Token);
+        _ = RefreshTargets(lifetime.Token);
     }
 
-    private async Task RefreshMachines(CancellationToken cancellation)
+    private async Task RefreshTargets(CancellationToken cancellation)
     {
         try
         {
-            var guests = await VmDiskIo.ReadRunningGuests(cancellation);
-            if (cancellation.IsCancellationRequested || machine.Items.Cast<string>().Skip(1).SequenceEqual(guests))
-                return;
-            var selected = (string)machine.SelectedItem;
-            while (machine.Items.Count > 1)
-                machine.Items.RemoveAt(machine.Items.Count - 1);
-            machine.Items.AddRange(guests);
-            machine.SelectedIndex = Math.Max(0, machine.Items.IndexOf(selected));
+            while (!cancellation.IsCancellationRequested)
+            {
+                var available = await Task.Run(CpuProcessSampler.ReadTargets, cancellation);
+                cancellation.ThrowIfCancellationRequested();
+                if (!targets.Items.Cast<CpuExpansionTarget>().SequenceEqual(available))
+                {
+                    var checkedTargets = targets.CheckedItems.Cast<CpuExpansionTarget>().ToHashSet();
+                    updatingTargets = true;
+                    targets.BeginUpdate();
+                    try
+                    {
+                        targets.Items.Clear();
+                        foreach (var target in available)
+                            targets.Items.Add(target, checkedTargets.Contains(target));
+                    }
+                    finally
+                    {
+                        targets.EndUpdate();
+                        updatingTargets = false;
+                    }
+                    StartSampling();
+                }
+                await Task.Delay(TimeSpan.FromSeconds(15), cancellation);
+            }
         }
-        catch (Exception)
-        {
-            if (!cancellation.IsCancellationRequested)
-                inventoryError = "Hyper-V guest list unavailable";
-        }
+        catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { }
     }
 
     public void ApplyColors(Color background, Color foreground, Color card)
     {
-        BackColor = close.BackColor = card;
+        BackColor = close.BackColor = ranking.BackColor = limit.BackColor = card;
         ForeColor = foreground;
-        table.BackColor = background;
-        machine.BackColor = card;
-        table.ForeColor = machine.ForeColor = foreground;
+        table.BackColor = targets.BackColor = background;
+        table.ForeColor = targets.ForeColor = ranking.ForeColor = limit.ForeColor = foreground;
     }
 
     private async void StartSampling()
     {
-        if (!IsOpen || machine.SelectedIndex < 0)
+        if (!IsOpen)
             return;
+        var requested = targets.CheckedItems.Cast<CpuExpansionTarget>().ToArray();
+        if (sample != null && !sample.IsCancellationRequested && selected.SequenceEqual(requested))
+            return;
+        selected = requested;
         sample?.Cancel();
         using var current = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
         sample = current;
         var cancellation = current.Token;
-        string guest = machine.SelectedIndex == 0 ? null : (string)machine.SelectedItem;
+        latest = null;
         table.Items.Clear();
+        table.Groups.Clear();
         status.Text = "Collecting CPU usage…";
         try
         {
@@ -123,15 +153,16 @@ internal sealed class CpuProcessDetails : Panel
                 long start = Stopwatch.GetTimestamp();
                 try
                 {
-                    var reading = guest == null
-                        ? await Task.Run(() => ReadHost(cancellation), cancellation)
-                        : await VmDiskIo.SampleCpu(guest, cancellation);
+                    var reading = await CpuProcessSampler.ReadCluster(requested, cancellation);
                     cancellation.ThrowIfCancellationRequested();
-                    UpdateTable(reading, guest);
+                    latest = reading;
+                    Render();
                 }
                 catch (Exception e) when (!cancellation.IsCancellationRequested)
                 {
+                    latest = null;
                     table.Items.Clear();
+                    table.Groups.Clear();
                     status.Text = e.Message;
                 }
                 await Task.Delay(TimeSpan.FromSeconds(Math.Max(0.25,
@@ -146,53 +177,51 @@ internal sealed class CpuProcessDetails : Panel
         }
     }
 
-    private void UpdateTable(CpuProcessSample reading, string guest)
+    private void Render()
     {
-        string capacity = guest == null ? "logical CPUs" : "vCPUs";
-        status.Text = $"{reading.Seconds:0.0} s sample  |  {reading.LogicalProcessors} {capacity}  |  CPU % is share of machine capacity";
-        if (inventoryError != null)
-            status.Text += "  |  " + inventoryError;
+        if (latest == null)
+            return;
+        var host = latest.Host;
+        var machines = latest.Guests.Prepend(new CpuMachineProcesses(Environment.MachineName, host.Rows));
+        int maximum = (int)limit.Value;
+        bool group = ranking.SelectedIndex == 0 && latest.Guests.Length > 0;
+        status.Text = $"{host.Seconds:0.0} s host sample  |  {host.LogicalProcessors} logical CPUs  |  CPU % of Windows host";
+        if (latest.Unexpanded.Length > 0)
+            status.Text += "  |  Host rows kept for " + string.Join(", ", latest.Unexpanded);
+
         table.BeginUpdate();
         try
         {
             table.Items.Clear();
-            table.Items.AddRange(reading.Rows.Select(row => new ListViewItem(new[] { row.Process,
-                row.Pid.ToString(), (100 * row.Cores / reading.LogicalProcessors).ToString("0.##"),
-                row.Cores.ToString("0.##") })).ToArray());
+            table.Groups.Clear();
+            table.ShowGroups = group;
+            if (group)
+            {
+                foreach (var machine in machines)
+                {
+                    string heading = machine.VmCores is double cores
+                        ? $"{machine.Name}  |  {100 * cores / host.LogicalProcessors:0.##}% host CPU"
+                        : machine.Name;
+                    var section = new ListViewGroup(heading);
+                    table.Groups.Add(section);
+                    table.Items.AddRange(machine.Rows.OrderByDescending(row => row.Cores).ThenBy(row => row.Pid)
+                        .Take(maximum).Select(row => NewRow(machine.Name, row, host.LogicalProcessors, section)).ToArray());
+                }
+            }
+            else
+            {
+                table.Items.AddRange(machines.SelectMany(machine => machine.Rows.Select(row => (machine.Name, Row: row)))
+                    .OrderByDescending(entry => entry.Row.Cores).ThenBy(entry => entry.Name, StringComparer.OrdinalIgnoreCase)
+                    .ThenBy(entry => entry.Row.Pid).Take(maximum)
+                    .Select(entry => NewRow(entry.Name, entry.Row, host.LogicalProcessors)).ToArray());
+            }
         }
         finally { table.EndUpdate(); }
     }
 
-    private static async Task<CpuProcessSample> ReadHost(CancellationToken cancellation)
-    {
-        var before = ReadHostTimes();
-        long start = Stopwatch.GetTimestamp();
-        await Task.Delay(1000, cancellation).ConfigureAwait(false);
-        var after = ReadHostTimes();
-        double seconds = Stopwatch.GetElapsedTime(start).TotalSeconds;
-        var rows = after.Where(entry => before.TryGetValue(entry.Key, out var previous) && entry.Value.Time > previous.Time)
-            .Select(entry => new CpuProcessRow(entry.Key.Pid, entry.Value.Name,
-                (entry.Value.Time - before[entry.Key].Time).TotalSeconds / seconds))
-            .OrderByDescending(row => row.Cores).ThenBy(row => row.Pid).Take(TopRows).ToArray();
-        return new CpuProcessSample(Math.Max(1, (int)GetActiveProcessorCount(ushort.MaxValue)), seconds, rows);
-    }
-
-    private static Dictionary<(int Pid, long Started), (string Name, TimeSpan Time)> ReadHostTimes()
-    {
-        var result = new Dictionary<(int, long), (string, TimeSpan)>();
-        foreach (var process in Process.GetProcesses())
-            using (process)
-            {
-                try
-                {
-                    if (process.Id != 0)
-                        result[(process.Id, process.StartTime.ToUniversalTime().Ticks)] = (process.ProcessName, process.TotalProcessorTime);
-                }
-                catch (InvalidOperationException) { }
-                catch (Win32Exception) { }
-            }
-        return result;
-    }
+    private static ListViewItem NewRow(string machine, CpuProcessRow row, int processors, ListViewGroup group = null) =>
+        new(new[] { row.Process, machine, row.Pid.ToString(),
+            (100 * row.Cores / processors).ToString("0.##"), row.Cores.ToString("0.##") }, group);
 
     protected override void Dispose(bool disposing)
     {

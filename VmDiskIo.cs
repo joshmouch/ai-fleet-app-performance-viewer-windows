@@ -52,15 +52,6 @@ internal static class VmDiskIo
             }, StringComparer.OrdinalIgnoreCase);
     }
 
-    public static async Task<string[]> ReadRunningGuests(CancellationToken cancellation)
-    {
-        var guests = await ReadHyperV<string[]>("""
-            $ErrorActionPreference = 'Stop'
-            ConvertTo-Json -InputObject @(Get-VM | Where-Object State -eq Running | ForEach-Object Name) -Compress
-            """, cancellation).ConfigureAwait(false);
-        return guests.Where(IsGuestAddress).Order(StringComparer.OrdinalIgnoreCase).ToArray();
-    }
-
     private static async Task<T> ReadHyperV<T>(string script, CancellationToken cancellation)
     {
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
@@ -91,14 +82,13 @@ internal static class VmDiskIo
     }
 
     public static Task<CpuProcessSample> SampleCpu(string vmName, CancellationToken cancellation) =>
-        ReadGuest<CpuProcessSample>(vmName, "GuestCpu.py", "CPU", 12,
-            new[] { "/usr/bin/python3", "-I", "-" }, cancellation);
+        ReadGuest(vmName, "GuestCpu.sh", "CPU", 12, new[] { "/bin/sh", "-s" }, cancellation, CpuProcessSampler.ParseGuest);
 
-    private static bool IsGuestAddress(string name) =>
+    internal static bool IsGuestAddress(string name) =>
         name != null && Regex.IsMatch(name, @"\A[a-zA-Z0-9][a-zA-Z0-9-]{0,62}\z");
 
     private static async Task<T> ReadGuest<T>(string vmName, string script, string label, int seconds,
-        string[] command, CancellationToken cancellation) where T : class
+        string[] command, CancellationToken cancellation, Func<string, T> parse = null) where T : class
     {
         if (!IsGuestAddress(vmName))
             throw new InvalidOperationException("This VM does not have a supported guest address.");
@@ -109,9 +99,7 @@ internal static class VmDiskIo
         if (!File.Exists(key))
             throw new InvalidOperationException("The cluster SSH key is unavailable on this host.");
 
-        using var resource = typeof(VmDiskIo).Assembly.GetManifestResourceStream(script);
-        using var reader = new StreamReader(resource, Encoding.UTF8);
-        string code = await reader.ReadToEndAsync(cancellation).ConfigureAwait(false);
+        string code = await ReadScript(script, cancellation).ConfigureAwait(false);
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
         deadline.CancelAfter(TimeSpan.FromSeconds(seconds));
         CommandResult result;
@@ -121,7 +109,7 @@ internal static class VmDiskIo
             {
                 "-T", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", "-o", "IdentitiesOnly=yes",
                 "-o", "ConnectTimeout=5", "-i", key, "fleet@" + vmName + ".tail8400d9.ts.net"
-            }.Concat(command), code.Replace("\r\n", "\n"), deadline.Token).ConfigureAwait(false);
+            }.Concat(command), code, deadline.Token).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (!cancellation.IsCancellationRequested)
         {
@@ -134,20 +122,28 @@ internal static class VmDiskIo
                 (result.ExitCode == 255 ? "Could not connect to the VM with the configured cluster SSH identity."
                     : $"The VM could not run the guest {label} sampler."));
         }
-        return JsonSerializer.Deserialize<T>(result.Output)
+        return (parse == null ? JsonSerializer.Deserialize<T>(result.Output) : parse(result.Output))
             ?? throw new InvalidOperationException($"The VM returned no guest {label} sample.");
     }
 
-    private sealed record CommandResult(int ExitCode, string Output, string Error);
+    internal static async Task<string> ReadScript(string script, CancellationToken cancellation)
+    {
+        using var resource = typeof(VmDiskIo).Assembly.GetManifestResourceStream(script);
+        using var reader = new StreamReader(resource, Encoding.UTF8);
+        return (await reader.ReadToEndAsync(cancellation).ConfigureAwait(false)).Replace("\r\n", "\n");
+    }
 
-    private static async Task<CommandResult> Run(string executable, IEnumerable<string> arguments, string input,
-        CancellationToken cancellation)
+    internal sealed record CommandResult(int ExitCode, string Output, string Error);
+
+    internal static async Task<CommandResult> Run(string executable, IEnumerable<string> arguments, string input,
+        CancellationToken cancellation, Encoding outputEncoding = null)
     {
         cancellation.ThrowIfCancellationRequested();
         var start = new ProcessStartInfo(executable)
         {
             CreateNoWindow = true, UseShellExecute = false, RedirectStandardOutput = true, RedirectStandardError = true,
-            RedirectStandardInput = input != null, StandardOutputEncoding = Encoding.UTF8, StandardErrorEncoding = Encoding.UTF8
+            RedirectStandardInput = input != null, StandardOutputEncoding = outputEncoding ?? Encoding.UTF8,
+            StandardErrorEncoding = Encoding.UTF8
         };
         if (input != null)
             start.StandardInputEncoding = new UTF8Encoding(false);

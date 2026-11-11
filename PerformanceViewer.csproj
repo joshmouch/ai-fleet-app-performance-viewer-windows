@@ -17,8 +17,9 @@
     <Compile Include="DiskIoDetails.cs" />
     <Compile Include="VmDiskIo.cs" />
     <Compile Include="CpuProcessDetails.cs" />
+    <Compile Include="CpuProcessSampler.cs" />
     <EmbeddedResource Include="GuestDiskIo.py" LogicalName="GuestDiskIo.py" />
-    <EmbeddedResource Include="GuestCpu.py" LogicalName="GuestCpu.py" />
+    <EmbeddedResource Include="GuestCpu.sh" LogicalName="GuestCpu.sh" />
     <PackageReference Include="Microsoft.Diagnostics.Tracing.TraceEvent" Version="4.0.0" />
     <PackageReference Include="System.Management" Version="10.0.0" />
   </ItemGroup>
