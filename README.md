@@ -4,6 +4,7 @@ A Windows desktop viewer for CPU and disk activity on an AI Fleet cluster host. 
 
 - Use **Guests**, **Group by machine**, and **Top** above the charts to control CPU and disk details. Grouping separates CPU tiles, disks and VHDX cards, and ranked rows by machine. Clear it for one grid and one ranking per table.
 - In the CPU view, checked guests add virtual processor timelines. In **Show processes**, **Guest CPU %** is the process share of the guest's measured usage. **Host CPU %** is its estimated share of Windows CPU capacity and determines rank. WSL 2 distros share one guest CPU budget.
+- With guests checked, Hyper-V counters split each host logical processor into Windows time and combined VM time. The overview also shows Hyper-V overhead. Guest virtual processor timelines show that guest's own processor usage. The host split includes all running VMs.
 - **Show disks** shows disks that meet the activity and transfer thresholds. Select a disk for process and path I/O. **VHDX files** adds the busiest virtual disk files on those disks.
 - For a checked Hyper-V VM with a matching VHDX and guest file I/O, the disk tables distribute the Windows bytes and operations across guest rows. **Guest MiB** shows guest file I/O, including cached I/O. The **Guest Processes** and **Guest Paths** tabs show the underlying guest sample for a selected VM disk.
 
