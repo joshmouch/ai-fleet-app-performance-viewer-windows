@@ -15,6 +15,8 @@
     <AssemblyName>AI Fleet Cluster Performance Viewer</AssemblyName>
   </PropertyGroup>
   <ItemGroup>
+    <!-- Supplies System.Windows.Automation and its Provider types for BandAutomation and AutomationInteropProvider in
+         RankedTable.cs; UseWPF is not set, since it would add implicit WPF usings and the XAML build for nothing. -->
     <FrameworkReference Include="Microsoft.WindowsDesktop.App.WPF" />
     <Compile Include="CpuTimelines.cs" />
     <Compile Include="HyperVHostCounters.cs" />

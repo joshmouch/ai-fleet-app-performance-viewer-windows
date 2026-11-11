@@ -107,7 +107,12 @@ internal static class CpuProcessSampler
         string.Equals(name, "vmmem", StringComparison.OrdinalIgnoreCase) ||
         string.Equals(name, "vmmem.exe", StringComparison.OrdinalIgnoreCase);
 
-    public static async Task<ClusterCpuSample> ReadCluster(CpuExpansionTarget[] targets, CancellationToken cancellation)
+    /// <summary>One cluster CPU sample. Runs on the thread pool, so its synchronous process starts, registry and WMI reads
+    /// never run on the caller's UI thread.</summary>
+    public static Task<ClusterCpuSample> ReadCluster(CpuExpansionTarget[] targets, CancellationToken cancellation) =>
+        Task.Run(() => ReadClusterOnPool(targets, cancellation), cancellation);
+
+    private static async Task<ClusterCpuSample> ReadClusterOnPool(CpuExpansionTarget[] targets, CancellationToken cancellation)
     {
         var selected = targets.Where(target => !target.IsWsl).Select(target => target.Name)
             .ToHashSet(StringComparer.OrdinalIgnoreCase);

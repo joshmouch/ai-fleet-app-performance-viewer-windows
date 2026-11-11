@@ -182,7 +182,7 @@ internal sealed class CpuProcessDetails : Panel
                 100 * row.Cores / host.LogicalProcessors, row.Cores))
             .Concat(latest.Guests.SelectMany(machine => machine.Rows.Select(row => new ProcessRow(machine.Name, row,
                 100 * row.AttributedCores / host.LogicalProcessors, row.AttributedCores)))).ToArray();
-        table.Render(rows.Where(row => RowFilter.Matches(filter, row.Process.Process, row.Machine, row.Process.Pid.ToString())),
+        table.Render(filter.Length == 0 ? rows : rows.Where(row => RowFilter.Matches(filter, row.Process.Process, row.Machine, row.Process.Pid.ToString())),
             row => row.Machine, groupByMachine, topRows, NewRow, bandWidth is int width
                 ? (width, row => row.Cores, rows.Sum(row => row.Cores ?? 0) + missing, "CPU") : null,
             (row, key) => key is ProcessIdentity process && process.Machine == row.Machine &&

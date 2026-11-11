@@ -24,7 +24,12 @@ internal sealed record GuestIoSample(string Device, int Seconds, GuestIoRow[] Ro
 
 internal static class VmDiskIo
 {
-    public static async Task<Dictionary<string, VmDiskOwners>> ReadInventory(CancellationToken cancellation,
+    /// <summary>The VM disk inventory. Runs on the thread pool, so its synchronous process start and WMI reads never run on
+    /// the caller's UI thread.</summary>
+    public static Task<Dictionary<string, VmDiskOwners>> ReadInventory(CancellationToken cancellation, VolumePathIndex paths) =>
+        Task.Run(() => ReadInventoryOnPool(cancellation, paths), cancellation);
+
+    private static async Task<Dictionary<string, VmDiskOwners>> ReadInventoryOnPool(CancellationToken cancellation,
         VolumePathIndex paths)
     {
         const string script = """
