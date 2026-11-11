@@ -115,8 +115,102 @@ internal static class VmDiskIo
             ?? throw new InvalidOperationException("WSL returned no guest disk sample.");
     }
 
-    public static Task<CpuProcessSample> SampleCpu(string vmName, CancellationToken cancellation) =>
-        ReadGuest(vmName, "GuestCpu.sh", "CPU", 12, new[] { "/bin/sh", "-s" }, cancellation, CpuProcessSampler.ParseGuest);
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, GuestCpuSession> CpuSessions =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>One long-lived windowless ssh per VM serves every CPU sample; a failed session is dropped and reopened.</summary>
+    public static async Task<CpuProcessSample> SampleCpu(string vmName, CancellationToken cancellation)
+    {
+        var target = GuestSshArguments(vmName);
+        var session = CpuSessions.GetOrAdd(vmName, _ => new GuestCpuSession());
+        try
+        {
+            string output = await session.Sample(target, await ReadScript("GuestCpu.sh", cancellation).ConfigureAwait(false),
+                TimeSpan.FromSeconds(12), cancellation).ConfigureAwait(false);
+            return CpuProcessSampler.ParseGuest(output)
+                ?? throw new InvalidOperationException("The VM returned no guest CPU sample.");
+        }
+        catch (Exception)
+        {
+            session.Close();
+            throw;
+        }
+    }
+
+    private sealed class GuestCpuSession
+    {
+        private readonly SemaphoreSlim gate = new(1, 1);
+        private Process process;
+
+        public void Close()
+        {
+            var old = process;
+            process = null;
+            try { if (old != null && !old.HasExited) old.Kill(entireProcessTree: true); }
+            catch (InvalidOperationException) { }
+            catch (System.ComponentModel.Win32Exception) { }
+            old?.Dispose();
+        }
+
+        public async Task<string> Sample(string[] target, string code, TimeSpan limit, CancellationToken cancellation)
+        {
+            await gate.WaitAsync(cancellation).ConfigureAwait(false);
+            try
+            {
+                using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
+                deadline.CancelAfter(limit);
+                using var registration = deadline.Token.Register(Close);
+                try
+                {
+                    if (process == null || process.HasExited)
+                        Open(target, code);
+                    var current = process;
+                    await current.StandardInput.WriteLineAsync("go".AsMemory(), deadline.Token).ConfigureAwait(false);
+                    await current.StandardInput.FlushAsync(deadline.Token).ConfigureAwait(false);
+                    var text = new StringBuilder();
+                    while (true)
+                    {
+                        string line = await current.StandardOutput.ReadLineAsync(deadline.Token).ConfigureAwait(false)
+                            ?? throw new InvalidOperationException("Could not connect to the VM with the configured cluster SSH identity.");
+                        if (line.StartsWith("__END__ ", StringComparison.Ordinal))
+                        {
+                            if (line != "__END__ 0")
+                                throw new InvalidOperationException("The VM could not run the guest CPU sampler.");
+                            return text.ToString();
+                        }
+                        text.Append(line).Append('\n');
+                    }
+                }
+                catch (OperationCanceledException) when (!cancellation.IsCancellationRequested)
+                {
+                    throw new InvalidOperationException("Guest CPU sampling did not finish.");
+                }
+                catch (IOException)
+                {
+                    throw new InvalidOperationException("The VM closed the guest CPU sampling connection.");
+                }
+            }
+            finally { gate.Release(); }
+        }
+
+        private void Open(string[] target, string code)
+        {
+            Close();
+            string encoded = Convert.ToBase64String(new UTF8Encoding(false).GetBytes(code));
+            var start = new ProcessStartInfo(SshExecutable)
+            {
+                CreateNoWindow = true, UseShellExecute = false, RedirectStandardInput = true, RedirectStandardOutput = true,
+                RedirectStandardError = true, StandardOutputEncoding = Encoding.UTF8, StandardErrorEncoding = Encoding.UTF8,
+                StandardInputEncoding = new UTF8Encoding(false)
+            };
+            foreach (string argument in target)
+                start.ArgumentList.Add(argument);
+            start.ArgumentList.Add("/bin/sh -c 'eval \"$(printf %s " + encoded + " | base64 -d)\"' sh loop");
+            process = Process.Start(start);
+            process.ErrorDataReceived += (_, _) => { };
+            process.BeginErrorReadLine();
+        }
+    }
 
     public static Task<string> ReadGuestCommands(string vmName, string[] pids, CancellationToken cancellation) =>
         ReadGuest(vmName, "GuestCommands.sh", "command line", 8,
@@ -145,8 +239,9 @@ internal static class VmDiskIo
     internal static bool IsGuestAddress(string name) =>
         name != null && Regex.IsMatch(name, @"\A[a-zA-Z0-9][a-zA-Z0-9-]{0,62}\z");
 
-    private static async Task<T> ReadGuest<T>(string vmName, string script, string label, int seconds,
-        string[] command, CancellationToken cancellation, Func<string, T> parse = null) where T : class
+    private static readonly string SshExecutable = System.IO.Path.Combine(Environment.SystemDirectory, "OpenSSH", "ssh.exe");
+
+    private static string[] GuestSshArguments(string vmName)
     {
         if (!IsGuestAddress(vmName))
             throw new InvalidOperationException("This VM does not have a supported guest address.");
@@ -160,17 +255,26 @@ internal static class VmDiskIo
         if (!File.Exists(key))
             throw new InvalidOperationException("The cluster SSH key is unavailable on this host.");
 
+        return new[]
+        {
+            "-T", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", "-o", "IdentitiesOnly=yes",
+            "-o", "ConnectTimeout=5", "-o", "ServerAliveInterval=10", "-o", "ServerAliveCountMax=3",
+            "-i", key, "fleet@" + vmName + "." + domain
+        };
+    }
+
+    private static async Task<T> ReadGuest<T>(string vmName, string script, string label, int seconds,
+        string[] command, CancellationToken cancellation, Func<string, T> parse = null) where T : class
+    {
+        var target = GuestSshArguments(vmName);
+
         string code = await ReadScript(script, cancellation).ConfigureAwait(false);
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
         deadline.CancelAfter(TimeSpan.FromSeconds(seconds));
         CommandResult result;
         try
         {
-            result = await Run(System.IO.Path.Combine(Environment.SystemDirectory, "OpenSSH", "ssh.exe"), new[]
-            {
-                "-T", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", "-o", "IdentitiesOnly=yes",
-                "-o", "ConnectTimeout=5", "-i", key, "fleet@" + vmName + "." + domain
-            }.Concat(command), code, deadline.Token).ConfigureAwait(false);
+            result = await Run(SshExecutable, target.Concat(command), code, deadline.Token).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (!cancellation.IsCancellationRequested)
         {
