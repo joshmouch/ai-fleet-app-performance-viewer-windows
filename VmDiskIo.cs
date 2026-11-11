@@ -130,7 +130,7 @@ internal static class VmDiskIo
             return CpuProcessSampler.ParseGuest(output)
                 ?? throw new InvalidOperationException("The VM returned no guest CPU sample.");
         }
-        catch (Exception)
+        catch (Exception) when (!cancellation.IsCancellationRequested)
         {
             session.Close();
             throw;
@@ -141,6 +141,7 @@ internal static class VmDiskIo
     {
         private readonly SemaphoreSlim gate = new(1, 1);
         private Process process;
+        private bool replyPending; // a caller stopped waiting; its reply is still on the wire
 
         public void Close()
         {
@@ -159,27 +160,24 @@ internal static class VmDiskIo
             {
                 using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
                 deadline.CancelAfter(limit);
-                using var registration = deadline.Token.Register(Close);
+                using var timeout = new CancellationTokenSource(limit);
+                using var registration = timeout.Token.Register(Close);
                 try
                 {
                     if (process == null || process.HasExited)
+                    {
                         Open(target, code);
+                        replyPending = false;
+                    }
                     var current = process;
+                    if (replyPending)
+                        await ReadReply(current, deadline.Token).ConfigureAwait(false);
+                    replyPending = true;
                     await current.StandardInput.WriteLineAsync("go".AsMemory(), deadline.Token).ConfigureAwait(false);
                     await current.StandardInput.FlushAsync(deadline.Token).ConfigureAwait(false);
-                    var text = new StringBuilder();
-                    while (true)
-                    {
-                        string line = await current.StandardOutput.ReadLineAsync(deadline.Token).ConfigureAwait(false)
-                            ?? throw new InvalidOperationException("Could not connect to the VM with the configured cluster SSH identity.");
-                        if (line.StartsWith("__END__ ", StringComparison.Ordinal))
-                        {
-                            if (line != "__END__ 0")
-                                throw new InvalidOperationException("The VM could not run the guest CPU sampler.");
-                            return text.ToString();
-                        }
-                        text.Append(line).Append('\n');
-                    }
+                    string reply = await ReadReply(current, deadline.Token).ConfigureAwait(false);
+                    replyPending = false;
+                    return reply;
                 }
                 catch (OperationCanceledException) when (!cancellation.IsCancellationRequested)
                 {
@@ -191,6 +189,23 @@ internal static class VmDiskIo
                 }
             }
             finally { gate.Release(); }
+        }
+
+        private static async Task<string> ReadReply(Process current, CancellationToken cancellation)
+        {
+            var text = new StringBuilder();
+            while (true)
+            {
+                string line = await current.StandardOutput.ReadLineAsync(cancellation).ConfigureAwait(false)
+                    ?? throw new InvalidOperationException("Could not connect to the VM with the configured cluster SSH identity.");
+                if (line.StartsWith("__END__ ", StringComparison.Ordinal))
+                {
+                    if (line != "__END__ 0")
+                        throw new InvalidOperationException("The VM could not run the guest CPU sampler.");
+                    return text.ToString();
+                }
+                text.Append(line).Append('\n');
+            }
         }
 
         private void Open(string[] target, string code)
