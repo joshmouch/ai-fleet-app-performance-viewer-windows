@@ -117,6 +117,7 @@ internal sealed class VolumeFileIo : IDisposable
     internal const int WindowSeconds = 60;
     private const int MaxPathsPerBucket = 4096;
     private const int MaxOpenFiles = 65536;
+    private const int MaxRequests = 65536;
     private static readonly System.Threading.SemaphoreSlim RundownGate = new(1);
     private readonly object lifecycle = new();
     private readonly object samples = new();
@@ -124,13 +125,15 @@ internal sealed class VolumeFileIo : IDisposable
     private Bucket currentBucket;
     private readonly Dictionary<int, string> processes = new();
     private readonly Dictionary<ulong, OpenFile> openFiles = new();
+    private readonly Queue<(ulong Key, OpenFile File)> fileOrder = new();
+    private readonly Dictionary<ulong, DiskRequest> requests = new();
+    private double nextRequestTrim;
     private volatile TraceScope scope;
     private long detailStarted;
     private long virtualStarted;
     private volatile bool disposed;
     private TraceEventSession session;
     private volatile string status = "Starting Windows file I/O trace...";
-    private volatile string rundownStatus;
     private volatile int eventsLost;
     private long started;
 
@@ -145,6 +148,7 @@ internal sealed class VolumeFileIo : IDisposable
         public volatile string Path = path;
     }
 
+    private readonly record struct DiskRequest(int Pid, int Thread, double Time, string Process);
     private readonly record struct DiskPathKey(int Disk, FileIoKey Process, OpenFile File);
 
     private sealed class Bucket(long second)
@@ -157,7 +161,7 @@ internal sealed class VolumeFileIo : IDisposable
     }
 
     public sealed record Snapshot(Dictionary<FileIoKey, FileIoTotals> Entries,
-        long DiskBytes, long NamedBytes, double Seconds, string Status, string RundownStatus, int EventsLost, int Omitted,
+        long DiskBytes, long NamedBytes, double Seconds, string Status, int EventsLost, int Omitted,
         Dictionary<FileIoKey, FileIoTotals> VirtualPaths = null);
     public sealed record VirtualSnapshot(VirtualDiskIo[] Entries, double Seconds, string Status, int EventsLost);
 
@@ -210,6 +214,7 @@ internal sealed class VolumeFileIo : IDisposable
                 ReapAbandonedSessions();
                 session = OpenSession(owner);
                 session.EnableKernelProvider(KernelTraceEventParser.Keywords.DiskIO |
+                    KernelTraceEventParser.Keywords.DiskIOInit | KernelTraceEventParser.Keywords.DiskFileIO |
                     KernelTraceEventParser.Keywords.Process | KernelTraceEventParser.Keywords.Thread);
                 try
                 {
@@ -232,9 +237,14 @@ internal sealed class VolumeFileIo : IDisposable
             source.Kernel.ProcessStop += e => processes.Remove(e.ProcessID);
             if (fileInfoAvailable)
                 source.Dynamic.All += RecordFileName;
+            source.Kernel.FileIOName += e => RememberFile(e.FileKey, e.FileName, 0);
+            source.Kernel.FileIOFileCreate += e => RememberFile(e.FileKey, e.FileName, 1);
+            source.Kernel.FileIOFileRundown += e => RememberFile(e.FileKey, e.FileName, 2);
+            source.Kernel.FileIOFileDelete += e => RememberFile(e.FileKey, e.FileName, 3);
+            source.Kernel.DiskIOReadInit += RecordRequest;
+            source.Kernel.DiskIOWriteInit += RecordRequest;
             source.Kernel.DiskIORead += e => RecordDisk(e, false, source);
             source.Kernel.DiskIOWrite += e => RecordDisk(e, true, source);
-            rundownStatus = fileInfoAvailable ? "Resolving names of already open files..." : "Windows filename rundown unavailable";
             System.Threading.Volatile.Write(ref started, Stopwatch.GetTimestamp());
             status = null;
             if (!disposed)
@@ -276,17 +286,13 @@ internal sealed class VolumeFileIo : IDisposable
         {
             if (disposed)
                 return;
-            // Stopping a kernel disk-file session causes Windows to broadcast open-file
-            // names to the live FileInfo subscriber. Keep disk completions flowing there.
+            // Stopping a kernel disk-file session broadcasts names of already open files.
+            // The long-running trace keeps receiving completions during that rundown.
             using var rundown = OpenSession(owner);
             rundown.EnableKernelProvider(KernelTraceEventParser.Keywords.DiskIO | KernelTraceEventParser.Keywords.DiskFileIO);
             rundown.Stop();
-            rundownStatus = null;
         }
-        catch (Exception)
-        {
-            rundownStatus = "Windows filename rundown unavailable";
-        }
+        catch (Exception) { }
         finally
         {
             RundownGate.Release();
@@ -332,34 +338,71 @@ internal sealed class VolumeFileIo : IDisposable
         int length = unchecked((ushort)Marshal.ReadInt16(e.DataStart, e.PointerSize));
         if (key == 0 || length > (e.EventDataLength - pathOffset) / sizeof(char))
             return;
-        var selection = scope;
-        var rawPath = new ReadOnlySpan<char>((byte*)e.DataStart + pathOffset, length).TrimEnd('\0');
+        var path = new ReadOnlySpan<char>((byte*)e.DataStart + pathOffset, length).TrimEnd('\0');
+        RememberFile(key, path, kind);
+    }
+
+    private void RememberFile(ulong key, ReadOnlySpan<char> path, int kind)
+    {
+        if (disposed || key == 0)
+            return;
         openFiles.TryGetValue(key, out var file);
-        if (kind == 1 && file != null)
-        {
-            // A newly created file object can reuse a pointer; do not relabel old I/O.
-            openFiles.Remove(key);
-            file = null;
-        }
         if (kind == 3)
         {
             if (file != null)
             {
-                if (!rawPath.IsEmpty)
-                    file.Path ??= selection.Paths.Resolve(rawPath, null) ?? rawPath.ToString();
+                if (!path.IsEmpty)
+                    file.Path ??= path.ToString();
                 openFiles.Remove(key);
             }
             return;
         }
-        if (rawPath.IsEmpty)
+        if (path.IsEmpty)
             return;
-        string path = selection.Details ? selection.Paths.Resolve(rawPath, null) : null;
-        if (path == null && IsVirtualDisk(rawPath))
-            path = selection.Paths.Resolve(rawPath, null) ?? rawPath.ToString();
-        if (file != null)
-            file.Path ??= path ?? rawPath.ToString();
-        else if (path != null && openFiles.Count < MaxOpenFiles)
-            openFiles[key] = new OpenFile(path);
+        var selection = scope;
+        bool virtualDisk = IsVirtualDisk(path);
+        // Keep raw device paths when the volume inventory is still loading.
+        if (file == null && !virtualDisk && !selection.Details)
+            return;
+        string resolved = selection.Paths.Resolve(path, null);
+        if (file == null && !virtualDisk && kind == 2 && resolved == null)
+            return;
+        string name = resolved ?? path.ToString();
+        if (file == null || (kind == 1 && file.Path != null &&
+            !string.Equals(file.Path, name, StringComparison.OrdinalIgnoreCase)))
+            AddOpenFile(key, name);
+        else
+            file.Path ??= name;
+    }
+
+    private OpenFile AddOpenFile(ulong key, string path)
+    {
+        if (fileOrder.Count == MaxOpenFiles)
+        {
+            var oldest = fileOrder.Dequeue();
+            if (ReferenceEquals(openFiles.GetValueOrDefault(oldest.Key), oldest.File))
+                openFiles.Remove(oldest.Key);
+        }
+        var file = new OpenFile(path);
+        openFiles[key] = file;
+        fileOrder.Enqueue((key, file));
+        return file;
+    }
+
+    private void RecordRequest(DiskIOInitTraceData e)
+    {
+        if (disposed || e.Irp == 0 || e.ProcessID <= 0)
+            return;
+        double time = e.TimeStampRelativeMSec;
+        if (requests.Count >= MaxRequests && time >= nextRequestTrim)
+        {
+            nextRequestTrim = time + 1000;
+            foreach (var key in requests.Where(pair => time - pair.Value.Time > WindowSeconds * 1000)
+                .Select(pair => pair.Key).ToArray())
+                requests.Remove(key);
+        }
+        if (requests.Count < MaxRequests || requests.ContainsKey(e.Irp))
+            requests[e.Irp] = new DiskRequest(e.ProcessID, e.ThreadID, time, processes.GetValueOrDefault(e.ProcessID));
     }
 
     private static bool IsVirtualDisk(ReadOnlySpan<char> path) =>
@@ -368,6 +411,9 @@ internal sealed class VolumeFileIo : IDisposable
 
     private void RecordDisk(DiskIOTraceData e, bool write, ETWTraceEventSource source)
     {
+        if (disposed)
+            return;
+        bool hasRequest = requests.Remove(e.Irp, out var request);
         var selection = scope;
         bool detail = selection.Details;
         bool virtualDisk = Array.IndexOf(selection.VirtualDisks, e.DiskNumber) >= 0;
@@ -386,8 +432,8 @@ internal sealed class VolumeFileIo : IDisposable
                 return;
             if (file != null)
                 file.Path = path;
-            else if (e.FileKey != 0 && openFiles.Count < MaxOpenFiles)
-                openFiles[e.FileKey] = file = new OpenFile(path);
+            else if (e.FileKey != 0)
+                file = AddOpenFile(e.FileKey, path);
             else if (path != null)
                 file = new OpenFile(path);
         }
@@ -395,8 +441,15 @@ internal sealed class VolumeFileIo : IDisposable
         if (!detail && virtualPath == null)
             return;
         int pid = e.ProcessID;
-        if (!processes.TryGetValue(pid, out string process) || string.IsNullOrWhiteSpace(process))
-            process = string.IsNullOrWhiteSpace(e.ProcessName) ? (pid == 4 ? "System" : "Unknown") : e.ProcessName;
+        string process = processes.GetValueOrDefault(pid) ?? e.ProcessName;
+        if (pid <= 0 && hasRequest && (e.ThreadID <= 0 || request.Thread <= 0 || e.ThreadID == request.Thread) &&
+            Math.Abs(e.TimeStampRelativeMSec - e.ElapsedTimeMSec - request.Time) < 2)
+        {
+            pid = request.Pid;
+            process = request.Process ?? processes.GetValueOrDefault(pid);
+        }
+        if (string.IsNullOrWhiteSpace(process))
+            process = pid == 4 ? "System" : "Unknown";
         var count = write ? new FileIoTotals { WriteBytes = e.TransferSize, Writes = 1 }
             : new FileIoTotals { ReadBytes = e.TransferSize, Reads = 1 };
         long now = Stopwatch.GetTimestamp() / Stopwatch.Frequency;
@@ -509,7 +562,7 @@ internal sealed class VolumeFileIo : IDisposable
                 entries.Add(entry.Key, missing);
         }
         return new Snapshot(byPath ? entries : processTotals, diskBytes, namedBytes, seconds, status,
-            rundownStatus, eventsLost, omitted, virtualPaths);
+            eventsLost, omitted, virtualPaths);
     }
 
     private string VirtualPath(string path) => VmDiskIo.Normalize(scope.Paths.Resolve(path, null) ?? path);
@@ -541,7 +594,7 @@ internal sealed class VolumeFileIo : IDisposable
                     }
         }
         return new VirtualSnapshot(entries.Select(entry => new VirtualDiskIo(entry.Key.Disk, entry.Key.Path, entry.Value)).ToArray(),
-            seconds, status ?? rundownStatus, eventsLost);
+            seconds, status, eventsLost);
     }
 
     public void Dispose()
@@ -678,6 +731,8 @@ internal sealed class DiskIoDetails : Panel
     private readonly Dictionary<VmDisk, GuestIoWatch> guestWatches = new();
     private HashSet<string> expandedGuests = new(StringComparer.OrdinalIgnoreCase);
     private bool groupByMachine;
+    private bool usageBands;
+    private bool showAttributionGaps;
     private int topRows;
     private readonly ProcessCommands commands = new();
     private VmDisk guestDisk;
@@ -723,7 +778,10 @@ internal sealed class DiskIoDetails : Panel
         tabs.SizeChanged += (_, _) => LayoutTotals();
         refreshTimer.Tick += (_, _) => RefreshRows();
         foreach (var table in new[] { paths, processes, guestPaths, guestProcesses })
+        {
             table.RankingChanged += (_, _) => RefreshRows();
+            table.ViewportChanged += (_, _) => commands.Refresh();
+        }
         paths.MouseDoubleClick += (_, e) =>
         {
             if (e.Button == MouseButtons.Left)
@@ -793,12 +851,14 @@ internal sealed class DiskIoDetails : Panel
 
     public int HeightFor(int available) => expanded ? Math.Min(345, Math.Max(180, available * 3 / 5)) : 34;
 
-    public void SetOptions(CpuExpansionTarget[] guests, bool group, int limit, string search)
+    public void SetOptions(CpuExpansionTarget[] guests, bool group, int limit, string search, bool bands, bool showGaps)
     {
         expandedGuests = guests.Select(guest => guest.Name)
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
         groupByMachine = group;
         topRows = limit;
+        usageBands = bands;
+        showAttributionGaps = showGaps;
         filter = search;
         RefreshRows();
     }
@@ -984,8 +1044,6 @@ internal sealed class DiskIoDetails : Panel
         else if (byPath && selectedPath == null)
             window += $"  |  {(double)snapshot.NamedBytes / snapshot.DiskBytes:P0} of bytes matched to paths";
         status.Text = snapshot.Status ?? window;
-        if (byPath && snapshot.Status == null && snapshot.RundownStatus != null)
-            status.Text += "  |  " + snapshot.RundownStatus;
         if (snapshot.EventsLost > 0)
             status.Text += "  |  Windows dropped " + snapshot.EventsLost + " trace events";
         if (byPath && snapshot.Omitted > 0)
@@ -1007,8 +1065,8 @@ internal sealed class DiskIoDetails : Panel
             status.Text += "  |  Waiting on " + (missing.Length - unavailable.Length) + " guest disks";
         var errors = unavailable.Select(candidate => $"{candidate.Group.Key.VMName} / " +
             System.IO.Path.GetFileName(candidate.Group.First().Key.Path) + ": " + candidate.Sample.Error);
-        SetStatusHelp(string.Join("\n", errors.Prepend(status.Text)));
         var totals = FillTable(byPath ? paths : processes, rows, byPath, guestOnly: false, snapshot.Seconds, owners);
+        SetStatusHelp(string.Join("\n", errors.Prepend(status.Text)));
         string description = hasGuestRows
             ? "Guest rows divide their VHDX's measured Windows I/O using the guest's file I/O proportions."
             : "Completed Windows I/O for the current selection.";
@@ -1072,9 +1130,9 @@ internal sealed class DiskIoDetails : Panel
             status.Text += " Showing recent samples.";
         if (sample?.Limited == true)
             status.Text += "  |  Some file paths unresolved";
-        SetStatusHelp(status.Text);
         var totals = FillTable(table, entries.Select(entry => new DiskIoRow(entry.Key, guestDisk.VMName, entry.Value)).ToArray(),
             byPath, guestOnly: true, sample?.Seconds ?? 0, null);
+        SetStatusHelp(status.Text);
         string comparison = sample is { DiskSeconds: > 0 }
             ? $"Guest disk counters during the sample runs: read {sample.DiskReadBytes / BytesPerMiB / sample.DiskSeconds:0.##} MiB/s, write {sample.DiskWriteBytes / BytesPerMiB / sample.DiskSeconds:0.##} MiB/s."
             : "Guest disk counters are unavailable.";
@@ -1096,7 +1154,7 @@ internal sealed class DiskIoDetails : Panel
             $"Read {read:N2} MiB / {values.Reads:N0} ops   |   Write {write:N2} MiB / {values.Writes:N0} ops   |   Total {total:N2} MiB / {values.Operations:N0} ops ({total / seconds:N2} MiB/s)";
         totalsCompact = seconds <= 0 ? totalsFull :
             $"R {read:N2}  |  W {write:N2}  |  Total {total:N2} MiB ({total / seconds:N2} MiB/s)";
-        string help = $"{totalsFull}\n{description}\nIncludes all matching rows, even when only the top {topRows} are listed.";
+        string help = $"{totalsFull}\n{description}\nIncludes all matching I/O, including attribution gaps.";
         if (detailsHelp.GetToolTip(totals) != help)
             detailsHelp.SetToolTip(totals, help);
         LayoutTotals();
@@ -1120,18 +1178,41 @@ internal sealed class DiskIoDetails : Panel
     {
         var matched = entries.Where(row => RowFilter.Matches(filter, row.Key.Process, row.Machine,
             row.Key.Pid.ToString(), row.Key.Path)).ToArray();
-        table.Render(matched, row => row.Machine, groupByMachine, topRows, Item);
+        var gaps = matched.Where(IsGap).ToArray();
+        if (gaps.Length > 0 && seconds > 0)
+        {
+            if (byPath)
+                status.Text = $"Unresolved paths {Rate(gaps.Sum(row => row.Totals.TotalBytes), BytesPerMiB)} MiB/s  |  " + status.Text;
+            else
+            {
+                long kernel = gaps.Where(IsWindowsKernel).Sum(row => row.Totals.TotalBytes);
+                long unidentified = gaps.Sum(row => row.Totals.TotalBytes) - kernel;
+                if (unidentified > 0)
+                    status.Text = $"Unidentified process {Rate(unidentified, BytesPerMiB)} MiB/s  |  " + status.Text;
+                if (kernel > 0)
+                    status.Text = $"Windows kernel {Rate(kernel, BytesPerMiB)} MiB/s  |  " + status.Text;
+            }
+        }
+
+        var ranked = showAttributionGaps ? matched : matched.Where(row => !IsGap(row));
+        table.Render(ranked, row => row.Machine, groupByMachine, topRows, Item, usageBands
+            ? (row => row.Totals.TotalBytes, (double)entries.Sum(row => row.Totals.TotalBytes), "I/O") : null);
         if (byPath)
             commands.Suspend();
         else
             commands.Update(table, table.Columns.Count - 1, item =>
             {
-                var row = (RowSelection)item.Tag;
+                if (item.Tag is not RowSelection row)
+                    return null;
                 // The WSL disk trace reports kernel PIDs, which can differ from the distro's /proc IDs.
                 int pid = row.Machine.StartsWith("WSL / ", StringComparison.OrdinalIgnoreCase) ? 0 : row.Key.Pid;
                 return new ProcessIdentity(row.Machine, pid, row.Key.Process);
-            });
+            }, usageBands);
         return DiskIoMerge.Sum(matched.Select(row => row.Totals));
+
+        static bool IsWindowsKernel(DiskIoRow row) => row.Machine == Environment.MachineName && row.Key.Pid == 4;
+        bool IsGap(DiskIoRow row) => byPath ? row.Key.Path.Length == 0 || row.Key.Path == "(path unavailable)" :
+            IsWindowsKernel(row) || row.Key.Pid <= 0 || row.Key.Process.Equals("Unknown", StringComparison.OrdinalIgnoreCase);
 
         string Rate(long amount, double scale = 1) => seconds > 0 ? (amount / scale / seconds).ToString("N2") : "—";
 
@@ -1150,9 +1231,11 @@ internal sealed class DiskIoDetails : Panel
                 int slash = Math.Max(display.LastIndexOf('\\'), display.LastIndexOf('/'));
                 if (slash >= 0 && slash < display.Length - 1)
                     display = display[(slash + 1)..] + "   ·   " + display[..(slash + 1)];
-                cells.Add(display.Length == 0 ? "(path unavailable)" : display);
+                cells.Add(IsGap(row) ? "Unresolved file path" : display);
             }
-            cells.AddRange(new[] { row.Key.Process, row.Machine,
+            string process = IsWindowsKernel(row) ? "System (Windows kernel)" :
+                row.Key.Pid <= 0 ? "Unidentified process" : row.Key.Process;
+            cells.AddRange(new[] { process, row.Machine,
                 Rate(value.TotalBytes, BytesPerMiB), Rate(value.ReadBytes, BytesPerMiB),
                 Rate(value.WriteBytes, BytesPerMiB), Rate(value.Operations) });
             if (!guestOnly)

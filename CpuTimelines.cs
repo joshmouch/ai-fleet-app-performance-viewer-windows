@@ -232,6 +232,8 @@ internal sealed class Timeline : Form
     private readonly Button guestOptions = new() { Text = "Guests", FlatStyle = FlatStyle.Flat };
     private readonly ContextMenuStrip guestMenu = new();
     private readonly CheckBox groupByMachine = new() { Text = "Group by machine", AutoSize = true };
+    private readonly CheckBox usageBands = new() { Text = "10% usage bands", AutoSize = true };
+    private readonly CheckBox diskAttributionGaps = new() { Text = "Show disk attribution gaps", AutoSize = true };
     private readonly NumericUpDown topRows = new() { Minimum = 1, Maximum = 50, Value = 20, AccessibleName = "Number of top rows" };
     private readonly VScrollBar cpuScroll = new() { Visible = false };
     private readonly HashSet<CpuExpansionTarget> selectedGuests = new();
@@ -282,6 +284,7 @@ internal sealed class Timeline : Form
         public Dictionary<string, double> GuestValues;
         public HyperVHostSample HostCpu;
         public Dictionary<string, DiskReading> Disks;
+        public Dictionary<string, DiskSummary> VirtualDisks;
 
         public double? GetUtilization(string processor)
         {
@@ -463,13 +466,21 @@ internal sealed class Timeline : Form
         diskRank.Width = 144;
         diskRank.SelectedIndexChanged += DiskFilterChanged;
         AddSetting(settingsMenu, UpdateLabel, updateInterval);
+        usageBands.CheckedChanged += (_, _) =>
+        {
+            topRows.Enabled = !usageBands.Checked;
+            ApplyDetailOptions();
+        };
+        diskAttributionGaps.CheckedChanged += (_, _) => ApplyDetailOptions();
         AddSetting(settingsMenu, "Top rows", topRows);
+        AddSetting(settingsMenu, null, usageBands);
         AddSetting(settingsMenu, null, groupByMachine);
         AddSetting(diskSettingsMenu, "Rank cards by", diskRank);
         AddSetting(diskSettingsMenu, "Card scope", diskScope);
         AddSetting(diskSettingsMenu, DiskCutoffLabel, diskCutoff);
         AddSetting(diskSettingsMenu, TransferCutoffLabel, transferCutoff);
         AddSetting(diskSettingsMenu, null, showVirtualDisks);
+        AddSetting(diskSettingsMenu, null, diskAttributionGaps);
         settingsButton.Click += (_, _) => OpenMenu(settingsMenu, settingsButton);
         diskSettingsButton.Click += (_, _) => OpenMenu(diskSettingsMenu, diskSettingsButton);
         guestOptions.Click += (_, _) => OpenMenu(guestMenu, guestOptions);
@@ -707,7 +718,7 @@ internal sealed class Timeline : Form
                     ? !sample.Disks.Values.Any(disk => disk.Number == selectedVirtualDisk.Latest.Number)
                     : !sample.Disks.ContainsKey(selectedDisk)))
                 diskIoDetails.SelectAllDisks();
-            RefreshDiskCards(now);
+            RefreshDiskCards(now, sample);
         }
         Invalidate();
     }
@@ -803,8 +814,8 @@ internal sealed class Timeline : Form
     {
         var guests = availableGuests.Where(selectedGuests.Contains).ToArray();
         string filter = find.Text.Trim();
-        processDetails.SetOptions(guests, groupByMachine.Checked, (int)topRows.Value, filter);
-        diskIoDetails.SetOptions(guests, groupByMachine.Checked, (int)topRows.Value, filter);
+        processDetails.SetOptions(guests, groupByMachine.Checked, (int)topRows.Value, filter, usageBands.Checked);
+        diskIoDetails.SetOptions(guests, groupByMachine.Checked, (int)topRows.Value, filter, usageBands.Checked, diskAttributionGaps.Checked);
     }
 
     private void SharedOptionsChanged()
@@ -1065,11 +1076,11 @@ internal sealed class Timeline : Form
             (identity.AccessPaths != null && identity.AccessPaths.Length > 0);
     }
 
-    private void RefreshDiskCards(double now)
+    private void RefreshDiskCards(double now, Sample sample = null)
     {
         var summaries = ReadDiskSummaries(now);
         var physical = summaries.Where(MeetsDiskFilters).ToArray();
-        var active = physical.Concat(FindVirtualDisks(summaries))
+        var active = physical.Concat(FindVirtualDisks(summaries, sample))
             .OrderByDescending(DiskRankValue).ThenBy(disk => disk.Id, StringComparer.OrdinalIgnoreCase).ToArray();
         if (selectedDisk != null && !active.Any(disk => disk.Id == selectedDisk))
         {
@@ -1213,7 +1224,7 @@ internal sealed class Timeline : Form
         Invalidate();
     }
 
-    private DiskSummary[] FindVirtualDisks(DiskSummary[] disks)
+    private DiskSummary[] FindVirtualDisks(DiskSummary[] disks, Sample sample)
     {
         int[] numbers = showVirtualDisks.Checked
             ? disks.Where(disk => IncludesDisk(SelectedDiskScope, disk.Latest.Number))
@@ -1234,7 +1245,7 @@ internal sealed class Timeline : Form
 
         var owners = diskIoDetails.VirtualDiskOwners;
         var limit = SelectedTransferLimit;
-        return snapshot.Entries.GroupBy(entry => VmDiskIo.Normalize(entry.Path), StringComparer.OrdinalIgnoreCase)
+        var virtualDisks = snapshot.Entries.GroupBy(entry => VmDiskIo.Normalize(entry.Path), StringComparer.OrdinalIgnoreCase)
             .Select(group =>
             {
                 var largest = group.OrderByDescending(entry => entry.Totals.TotalBytes).First();
@@ -1254,7 +1265,10 @@ internal sealed class Timeline : Form
                         WriteMiB = total.WriteBytes / (1048576 * snapshot.Seconds)
                     }
                 };
-            }).Where(disk => disk.Rate(limit.WritesOnly) >= limit.MinimumMiB)
+            }).ToArray();
+        if (sample != null)
+            sample.VirtualDisks = virtualDisks.ToDictionary(disk => disk.Id, StringComparer.OrdinalIgnoreCase);
+        return virtualDisks.Where(disk => disk.Rate(limit.WritesOnly) >= limit.MinimumMiB)
             .OrderByDescending(DiskRankValue)
             .ThenBy(disk => disk.Id, StringComparer.Ordinal).Take(12).ToArray();
     }
@@ -1348,7 +1362,7 @@ internal sealed class Timeline : Form
             grid.Color = Blend(card.Color, ForeColor, 0.22);
             if (showingDisks)
             {
-                DrawDiskDetail(g, muted, grid, line, width, range);
+                DrawDiskDetail(g, latest, muted, grid, line, width, range);
                 return;
             }
 
@@ -1361,40 +1375,13 @@ internal sealed class Timeline : Form
     private void DrawCpuOverview(Graphics g, Sample latest, HistoryRange range, int width, bool split,
         SolidBrush muted, Pen grid, Pen line, Pen vmLine)
     {
-        float statsWidth = 0;
-        if (split)
-        {
-            using var windowsFont = new Font(Font.FontFamily, 18, FontStyle.Bold);
-            using var guestsFont = new Font(Font.FontFamily, 15, FontStyle.Bold);
-            using var windowsText = new SolidBrush(line.Color);
-            using var guestsText = new SolidBrush(vmLine.Color);
-            var current = latest?.HostCpu?.Overall;
-            var stats = new[]
-            {
-                (Label: "Windows CPU", Value: current?.Windows, Font: windowsFont, Text: windowsText),
-                (Label: "All Guests", Value: current?.VirtualMachines, Font: guestsFont, Text: guestsText),
-                (Label: "Hyper-V overhead", Value: current?.Hypervisor, Font: Font, Text: muted)
-            };
-            const int inset = 12;
-            const int valueGap = 12;
-            float contentWidth = stats.Max(stat => g.MeasureString(stat.Label, stat.Font).Width +
-                valueGap + g.MeasureString("100%", stat.Font).Width);
-            statsWidth = contentWidth + inset * 2;
-            float rowHeight = (OverallPanelHeight - 12f) / stats.Length;
-            float left = PaddingSize + inset;
-            float right = left + contentWidth;
-            for (int i = 0; i < stats.Length; i++)
-            {
-                var stat = stats[i];
-                float y = ChartTop + 6 + (i + 0.5f) * rowHeight - stat.Font.GetHeight(g) / 2;
-                string value = Percent(stat.Value);
-                g.DrawString(stat.Label, stat.Font, stat.Text, left, y);
-                g.DrawString(value, stat.Font, stat.Text, right - g.MeasureString(value, stat.Font).Width, y);
-            }
-        }
-
-        var chart = new RectangleF(PaddingSize + statsWidth + 48, ChartTop + 12,
-            width - statsWidth - 60, OverallPanelHeight - 34);
+        var current = latest?.HostCpu?.Overall;
+        float statsWidth = split
+            ? DrawOverviewStats(g, muted, ("Windows CPU", Percent(current?.Windows), "100%", line.Color),
+                ("All Guests", Percent(current?.VirtualMachines), "100%", vmLine.Color),
+                ("Hyper-V overhead", Percent(current?.Hypervisor), "100%", null))
+            : DrawOverviewStats(g, muted, ("Windows CPU", Percent(latest?.Total), "100%", line.Color));
+        var chart = OverviewChart(width, statsWidth);
         DrawChartGrid(g, chart, grid);
         if (split)
         {
@@ -1407,6 +1394,36 @@ internal sealed class Timeline : Form
             DrawHistory(g, chart, line, range, sample => sample.Total);
         DrawAxes(g, chart, muted, range.Duration, 100, "%");
     }
+
+    private float DrawOverviewStats(Graphics g, SolidBrush muted,
+        params (string Label, string Value, string MaxValue, Color? Color)[] stats)
+    {
+        using var primary = new Font(Font.FontFamily, 18, FontStyle.Bold);
+        using var secondary = new Font(Font.FontFamily, 15, FontStyle.Bold);
+        Font[] fonts = { primary, secondary, Font };
+        const int inset = 12;
+        const int valueGap = 12;
+        float contentWidth = stats.Select((stat, i) => g.MeasureString(stat.Label, fonts[i]).Width + valueGap +
+            Math.Max(g.MeasureString(stat.Value, fonts[i]).Width, g.MeasureString(stat.MaxValue, fonts[i]).Width)).Max();
+        float rowHeight = (OverallPanelHeight - 12f) / fonts.Length;
+        float left = PaddingSize + inset;
+        float right = left + contentWidth;
+        for (int i = 0; i < stats.Length; i++)
+        {
+            var stat = stats[i];
+            var font = fonts[i];
+            using var seriesBrush = stat.Color is Color color ? new SolidBrush(color) : null;
+            var brush = seriesBrush ?? muted;
+            float y = ChartTop + 6 + (i + 0.5f) * rowHeight - font.GetHeight(g) / 2;
+            g.DrawString(stat.Label, font, brush, left, y);
+            g.DrawString(stat.Value, font, brush, right - g.MeasureString(stat.Value, font).Width, y);
+        }
+        return contentWidth + inset * 2;
+    }
+
+    private static RectangleF OverviewChart(int width, float statsWidth, float leftAxis = 48, float rightAxis = 12) =>
+        new(PaddingSize + statsWidth + leftAxis, ChartTop + 12,
+            Math.Max(1, width - statsWidth - leftAxis - rightAxis), OverallPanelHeight - 34);
 
     private sealed record CpuTile(string Machine, string Processor, string GuestCounter = null, int? LogicalProcessor = null)
     {
@@ -1540,46 +1557,48 @@ internal sealed class Timeline : Form
             base.OnMouseWheel(e);
     }
 
-    private void DrawDiskDetail(Graphics g, Brush muted, Pen grid, Pen line, int width, HistoryRange range)
+    private void DrawDiskDetail(Graphics g, Sample latest, SolidBrush muted, Pen grid, Pen line, int width, HistoryRange range)
     {
-        if (selectedVirtualDisk is { } selected)
-        {
-            const TextFormatFlags flags = TextFormatFlags.SingleLine | TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix;
-            var path = new Rectangle(PaddingSize + 12, ChartTop + 12, width - 24, 19);
-            TextRenderer.DrawText(g, selected.VirtualDisk.Path, Font, path, ForeColor, flags | TextFormatFlags.PathEllipsis);
-            g.DrawString(VirtualDiskLabel(selected), Font, muted, path.X, path.Bottom + 3);
-            string rates = !selected.BelowFilter
-                ? TransferRates(selected.Latest) + $"  |  {selected.VirtualDisk.Totals.Operations:N0} operations in {selected.Coverage:0} s"
-                : "Outside the current top VHDX files";
-            g.DrawString(rates, Font, muted, path.X, path.Bottom + 26);
-            return;
-        }
-        int half = width / 2;
-        float plotTop = ChartTop + 27;
-        float plotHeight = OverallPanelHeight - 49;
-        var activeChart = new RectangleF(PaddingSize + 48, plotTop, half - 60, plotHeight);
-        var rateChart = new RectangleF(PaddingSize + half + 48, plotTop, width - half - 60, plotHeight);
-        g.DrawString(selectedDisk == null ? "Busiest disk active time" : "Active time", Font, muted, activeChart.Left, ChartTop + 5);
-        g.DrawString(selectedDisk == null ? "Windows disk counters (MiB/s)" : "Transfer rate (MiB/s)", Font, muted, rateChart.Left, ChartTop + 5);
-        DrawChartGrid(g, activeChart, grid);
-        DrawChartGrid(g, rateChart, grid);
-
-        double maxRate = Math.Max(1, Math.Ceiling(history.Skip(range.FirstSample)
-            .Select(sample => ReadChartDisk(sample).GetValueOrDefault())
-            .Select(disk => Math.Max(disk.ReadMiB, disk.WriteMiB)).DefaultIfEmpty().Max()));
-        using (var writeLine = new Pen(writeLineColor, line.Width))
-        using (var readText = new SolidBrush(line.Color))
-        using (var writeText = new SolidBrush(writeLineColor))
-        {
-            g.DrawString("Read", Font, readText, rateChart.Right - 75, ChartTop + 5);
-            g.DrawString("Write", Font, writeText, rateChart.Right - 36, ChartTop + 5);
-            DrawHistory(g, rateChart, line, range, sample => ReadChartDisk(sample)?.ReadMiB, maxRate);
-            DrawHistory(g, rateChart, writeLine, range, sample => ReadChartDisk(sample)?.WriteMiB, maxRate);
-        }
-        DrawHistory(g, activeChart, line, range, sample => ReadChartDisk(sample)?.Active);
-        DrawAxes(g, activeChart, muted, range.Duration, 100, "%");
-        DrawAxes(g, rateChart, muted, range.Duration, maxRate, "");
+        bool virtualDisk = selectedVirtualDisk != null;
+        var historyRows = history.Skip(range.FirstSample).Select(ReadOverviewDisk).ToArray();
+        var current = ReadOverviewDisk(latest);
+        if (virtualDisk && latest != null && current == null && !selectedVirtualDisk.BelowFilter)
+            current = VirtualReading(selectedVirtualDisk);
+        double maxRate = Math.Max(1, Math.Ceiling(Math.Max(Math.Max(current?.Read ?? 0, current?.Write ?? 0),
+            historyRows.Select(row => Math.Max(row?.Read ?? 0, row?.Write ?? 0)).DefaultIfEmpty().Max())));
+        double maxSecondary = virtualDisk ? Math.Max(1, Math.Ceiling(Math.Max(current?.Secondary ?? 0,
+            historyRows.Select(row => row?.Secondary ?? 0).DefaultIfEmpty().Max()))) : 100;
+        string secondaryLabel = virtualDisk ? "Operations/s" : selectedDisk == null ? "Peak active time" : "Active time";
+        string secondaryUnit = virtualDisk ? " ops/s" : "%";
+        static string Number(double? value) => value?.ToString("0.#") ?? "—";
+        string secondary = Number(current?.Secondary) + (virtualDisk || current == null ? "" : "%");
+        using var writeLine = new Pen(writeLineColor, line.Width);
+        using var secondaryLine = new Pen(muted.Color) { DashStyle = System.Drawing.Drawing2D.DashStyle.Dot };
+        float statsWidth = DrawOverviewStats(g, muted, ("Read MiB/s", Number(current?.Read), Number(maxRate), line.Color),
+            ("Write MiB/s", Number(current?.Write), Number(maxRate), writeLine.Color),
+            (secondaryLabel, secondary, Number(maxSecondary) + (virtualDisk ? "" : "%"), null));
+        var chart = OverviewChart(width, statsWidth, g.MeasureString(Number(maxRate), Font).Width + 16,
+            g.MeasureString(Number(maxSecondary) + secondaryUnit, Font).Width + 14);
+        DrawChartGrid(g, chart, grid);
+        DrawHistory(g, chart, line, range, sample => ReadOverviewDisk(sample)?.Read, maxRate);
+        DrawHistory(g, chart, writeLine, range, sample => ReadOverviewDisk(sample)?.Write, maxRate);
+        DrawHistory(g, chart, secondaryLine, range, sample => ReadOverviewDisk(sample)?.Secondary, maxSecondary);
+        DrawAxes(g, chart, muted, range.Duration, maxRate, "");
+        DrawAxisValues(g, chart, muted, maxSecondary, secondaryUnit, right: true);
     }
+
+    private (double Read, double Write, double Secondary)? ReadOverviewDisk(Sample sample)
+    {
+        if (sample == null)
+            return null;
+        if (selectedVirtualDisk != null)
+            return sample.VirtualDisks?.GetValueOrDefault(selectedDisk) is { } disk ? VirtualReading(disk) : null;
+        var reading = ReadChartDisk(sample);
+        return reading is { } physical ? (physical.ReadMiB, physical.WriteMiB, physical.Active) : null;
+    }
+
+    private static (double Read, double Write, double Secondary) VirtualReading(DiskSummary disk) =>
+        (disk.Latest.ReadMiB, disk.Latest.WriteMiB, disk.VirtualDisk.Totals.Operations / disk.Coverage);
 
     private DiskReading? ReadChartDisk(Sample sample)
     {
@@ -1708,15 +1727,21 @@ internal sealed class Timeline : Form
 
     private void DrawAxes(Graphics g, RectangleF chart, Brush text, string duration, double maximum, string unit)
     {
+        DrawAxisValues(g, chart, text, maximum, unit);
+        g.DrawString(duration + " ago", Font, text, chart.Left, chart.Bottom + 4);
+        g.DrawString("Now", Font, text, chart.Right - g.MeasureString("Now", Font).Width, chart.Bottom + 4);
+    }
+
+    private void DrawAxisValues(Graphics g, RectangleF chart, Brush text, double maximum, string unit, bool right = false)
+    {
         float labelOffset = Font.GetHeight(g) / 2;
         for (int level = 0; level <= 2; level++)
         {
             string label = (maximum * level / 2).ToString("0.#") + unit;
             float y = chart.Bottom - chart.Height * level / 2 - labelOffset;
-            g.DrawString(label, Font, text, chart.Left - 5 - g.MeasureString(label, Font).Width, y);
+            float x = right ? chart.Right + 5 : chart.Left - 5 - g.MeasureString(label, Font).Width;
+            g.DrawString(label, Font, text, x, y);
         }
-        g.DrawString(duration + " ago", Font, text, chart.Left, chart.Bottom + 4);
-        g.DrawString("Now", Font, text, chart.Right - g.MeasureString("Now", Font).Width, chart.Bottom + 4);
     }
 
     private static void DrawChartGrid(Graphics g, RectangleF chart, Pen grid)

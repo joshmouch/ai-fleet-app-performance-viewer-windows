@@ -16,21 +16,23 @@ internal sealed class ProcessCommands : IDisposable
     private readonly Dictionary<ProcessIdentity, (long ReadAt, string Command)> cache = new();
     private ListView table;
     private int column;
+    private bool viewportOnly;
     private Func<ListViewItem, ProcessIdentity> identify;
     private CancellationTokenSource pending;
     private bool disposed;
 
-    public void Update(ListView visibleTable, int commandColumn, Func<ListViewItem, ProcessIdentity> identity)
+    public void Update(ListView visibleTable, int commandColumn, Func<ListViewItem, ProcessIdentity> identity, bool viewportOnly = false)
     {
         table = visibleTable;
         column = commandColumn;
         identify = identity;
+        this.viewportOnly = viewportOnly;
         Refresh();
     }
 
     public void Suspend() => table = null;
 
-    private void Refresh()
+    public void Refresh()
     {
         if (table == null || disposed)
             return;
@@ -39,9 +41,15 @@ internal sealed class ProcessCommands : IDisposable
             cache.Remove(key);
 
         var missing = new HashSet<ProcessIdentity>();
-        foreach (ListViewItem item in table.Items)
+        int start = viewportOnly ? table.TopItem?.Index ?? 0 : 0;
+        int end = viewportOnly ? Math.Min(table.Items.Count, start + table.ClientSize.Height / FontRowHeight() + 2)
+            : table.Items.Count;
+        for (int i = start; i < end; i++)
         {
+            var item = table.Items[i];
             var process = identify(item);
+            if (process == null)
+                continue;
             if (process.Pid <= 0)
                 item.SubItems[column].Text = "—";
             else if (cache.TryGetValue(process, out var entry))
@@ -59,6 +67,8 @@ internal sealed class ProcessCommands : IDisposable
         if (pending == null && missing.Count > 0)
             Load(missing.ToArray());
     }
+
+    private int FontRowHeight() => table.Items.Count > 0 ? Math.Max(1, table.GetItemRect(0).Height) : 1;
 
     private async void Load(ProcessIdentity[] processes)
     {
