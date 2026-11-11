@@ -99,14 +99,28 @@ internal static class VmDiskIo
 
     private static async Task<GuestIoSample> ReadWslDisk(string distro, CancellationToken cancellation)
     {
+        const string command = """
+            if [ ! -x /usr/bin/python3 ]; then
+                if ! command -v apt-get >/dev/null; then
+                    echo 'Guest disk I/O: Python 3 is required and this distro has no apt-get.' >&2
+                    exit 1
+                fi
+                if ! apt-get -qq update </dev/null >&2 ||
+                   ! DEBIAN_FRONTEND=noninteractive apt-get -qq -y --no-install-recommends install python3 ca-certificates </dev/null >&2; then
+                    echo 'Guest disk I/O: Could not install Python 3 in WSL.' >&2
+                    exit 1
+                fi
+            fi
+            exec /usr/bin/python3 -I - root
+            """;
         var running = await CpuProcessSampler.ReadRunningWslNames(cancellation).ConfigureAwait(false);
         if (!running.Contains(distro))
             throw new InvalidOperationException($"WSL distribution {distro} is stopped.");
         string code = await ReadScript("GuestDiskIo.py", cancellation).ConfigureAwait(false);
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
-        deadline.CancelAfter(TimeSpan.FromSeconds(28));
+        deadline.CancelAfter(TimeSpan.FromSeconds(120));
         var result = await Run(CpuProcessSampler.Wsl,
-            new[] { "--distribution", distro, "--user", "root", "--exec", "/usr/bin/python3", "-I", "-", "root" },
+            new[] { "--distribution", distro, "--user", "root", "--exec", "/bin/sh", "-c", command.Replace("\r\n", "\n") },
             code, deadline.Token).ConfigureAwait(false);
         if (result.ExitCode != 0)
         {
