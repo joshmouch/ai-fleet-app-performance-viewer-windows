@@ -2,12 +2,15 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Drawing;
+using System.Runtime.InteropServices;
 using System.Windows.Forms;
 
 internal sealed class RankedTable<TRow> : ListView
 {
     private sealed record Column(string Title, Func<TRow, IComparable> Value, bool Numeric);
     private readonly List<Column> columns = new();
+    private readonly ContextMenuStrip rowMenu = new();
+    private string rowToCopy;
     private sealed record BandDivider(int Band);
     private readonly record struct BandRow(TRow Row, int Divider = -1);
     private readonly bool virtualizeBands;
@@ -35,6 +38,11 @@ internal sealed class RankedTable<TRow> : ListView
         HideSelection = false;
         ShowItemToolTips = true;
         HeaderStyle = ColumnHeaderStyle.Clickable;
+        rowMenu.Items.Add("Copy row", null, (_, _) =>
+        {
+            try { Clipboard.SetDataObject(rowToCopy, true, 5, 50); }
+            catch (ExternalException) { }
+        });
         ColumnClick += (_, e) =>
         {
             if (usageBands || columns[e.Column].Value == null)
@@ -236,10 +244,27 @@ internal sealed class RankedTable<TRow> : ListView
             ViewportChanged?.Invoke(this, EventArgs.Empty);
     }
 
+    protected override void OnMouseUp(MouseEventArgs e)
+    {
+        base.OnMouseUp(e);
+        if (e.Button != MouseButtons.Right || GetItemAt(e.X, e.Y) is not { Tag: not BandDivider } item)
+            return;
+
+        // Live refreshes can replace the clicked item while the menu is open.
+        rowToCopy = string.Join(Environment.NewLine, Enumerable.Range(0, Math.Min(item.SubItems.Count, columns.Count))
+            .Where(index => !string.IsNullOrWhiteSpace(item.SubItems[index].Text))
+            .Select(index => $"{columns[index].Title}: {item.SubItems[index].Text}"));
+        if (rowToCopy.Length > 0)
+            rowMenu.Show(this, e.Location);
+    }
+
     protected override void Dispose(bool disposing)
     {
         if (disposing)
+        {
+            rowMenu.Dispose();
             dividerFont?.Dispose();
+        }
         base.Dispose(disposing);
     }
 }
