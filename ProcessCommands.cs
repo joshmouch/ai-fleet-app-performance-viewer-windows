@@ -13,7 +13,7 @@ internal sealed record ProcessIdentity(string Machine, int Pid, string Name, lon
 
 internal sealed class ProcessCommands : IDisposable
 {
-    private readonly Dictionary<ProcessIdentity, (long ReadAt, string Command)> cache = new();
+    private readonly Dictionary<ProcessIdentity, (long ReadAt, string Command, string Failure)> cache = new();
     private ListView table;
     private int column;
     private Func<ListViewItem, ProcessIdentity> identify;
@@ -37,7 +37,8 @@ internal sealed class ProcessCommands : IDisposable
         else if (cache.TryGetValue(process, out var entry))
         {
             item.SubItems[commandColumn].Text = entry.Command ?? "—";
-            item.ToolTipText = entry.Command ?? "Command line unavailable";
+            item.ToolTipText = entry.Command ?? (entry.Failure == null ? "Command line unavailable"
+                : "Command line unavailable: " + entry.Failure);
         }
         else
         {
@@ -85,9 +86,11 @@ internal sealed class ProcessCommands : IDisposable
                 return;
 
             long readAt = Stopwatch.GetTimestamp();
-            var commands = batches.SelectMany(batch => batch).ToDictionary(pair => pair.Key, pair => pair.Value);
+            var commands = batches.SelectMany(batch => batch.Commands).ToDictionary(pair => pair.Key, pair => pair.Value);
+            var failures = batches.Where(batch => batch.Failure != null).ToDictionary(batch => batch.Machine, batch => batch.Failure,
+                StringComparer.OrdinalIgnoreCase);
             foreach (var process in processes)
-                cache[process] = (readAt, commands.GetValueOrDefault(process));
+                cache[process] = (readAt, commands.GetValueOrDefault(process), failures.GetValueOrDefault(process.Machine));
             if (table?.VirtualMode == true)
                 table.Invalidate();
         }
@@ -99,20 +102,21 @@ internal sealed class ProcessCommands : IDisposable
         }
     }
 
-    private static async Task<Dictionary<ProcessIdentity, string>> ReadMachine(string machine, ProcessIdentity[] processes,
-        CancellationToken cancellation)
+    /// <summary>The machine's command lines, or none with the reason the read failed.</summary>
+    private static async Task<(string Machine, Dictionary<ProcessIdentity, string> Commands, string Failure)> ReadMachine(
+        string machine, ProcessIdentity[] processes, CancellationToken cancellation)
     {
         try
         {
             if (string.Equals(machine, Environment.MachineName, StringComparison.OrdinalIgnoreCase))
-                return await Task.Run(() => ReadWindows(processes), cancellation).ConfigureAwait(false);
+                return (machine, await Task.Run(() => ReadWindows(processes), cancellation).ConfigureAwait(false), null);
             string[] pids = processes.Select(process => process.Pid.ToString(CultureInfo.InvariantCulture)).Distinct().ToArray();
             string output = machine.StartsWith("WSL / ", StringComparison.OrdinalIgnoreCase)
                 ? await ReadWsl(machine[6..], pids, cancellation).ConfigureAwait(false)
                 : await VmDiskIo.ReadGuestCommands(machine, pids, cancellation).ConfigureAwait(false);
-            return ParseLinux(output, processes);
+            return (machine, ParseLinux(output, processes), null);
         }
-        catch (Exception) when (!cancellation.IsCancellationRequested) { return new(); }
+        catch (Exception e) when (!cancellation.IsCancellationRequested) { return (machine, new(), e.Message); }
     }
 
     private static Dictionary<ProcessIdentity, string> ReadWindows(ProcessIdentity[] processes)
@@ -142,13 +146,18 @@ internal sealed class ProcessCommands : IDisposable
 
     private static async Task<string> ReadWsl(string distro, string[] pids, CancellationToken cancellation)
     {
-        string code = await VmDiskIo.ReadScript("GuestCommands.sh", cancellation).ConfigureAwait(false);
+        string code = VmDiskIo.ReadScript("GuestCommands.sh");
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
         deadline.CancelAfter(TimeSpan.FromSeconds(8));
         var result = await VmDiskIo.Run(CpuProcessSampler.Wsl,
             new[] { "--distribution", distro, "--exec", "/bin/sh", "-s", "--" }.Concat(pids), code, deadline.Token)
             .ConfigureAwait(false);
-        return result.ExitCode == 0 ? result.Output : "";
+        if (result.ExitCode == 0)
+            return result.Output;
+        // wsl.exe writes its own errors as UTF-16, so the NULs are dropped before the first line is read.
+        string line = result.Error.Replace("\0", "").Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .FirstOrDefault();
+        throw new InvalidOperationException($"WSL exit code {result.ExitCode}" + (line == null ? "" : ": " + line));
     }
 
     private static Dictionary<ProcessIdentity, string> ParseLinux(string output, ProcessIdentity[] processes)

@@ -252,6 +252,7 @@ internal sealed class Timeline : Form
     private DiskCounters diskCounters;
     private PdhQuery guestCounters;
     private HyperVHostCounters hostCounters;
+    private string hostCountersFailure;
     private string[] diskCardLayout = Array.Empty<string>();
     private CpuExpansionTarget[] availableGuests = Array.Empty<CpuExpansionTarget>();
     private double nextGuestRefresh;
@@ -782,7 +783,7 @@ internal sealed class Timeline : Form
             UpdateGuestMenu();
             SharedOptionsChanged();
         }
-        catch (Win32Exception) { }
+        catch (Exception) { } // async void: the guest list stays as it was; nothing may escape to crash the viewer
         finally { loadingGuests = false; }
     }
 
@@ -864,7 +865,10 @@ internal sealed class Timeline : Form
     {
         try { hostCounters = new HyperVHostCounters(); }
         catch (Exception e) when (e is InvalidOperationException or DllNotFoundException or EntryPointNotFoundException
-            or System.Text.Json.JsonException or KeyNotFoundException or ArgumentException) { }
+            or System.Text.Json.JsonException or KeyNotFoundException or ArgumentException)
+        {
+            hostCountersFailure = e.Message; // permanent for this run, unlike a null Read(), so it is shown
+        }
     }
 
     private async void SwitchView(bool disks)
@@ -892,9 +896,7 @@ internal sealed class Timeline : Form
             volumePaths = new VolumePathIndex(diskIdentities.Values
                 .Where(item => item.Volumes != null).SelectMany(item => item.Volumes));
         }
-        catch (ManagementException) { }
-        catch (UnauthorizedAccessException) { }
-        catch (COMException) { }
+        catch (Exception) { } // async void: disks keep their generic names; nothing may escape to crash the viewer
         finally
         {
             loadingDiskNames = false;
@@ -1393,7 +1395,8 @@ internal sealed class Timeline : Form
                     (virtualDiskStatus == null ? "" : "  |  " + virtualDiskStatus))
                 : error ?? (processors.Length == 0 ? "Collecting the first sample..." :
                     "Overall " + Percent(latest?.HostCpu?.Overall.Total ?? latest?.Total) + "  |  " +
-                    (physical?.Processors.Count ?? processors.Length) + " logical processors  |  Last " + range.Duration);
+                    (physical?.Processors.Count ?? processors.Length) + " logical processors  |  Last " + range.Duration +
+                    (hostCountersFailure == null ? "" : "  |  Hyper-V CPU split unavailable: " + hostCountersFailure));
             if (description.Text != detail)
                 description.Text = detail;
 

@@ -108,7 +108,7 @@ internal struct FileIoTotals
     public static void AddTo<TKey>(Dictionary<TKey, FileIoTotals> target, TKey key, FileIoTotals value)
     {
         // One hash and probe per update: the slot is updated in place, starting at default for a new key.
-        ref var slot = ref System.Runtime.InteropServices.CollectionsMarshal.GetValueRefOrAddDefault(target, key, out _);
+        ref var slot = ref CollectionsMarshal.GetValueRefOrAddDefault(target, key, out _);
         slot.Add(value);
     }
 }
@@ -178,7 +178,8 @@ internal sealed class VolumeFileIo : IDisposable
     {
         scope = new TraceScope(details, virtualDisks, index);
         detailStarted = virtualStarted = Stopwatch.GetTimestamp();
-        Task.Run(Run);
+        // Run blocks for the whole trace, so it gets its own thread rather than pinning a thread-pool thread.
+        Task.Factory.StartNew(Run, TaskCreationOptions.LongRunning);
     }
 
     public void SetScope(bool details, int[] virtualDisks, VolumePathIndex index)
@@ -216,25 +217,41 @@ internal sealed class VolumeFileIo : IDisposable
             using var self = Process.GetCurrentProcess();
             string owner = SessionPrefix + self.Id + "-" + self.StartTime.ToUniversalTime().Ticks + "-";
             bool fileInfoAvailable = false;
-            lock (lifecycle)
+            if (disposed)
+                return;
+            // ETW startup is slow, so it runs outside `lifecycle`: Dispose must never wait behind it. The session is
+            // published only after it is enabled; a Dispose that won the race is handled by the check under the lock.
+            ReapAbandonedSessions();
+            var opened = OpenSession(owner);
+            try
             {
-                if (disposed)
-                    return;
-                ReapAbandonedSessions();
-                session = OpenSession(owner);
-                session.EnableKernelProvider(KernelTraceEventParser.Keywords.DiskIO |
+                opened.EnableKernelProvider(KernelTraceEventParser.Keywords.DiskIO |
                     KernelTraceEventParser.Keywords.DiskIOInit | KernelTraceEventParser.Keywords.DiskFileIO |
                     KernelTraceEventParser.Keywords.Process | KernelTraceEventParser.Keywords.Thread);
                 try
                 {
-                    session.EnableProvider(FileInfoProvider, TraceEventLevel.Verbose, FileNameEvents);
+                    opened.EnableProvider(FileInfoProvider, TraceEventLevel.Verbose, FileNameEvents);
                     fileInfoAvailable = true;
                 }
                 catch (UnauthorizedAccessException) { }
                 catch (Win32Exception) { }
+                lock (lifecycle)
+                {
+                    if (disposed)
+                    {
+                        opened.Dispose();
+                        return;
+                    }
+                    session = opened;
+                }
+            }
+            catch
+            {
+                opened.Dispose();
+                throw;
             }
 
-            var source = session.Source;
+            var source = opened.Source;
             foreach (var process in Process.GetProcesses())
                 using (process)
                 {
@@ -984,7 +1001,9 @@ internal sealed class DiskIoDetails : Panel
             inventoryCancellation?.Dispose();
             inventoryCancellation = new();
             inventoryPathIndex = captureIndex;
-            inventory = VmDiskIo.ReadInventory(inventoryCancellation.Token, inventoryPathIndex);
+            var inventoryToken = inventoryCancellation.Token;
+            var inventoryIndex = inventoryPathIndex;
+            inventory = Task.Run(() => VmDiskIo.ReadInventory(inventoryToken, inventoryIndex), inventoryToken);
         }
     }
 
@@ -1252,8 +1271,8 @@ internal sealed class DiskIoDetails : Panel
         double seconds, Dictionary<string, VmDiskOwners> owners,
         Dictionary<FileIoKey, (string Label, string Help)> pendingRows = null)
     {
-        var matched = (filter.Length == 0 ? entries : entries.Where(row => RowFilter.Matches(filter, row.Key.Process, row.Machine,
-            row.Key.Pid.ToString(), row.Key.Path))).ToArray();
+        var matched = RowFilter.Apply(entries, filter, row => new[] { row.Key.Process, row.Machine,
+            row.Key.Pid.ToString(), row.Key.Path }).ToArray();
         var gaps = matched.Where(IsGap).ToArray();
         if (gaps.Length > 0 && seconds > 0)
         {

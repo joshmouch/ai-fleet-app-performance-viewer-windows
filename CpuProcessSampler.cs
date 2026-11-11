@@ -107,29 +107,26 @@ internal static class CpuProcessSampler
         string.Equals(name, "vmmem", StringComparison.OrdinalIgnoreCase) ||
         string.Equals(name, "vmmem.exe", StringComparison.OrdinalIgnoreCase);
 
-    /// <summary>One cluster CPU sample. Runs on the thread pool, so its synchronous process starts, registry and WMI reads
-    /// never run on the caller's UI thread.</summary>
-    public static Task<ClusterCpuSample> ReadCluster(CpuExpansionTarget[] targets, CancellationToken cancellation) =>
-        Task.Run(() => ReadClusterOnPool(targets, cancellation), cancellation);
-
-    private static async Task<ClusterCpuSample> ReadClusterOnPool(CpuExpansionTarget[] targets, CancellationToken cancellation)
+    /// <summary>One cluster CPU sample. Its process starts, registry and WMI reads are synchronous, so the caller runs it on
+    /// the thread pool.</summary>
+    public static async Task<ClusterCpuSample> ReadCluster(CpuExpansionTarget[] targets, CancellationToken cancellation)
     {
         var selected = targets.Where(target => !target.IsWsl).Select(target => target.Name)
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
         bool expandWsl = targets.Any(target => target.IsWsl);
         int? wslPid = expandWsl ? FindWslProcess() : null;
-        var wslNames = wslPid.HasValue ? ReadRunningWslDistros(cancellation) : Task.FromResult(Array.Empty<WslDistro>());
+        var wslNames = wslPid.HasValue ? ReadRunningWslDistros(cancellation)
+            : Task.FromResult((Distros: Array.Empty<WslDistro>(), Failure: (string)null));
         GuestOwner[] owners;
         try
         {
-            owners = selected.Count == 0 ? Array.Empty<GuestOwner>() :
-                await Task.Run(() => ReadGuestOwners(selected), cancellation).ConfigureAwait(false);
+            owners = selected.Count == 0 ? Array.Empty<GuestOwner>() : ReadGuestOwners(selected);
         }
         catch (Exception e) when (e is ManagementException or UnauthorizedAccessException or COMException)
         {
             owners = Array.Empty<GuestOwner>();
         }
-        var distrosToSample = await wslNames.ConfigureAwait(false);
+        var (distrosToSample, listFailure) = await wslNames.ConfigureAwait(false);
         cancellation.ThrowIfCancellationRequested();
         var hostTask = Task.Run(() => ReadHost(cancellation), cancellation);
         var hypervisorTask = Task.Run(() => ReadGuestBudgets(targets, cancellation), cancellation);
@@ -159,7 +156,10 @@ internal static class CpuProcessSampler
         }
         if (targets.FirstOrDefault(target => target.IsWsl) is { } wsl)
         {
-            var distros = await wslTask.ConfigureAwait(false);
+            var reads = await wslTask.ConfigureAwait(false);
+            var distros = reads.Where(read => read.Sample != null).ToArray();
+            string distroFailures = string.Join("; ", reads.Where(read => read.Failure != null)
+                .Select(read => $"{read.Name}: {read.Failure}"));
             var wrapper = host.Rows.FirstOrDefault(row => row.Pid == wslPid);
             double? budget = budgets.GetValueOrDefault(wsl) ?? wrapper?.Cores;
             var distroRows = Array.Empty<CpuMachineProcesses>();
@@ -172,7 +172,8 @@ internal static class CpuProcessSampler
                 expanded.AddRange(distroRows);
             }
             coverage.Add(new GuestCpuCoverage(wsl.Name, budget,
-                AssignedCores(distroRows.SelectMany(distro => distro.Rows)), distros.Length > 0));
+                AssignedCores(distroRows.SelectMany(distro => distro.Rows)), distros.Length > 0,
+                listFailure ?? (distroFailures.Length > 0 ? distroFailures : null)));
             if (budget.HasValue && wrapper != null)
                 replacedPids.Add(wrapper.Pid);
         }
@@ -221,20 +222,12 @@ internal static class CpuProcessSampler
         finally { foreach (var process in processes) process.Dispose(); }
     }
 
-    private static async Task<(string Name, CpuProcessSample Sample)[]> ReadWsl(string[] names, CancellationToken cancellation)
+    /// <summary>Every distro's sample or, for one that failed, the reason.</summary>
+    private static Task<(string Name, CpuProcessSample Sample, string Failure)[]> ReadWsl(string[] names,
+        CancellationToken cancellation)
     {
-        if (names.Length == 0)
-            return Array.Empty<(string, CpuProcessSample)>();
-        try
-        {
-            string code = await VmDiskIo.ReadScript("GuestCpu.sh", cancellation).ConfigureAwait(false);
-            var samples = await Task.WhenAll(names.Select(name => ReadWslDistro(name, code, cancellation))).ConfigureAwait(false);
-            return samples.Where(sample => sample.Sample != null).ToArray();
-        }
-        catch (Exception) when (!cancellation.IsCancellationRequested)
-        {
-            return Array.Empty<(string, CpuProcessSample)>();
-        }
+        string code = VmDiskIo.ReadScript("GuestCpu.sh");
+        return Task.WhenAll(names.Select(name => ReadWslDistro(name, code, cancellation)));
     }
 
     internal sealed record WslDistro(string Name, string Vhdx);
@@ -281,20 +274,20 @@ internal static class CpuProcessSampler
             .Select(line => line.Trim('\r', '\uFEFF')).ToHashSet(StringComparer.OrdinalIgnoreCase);
     }
 
-    private static async Task<WslDistro[]> ReadRunningWslDistros(CancellationToken cancellation)
+    private static async Task<(WslDistro[] Distros, string Failure)> ReadRunningWslDistros(CancellationToken cancellation)
     {
         try
         {
             var running = await ReadRunningWslNames(cancellation).ConfigureAwait(false);
-            return ReadWslDistros().Where(distro => running.Contains(distro.Name)).ToArray();
+            return (ReadWslDistros().Where(distro => running.Contains(distro.Name)).ToArray(), null);
         }
-        catch (Exception) when (!cancellation.IsCancellationRequested)
+        catch (Exception e) when (!cancellation.IsCancellationRequested)
         {
-            return Array.Empty<WslDistro>();
+            return (Array.Empty<WslDistro>(), e.Message);
         }
     }
 
-    private static async Task<(string Name, CpuProcessSample Sample)> ReadWslDistro(
+    private static async Task<(string Name, CpuProcessSample Sample, string Failure)> ReadWslDistro(
         string name, string code, CancellationToken cancellation)
     {
         try
@@ -303,9 +296,14 @@ internal static class CpuProcessSampler
             deadline.CancelAfter(TimeSpan.FromSeconds(12));
             var result = await VmDiskIo.Run(Wsl, new[] { "--distribution", name, "--exec", "/bin/sh", "-s" }, code,
                 deadline.Token).ConfigureAwait(false);
-            return (name, result.ExitCode == 0 ? ParseGuest(result.Output) : null);
+            if (result.ExitCode == 0)
+                return (name, ParseGuest(result.Output), null);
+            // wsl.exe writes its own errors as UTF-16, so the NULs are dropped before the first line is read.
+            string line = result.Error.Replace("\0", "").Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                .FirstOrDefault();
+            return (name, null, $"exit code {result.ExitCode}" + (line == null ? "" : ": " + line));
         }
-        catch (Exception) when (!cancellation.IsCancellationRequested) { return (name, null); }
+        catch (Exception e) when (!cancellation.IsCancellationRequested) { return (name, null, e.Message); }
     }
 
     internal static CpuProcessSample ParseGuest(string output)
