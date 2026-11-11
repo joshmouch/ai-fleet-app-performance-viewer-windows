@@ -9,7 +9,11 @@ using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 
-internal sealed record VmDisk(string VMName, string Path, string Controller, int Location, bool SingleScsiController);
+internal sealed record VmDisk(string VMName, string Path, string Controller, int Location, bool SingleScsiController,
+    string WslDistro = null)
+{
+    public string ExpansionTarget => WslDistro == null ? VMName : "WSL";
+}
 
 internal sealed record VmDiskOwners(string Label, VmDisk Attachment);
 
@@ -41,7 +45,17 @@ internal static class VmDiskIo
             }
             ConvertTo-Json -InputObject @($rows) -Compress
             """;
-        var attachments = await ReadHyperV<VmDisk[]>(script, cancellation).ConfigureAwait(false);
+        var wsl = CpuProcessSampler.ReadRunningWslDistros(cancellation);
+        VmDisk[] hyperV;
+        try { hyperV = await ReadHyperV<VmDisk[]>(script, cancellation).ConfigureAwait(false); }
+        catch (Exception) when (!cancellation.IsCancellationRequested)
+        {
+            if ((await wsl.ConfigureAwait(false)).Length == 0)
+                throw;
+            hyperV = Array.Empty<VmDisk>();
+        }
+        var attachments = hyperV.Concat((await wsl.ConfigureAwait(false)).Where(distro => distro.Vhdx != null)
+            .Select(distro => new VmDisk("WSL / " + distro.Name, distro.Vhdx, "", -1, false, distro.Name)));
         return attachments.Where(disk => !string.IsNullOrEmpty(disk?.Path))
             .GroupBy(disk => Normalize(disk.Path), StringComparer.OrdinalIgnoreCase).ToDictionary(
             group => group.Key, group =>
@@ -73,6 +87,8 @@ internal static class VmDiskIo
 
     public static Task<GuestIoSample> Sample(VmDisk disk, CancellationToken cancellation)
     {
+        if (disk.WslDistro != null)
+            return ReadWslDisk(disk.WslDistro, cancellation);
         if (disk.Controller != "SCSI" || !disk.SingleScsiController)
             throw new InvalidOperationException("Guest disk matching requires a VM with one Hyper-V SCSI controller.");
         if (!IsGuestAddress(disk.VMName) || disk.Location < 0 || disk.Location > 63)
@@ -81,8 +97,30 @@ internal static class VmDiskIo
             new[] { "sudo", "-n", "/usr/bin/python3", "-I", "-", disk.Location.ToString(System.Globalization.CultureInfo.InvariantCulture) }, cancellation);
     }
 
+    private static async Task<GuestIoSample> ReadWslDisk(string distro, CancellationToken cancellation)
+    {
+        string code = await ReadScript("GuestDiskIo.py", cancellation).ConfigureAwait(false);
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
+        deadline.CancelAfter(TimeSpan.FromSeconds(28));
+        var result = await Run(CpuProcessSampler.Wsl,
+            new[] { "--distribution", distro, "--user", "root", "--exec", "/usr/bin/python3", "-I", "-", "root" },
+            code, deadline.Token).ConfigureAwait(false);
+        if (result.ExitCode != 0)
+        {
+            string error = result.Error.Split('\n').FirstOrDefault(line => line.StartsWith("Guest disk I/O: ", StringComparison.Ordinal));
+            throw new InvalidOperationException(error?.TrimEnd() ??
+                $"Could not run the WSL disk sampler in {distro}. It requires Python 3 and bpftrace.");
+        }
+        return JsonSerializer.Deserialize<GuestIoSample>(result.Output)
+            ?? throw new InvalidOperationException("WSL returned no guest disk sample.");
+    }
+
     public static Task<CpuProcessSample> SampleCpu(string vmName, CancellationToken cancellation) =>
         ReadGuest(vmName, "GuestCpu.sh", "CPU", 12, new[] { "/bin/sh", "-s" }, cancellation, CpuProcessSampler.ParseGuest);
+
+    public static Task<string> ReadGuestCommands(string vmName, string[] pids, CancellationToken cancellation) =>
+        ReadGuest(vmName, "GuestCommands.sh", "command line", 8,
+            new[] { "/bin/sh", "-s", "--" }.Concat(pids).ToArray(), cancellation, output => output);
 
     private static string SettingsPath() => System.IO.Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "AIFleetPerformanceViewer", "settings.json");

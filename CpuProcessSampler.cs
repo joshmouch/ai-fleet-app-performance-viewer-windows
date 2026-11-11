@@ -12,14 +12,17 @@ using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Win32;
 
-internal sealed record CpuProcessRow(int Pid, string Process, double Cores, double? GuestCpuShare = null);
+internal sealed record CpuProcessRow(int Pid, string Process, double Cores, double? GuestCpuShare = null,
+    double? AttributedCores = null, long Started = 0);
 internal sealed record CpuProcessSample(int LogicalProcessors, double Seconds, CpuProcessRow[] Rows,
     double TotalCores = 0, double ProcessCores = 0);
-internal sealed record CpuMachineProcesses(string Name, CpuProcessRow[] Rows, double? VmCores = null);
-internal sealed record ClusterCpuSample(CpuProcessSample Host, CpuMachineProcesses[] Guests, string[] Unexpanded);
+internal sealed record CpuMachineProcesses(string Name, CpuProcessRow[] Rows);
+internal sealed record GuestCpuCoverage(string Machine, double? HostCores, double AttributedCores, bool SampleAvailable);
+internal sealed record ClusterCpuSample(CpuProcessSample Host, CpuMachineProcesses[] Guests, GuestCpuCoverage[] Coverage);
 internal sealed record CpuExpansionTarget(string Name, bool IsWsl = false, string CounterName = null)
 {
     public string CounterInstance => IsWsl ? CounterName : Name;
+    public string CounterPrefix => CounterInstance == null ? null : CounterInstance + ":hv vp ";
     public override string ToString() => Name;
 }
 
@@ -27,7 +30,7 @@ internal static class CpuProcessSampler
 {
     private sealed record Guest(string Name, int WorkerPid);
     private sealed record GuestOwner(string Name, HashSet<int> AccountingPids);
-    private static readonly string Wsl = Path.Combine(Environment.SystemDirectory, "wsl.exe");
+    internal static readonly string Wsl = Path.Combine(Environment.SystemDirectory, "wsl.exe");
 
     [DllImport("kernel32.dll")]
     private static extern uint GetActiveProcessorCount(ushort groupNumber);
@@ -109,7 +112,7 @@ internal static class CpuProcessSampler
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
         bool expandWsl = targets.Any(target => target.IsWsl);
         int? wslPid = expandWsl ? FindWslProcess() : null;
-        var wslNames = wslPid.HasValue ? ReadRunningWslDistros(cancellation) : Task.FromResult(Array.Empty<string>());
+        var wslNames = wslPid.HasValue ? ReadRunningWslDistros(cancellation) : Task.FromResult(Array.Empty<WslDistro>());
         GuestOwner[] owners;
         try
         {
@@ -123,65 +126,87 @@ internal static class CpuProcessSampler
         var distrosToSample = await wslNames.ConfigureAwait(false);
         cancellation.ThrowIfCancellationRequested();
         var hostTask = Task.Run(() => ReadHost(cancellation), cancellation);
-        var guestTasks = owners.Select(owner => ReadGuest(owner, cancellation)).ToArray();
-        var wslTask = ReadWsl(distrosToSample, cancellation);
-        await Task.WhenAll(guestTasks.Cast<Task>().Append(hostTask).Append(wslTask)).ConfigureAwait(false);
+        var hypervisorTask = Task.Run(() => ReadGuestBudgets(targets, cancellation), cancellation);
+        var guestTasks = targets.Where(target => !target.IsWsl)
+            .Select(async target => (Target: target, Sample: await ReadGuest(target.Name, cancellation).ConfigureAwait(false)))
+            .ToArray();
+        var wslTask = ReadWsl(distrosToSample.Select(distro => distro.Name).ToArray(), cancellation);
+        await Task.WhenAll(guestTasks.Cast<Task>().Append(hostTask).Append(wslTask).Append(hypervisorTask)).ConfigureAwait(false);
 
         var host = await hostTask.ConfigureAwait(false);
+        var budgets = await hypervisorTask.ConfigureAwait(false);
         var expanded = new List<CpuMachineProcesses>();
-        var unexpanded = selected.Except(owners.Select(owner => owner.Name), StringComparer.OrdinalIgnoreCase).ToList();
+        var coverage = new List<GuestCpuCoverage>();
         var replacedPids = new HashSet<int>();
         foreach (var task in guestTasks)
         {
-            var (owner, sample) = await task.ConfigureAwait(false);
-            if (sample == null)
-            {
-                unexpanded.Add(owner.Name);
-                continue;
-            }
-            var wrappers = host.Rows.Where(row => IsVmmem(row.Process) && owner.AccountingPids.Contains(row.Pid)).ToArray();
-            if (wrappers.Length == 0)
-                continue;
-            if (sample.TotalCores <= 0 || sample.Rows.Length == 0)
-            {
-                unexpanded.Add(owner.Name);
-                continue;
-            }
-            double vmCores = wrappers.Sum(row => row.Cores);
-            expanded.Add(Scale(owner.Name, sample, sample.TotalCores, vmCores));
-            replacedPids.UnionWith(wrappers.Select(row => row.Pid));
+            var (target, sample) = await task.ConfigureAwait(false);
+            var owner = owners.FirstOrDefault(owner => owner.Name == target.Name);
+            var wrappers = host.Rows.Where(row => owner?.AccountingPids.Contains(row.Pid) == true).ToArray();
+            double? budget = budgets.GetValueOrDefault(target) ?? (wrappers.Length > 0 ? wrappers.Sum(row => row.Cores) : null);
+            var rows = sample == null ? Array.Empty<CpuProcessRow>() : Scale(sample, sample.TotalCores, budget);
+            coverage.Add(new GuestCpuCoverage(target.Name, budget, AssignedCores(rows), sample != null));
+            if (rows.Length > 0)
+                expanded.Add(new CpuMachineProcesses(target.Name, rows));
+            if (budget.HasValue)
+                replacedPids.UnionWith(wrappers.Select(row => row.Pid));
         }
-        if (expandWsl)
+        if (targets.FirstOrDefault(target => target.IsWsl) is { } wsl)
         {
             var distros = await wslTask.ConfigureAwait(false);
-            var wrapper = host.Rows.FirstOrDefault(row => row.Pid == wslPid &&
-                string.Equals(row.Process, "vmmemWSL", StringComparison.OrdinalIgnoreCase));
-            double busy = distros.Length == 0 ? 0 :
-                Math.Max(distros.Max(distro => distro.Sample.TotalCores), distros.Sum(distro => distro.Sample.ProcessCores));
-            if (distros.Length == 0 || (wrapper != null && (busy <= 0 || !distros.Any(distro => distro.Sample.Rows.Length > 0))))
-                unexpanded.Add("WSL");
-            else if (wrapper != null)
+            var wrapper = host.Rows.FirstOrDefault(row => row.Pid == wslPid);
+            double? budget = budgets.GetValueOrDefault(wsl) ?? wrapper?.Cores;
+            var distroRows = Array.Empty<CpuMachineProcesses>();
+            if (distros.Length > 0)
             {
-                expanded.AddRange(distros.Where(distro => distro.Sample.Rows.Length > 0).Select(distro =>
-                    Scale("WSL / " + distro.Name, distro.Sample, busy, wrapper.Cores, distro.Sample.ProcessCores)));
-                replacedPids.Add(wrapper.Pid);
+                double busy = Math.Max(distros.Max(distro => distro.Sample.TotalCores),
+                    distros.Sum(distro => distro.Sample.ProcessCores));
+                distroRows = distros.Select(distro => new CpuMachineProcesses(
+                    "WSL / " + distro.Name, Scale(distro.Sample, busy, budget))).ToArray();
+                expanded.AddRange(distroRows);
             }
+            coverage.Add(new GuestCpuCoverage(wsl.Name, budget,
+                AssignedCores(distroRows.SelectMany(distro => distro.Rows)), distros.Length > 0));
+            if (budget.HasValue && wrapper != null)
+                replacedPids.Add(wrapper.Pid);
         }
         return new ClusterCpuSample(host with { Rows = host.Rows.Where(row => !replacedPids.Contains(row.Pid)).ToArray() },
-            expanded.ToArray(), unexpanded.Order(StringComparer.OrdinalIgnoreCase).ToArray());
+            expanded.ToArray(), coverage.ToArray());
     }
 
-    private static CpuMachineProcesses Scale(string name, CpuProcessSample sample, double guestBusyCores,
-        double hostCores, double? groupGuestCores = null)
+    private static async Task<Dictionary<CpuExpansionTarget, double?>> ReadGuestBudgets(
+        CpuExpansionTarget[] targets, CancellationToken cancellation)
     {
-        var rows = sample.Rows.Select(row =>
+        var result = new Dictionary<CpuExpansionTarget, double?>();
+        if (!targets.Any(target => target.CounterPrefix != null))
+            return result;
+        try
         {
-            double share = row.Cores / guestBusyCores;
-            return row with { Cores = hostCores * share, GuestCpuShare = share };
-        }).ToArray();
-        double groupCores = groupGuestCores is double subtotal ? hostCores * (subtotal / guestBusyCores) : hostCores;
-        return new CpuMachineProcesses(name, rows, groupCores);
+            using var query = new PdhQuery(@"\Hyper-V Hypervisor Virtual Processor(*)\% Guest Run Time");
+            await Task.Delay(1000, cancellation).ConfigureAwait(false);
+            query.Collect();
+            var values = query.Read(0);
+            foreach (var target in targets.Where(target => target.CounterPrefix != null))
+            {
+                var processors = values.Where(pair => pair.Key.StartsWith(target.CounterPrefix, StringComparison.OrdinalIgnoreCase)
+                    && int.TryParse(pair.Key.AsSpan(target.CounterPrefix.Length), out _)).ToArray();
+                if (processors.Length > 0)
+                    result.Add(target, processors.Sum(pair => Math.Clamp(pair.Value, 0, 100)) / 100);
+            }
+        }
+        catch (InvalidOperationException) { }
+        return result;
     }
+
+    private static CpuProcessRow[] Scale(CpuProcessSample sample, double busy, double? budget) =>
+        sample.Rows.Select(row => row with
+        {
+            GuestCpuShare = sample.TotalCores > 0 ? row.Cores / sample.TotalCores : null,
+            AttributedCores = busy > 0 ? budget * (row.Cores / busy) : null
+        }).ToArray();
+
+    private static double AssignedCores(IEnumerable<CpuProcessRow> rows) =>
+        rows.Sum(row => row.AttributedCores ?? 0);
 
     private static int? FindWslProcess()
     {
@@ -197,7 +222,8 @@ internal static class CpuProcessSampler
         try
         {
             string code = await VmDiskIo.ReadScript("GuestCpu.sh", cancellation).ConfigureAwait(false);
-            return await Task.WhenAll(names.Select(name => ReadWslDistro(name, code, cancellation))).ConfigureAwait(false);
+            var samples = await Task.WhenAll(names.Select(name => ReadWslDistro(name, code, cancellation))).ConfigureAwait(false);
+            return samples.Where(sample => sample.Sample != null).ToArray();
         }
         catch (Exception) when (!cancellation.IsCancellationRequested)
         {
@@ -205,7 +231,9 @@ internal static class CpuProcessSampler
         }
     }
 
-    private static async Task<string[]> ReadRunningWslDistros(CancellationToken cancellation)
+    internal sealed record WslDistro(string Name, string Vhdx);
+
+    internal static async Task<WslDistro[]> ReadRunningWslDistros(CancellationToken cancellation)
     {
         try
         {
@@ -214,35 +242,41 @@ internal static class CpuProcessSampler
             var list = await VmDiskIo.Run(Wsl, new[] { "--list", "--running", "--quiet" }, null, deadline.Token,
                 Encoding.Unicode).ConfigureAwait(false);
             if (list.ExitCode != 0)
-                return Array.Empty<string>();
+                return Array.Empty<WslDistro>();
             var running = list.Output.Split('\n', StringSplitOptions.RemoveEmptyEntries)
                 .Select(line => line.Trim('\r', '\uFEFF')).ToHashSet(StringComparer.OrdinalIgnoreCase);
             using var registry = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Lxss");
-            var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var distros = new List<WslDistro>();
             foreach (string key in registry?.GetSubKeyNames() ?? Array.Empty<string>())
             {
                 using var distro = registry.OpenSubKey(key);
                 if (distro?.GetValue("Version") is 2 && distro.GetValue("DistributionName") is string name && running.Contains(name))
-                    names.Add(name);
+                {
+                    string basePath = distro.GetValue("BasePath") as string;
+                    string file = distro.GetValue("VhdFileName") as string ?? "ext4.vhdx";
+                    distros.Add(new WslDistro(name, basePath == null ? null : Path.Combine(basePath, file)));
+                }
             }
-            return names.Order(StringComparer.OrdinalIgnoreCase).ToArray();
+            return distros.OrderBy(distro => distro.Name, StringComparer.OrdinalIgnoreCase).ToArray();
         }
         catch (Exception) when (!cancellation.IsCancellationRequested)
         {
-            return Array.Empty<string>();
+            return Array.Empty<WslDistro>();
         }
     }
 
     private static async Task<(string Name, CpuProcessSample Sample)> ReadWslDistro(
         string name, string code, CancellationToken cancellation)
     {
-        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
-        deadline.CancelAfter(TimeSpan.FromSeconds(12));
-        var result = await VmDiskIo.Run(Wsl, new[] { "--distribution", name, "--exec", "/bin/sh", "-s" }, code,
-            deadline.Token).ConfigureAwait(false);
-        if (result.ExitCode != 0)
-            throw new InvalidOperationException("WSL CPU sampling failed.");
-        return (name, ParseGuest(result.Output));
+        try
+        {
+            using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
+            deadline.CancelAfter(TimeSpan.FromSeconds(12));
+            var result = await VmDiskIo.Run(Wsl, new[] { "--distribution", name, "--exec", "/bin/sh", "-s" }, code,
+                deadline.Token).ConfigureAwait(false);
+            return (name, result.ExitCode == 0 ? ParseGuest(result.Output) : null);
+        }
+        catch (Exception) when (!cancellation.IsCancellationRequested) { return (name, null); }
     }
 
     internal static CpuProcessSample ParseGuest(string output)
@@ -261,30 +295,23 @@ internal static class CpuProcessSampler
                 processTicks = double.Parse(fields[4], CultureInfo.InvariantCulture);
                 logicalProcessors = int.Parse(fields[5], CultureInfo.InvariantCulture);
             }
-            else if (fields.Length == 3 && int.TryParse(fields[0], out int pid) &&
-                long.TryParse(fields[1], out long ticks) && ticks > 0)
-                ticksByProcess.Add(new CpuProcessRow(pid, fields[2], ticks));
+            else if (fields.Length == 4 && int.TryParse(fields[0], out int pid) &&
+                long.TryParse(fields[1], out long ticks) && ticks > 0 && long.TryParse(fields[2], out long started))
+                ticksByProcess.Add(new CpuProcessRow(pid, fields[3], ticks, Started: started));
         }
         if (!(seconds > 0 && ticksPerSecond > 0 && logicalProcessors > 0))
             throw new InvalidOperationException("Linux CPU sample was incomplete.");
         double divisor = seconds * ticksPerSecond;
         return new CpuProcessSample(logicalProcessors, seconds,
-            ticksByProcess.OrderByDescending(row => row.Cores).ThenBy(row => row.Pid).Take(50)
+            ticksByProcess.OrderByDescending(row => row.Cores).ThenBy(row => row.Pid)
                 .Select(row => row with { Cores = row.Cores / divisor }).ToArray(),
             Math.Max(busy, processTicks) / divisor, processTicks / divisor);
     }
 
-    private static async Task<(GuestOwner Owner, CpuProcessSample Sample)> ReadGuest(GuestOwner owner, CancellationToken cancellation)
+    private static async Task<CpuProcessSample> ReadGuest(string name, CancellationToken cancellation)
     {
-        if (owner.AccountingPids.Count > 0)
-        {
-            try
-            {
-                return (owner, await VmDiskIo.SampleCpu(owner.Name, cancellation).ConfigureAwait(false));
-            }
-            catch (Exception) when (!cancellation.IsCancellationRequested) { }
-        }
-        return (owner, null);
+        try { return await VmDiskIo.SampleCpu(name, cancellation).ConfigureAwait(false); }
+        catch (Exception) when (!cancellation.IsCancellationRequested) { return null; }
     }
 
     public static async Task<CpuProcessSample> ReadHost(CancellationToken cancellation)
@@ -296,7 +323,7 @@ internal static class CpuProcessSampler
         double seconds = Stopwatch.GetElapsedTime(start).TotalSeconds;
         var rows = after.Where(entry => before.TryGetValue(entry.Key, out var previous) && entry.Value.Time > previous.Time)
             .Select(entry => new CpuProcessRow(entry.Key.Pid, entry.Value.Name,
-                (entry.Value.Time - before[entry.Key].Time).TotalSeconds / seconds))
+                (entry.Value.Time - before[entry.Key].Time).TotalSeconds / seconds, Started: entry.Key.Started))
             .ToArray();
         return new CpuProcessSample(Math.Max(1, (int)GetActiveProcessorCount(ushort.MaxValue)), seconds, rows);
     }

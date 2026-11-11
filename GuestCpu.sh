@@ -41,7 +41,7 @@ ticks=$(getconf CLK_TCK)
             process_ticks += delta
             name = substr($0, length(pid) + 3, length($0) - length(fields) - length(pid) - 4)
             gsub(/[[:cntrl:]]/, " ", name)
-            printf "%d\t%d\t%s\n", pid, delta, name
+            printf "%d\t%d\t%s\t%s\n", pid, delta, stat[20], name
         }
     }
     END {
