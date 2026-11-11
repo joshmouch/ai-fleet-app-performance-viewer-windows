@@ -20,6 +20,7 @@ internal sealed class CpuProcessDetails : Panel
     private CpuExpansionTarget[] selected = Array.Empty<CpuExpansionTarget>();
     private ClusterCpuSample latest;
     private bool groupByMachine;
+    private bool usageBands;
     private string filter = "";
     private sealed record ProcessRow(string Machine, CpuProcessRow Process, double? Impact, double? Cores);
     private int topRows;
@@ -51,6 +52,7 @@ internal sealed class CpuProcessDetails : Panel
         commandColumn = table.AddColumn("Command line", 350, null);
         table.SortBy(impact);
         table.RankingChanged += (_, _) => Render();
+        table.ViewportChanged += (_, _) => commands.Refresh();
         table.SizeChanged += (_, _) =>
         {
             int available = table.ClientSize.Width - SystemInformation.VerticalScrollBarWidth -
@@ -79,12 +81,13 @@ internal sealed class CpuProcessDetails : Panel
         StartSampling();
     }
 
-    public void SetOptions(CpuExpansionTarget[] guests, bool group, int limit, string search)
+    public void SetOptions(CpuExpansionTarget[] guests, bool group, int limit, string search, bool bands)
     {
         bool changedGuests = !selected.SequenceEqual(guests);
         selected = guests;
         groupByMachine = group;
         topRows = limit;
+        usageBands = bands;
         filter = search;
         if (changedGuests && IsOpen)
             StartSampling();
@@ -172,10 +175,11 @@ internal sealed class CpuProcessDetails : Panel
         var rows = host.Rows.Select(row => new ProcessRow(Environment.MachineName, row,
                 100 * row.Cores / host.LogicalProcessors, row.Cores))
             .Concat(latest.Guests.SelectMany(machine => machine.Rows.Select(row => new ProcessRow(machine.Name, row,
-                100 * row.AttributedCores / host.LogicalProcessors, row.AttributedCores))));
+                100 * row.AttributedCores / host.LogicalProcessors, row.AttributedCores)))).ToArray();
         table.Render(rows.Where(row => RowFilter.Matches(filter, row.Process.Process, row.Machine, row.Process.Pid.ToString())),
-            row => row.Machine, groupByMachine, topRows, NewRow);
-        commands.Update(table, commandColumn.Index, item => (ProcessIdentity)item.Tag);
+            row => row.Machine, groupByMachine, topRows, NewRow, usageBands
+                ? (row => row.Cores, rows.Sum(row => row.Cores ?? 0) + missing, "CPU") : null);
+        commands.Update(table, commandColumn.Index, item => item.Tag as ProcessIdentity, usageBands);
     }
 
     private static ListViewItem NewRow(ProcessRow row, ListViewGroup group) =>
