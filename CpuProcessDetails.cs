@@ -162,6 +162,8 @@ internal sealed class CpuProcessDetails : Panel
             .Select(guest => guest.Machine).ToArray();
         if (unavailable.Length > 0)
             status.Text += "  |  Incomplete samples: " + string.Join(", ", unavailable);
+        string guestDomain = VmDiskIo.GuestDomain();
+        status.Text += guestDomain == null ? "  |  Guest domain: not set" : "  |  Guest domain: " + guestDomain;
         string help = string.Join("\n", latest.Coverage.Select(guest =>
             $"{guest.Machine}: " + (guest.HostCores is double cores
                 ? $"{100 * guest.AttributedCores / host.LogicalProcessors:0.##}% of host capacity attributed out of {100 * cores / host.LogicalProcessors:0.##}% measured"
