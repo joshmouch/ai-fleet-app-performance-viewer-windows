@@ -24,7 +24,8 @@ internal sealed record GuestIoSample(string Device, int Seconds, GuestIoRow[] Ro
 
 internal static class VmDiskIo
 {
-    public static async Task<Dictionary<string, VmDiskOwners>> ReadInventory(CancellationToken cancellation)
+    public static async Task<Dictionary<string, VmDiskOwners>> ReadInventory(CancellationToken cancellation,
+        VolumePathIndex paths)
     {
         const string script = """
             $ErrorActionPreference = 'Stop'
@@ -45,19 +46,18 @@ internal static class VmDiskIo
             }
             ConvertTo-Json -InputObject @($rows) -Compress
             """;
-        var wsl = CpuProcessSampler.ReadRunningWslDistros(cancellation);
+        // Registration owns the VHDX identity. Running state can change while the viewer is open.
+        var wsl = CpuProcessSampler.ReadWslDistros().Where(distro => distro.Vhdx != null).ToArray();
         VmDisk[] hyperV;
         try { hyperV = await ReadHyperV<VmDisk[]>(script, cancellation).ConfigureAwait(false); }
-        catch (Exception) when (!cancellation.IsCancellationRequested)
+        catch (Exception) when (!cancellation.IsCancellationRequested && wsl.Length > 0)
         {
-            if ((await wsl.ConfigureAwait(false)).Length == 0)
-                throw;
             hyperV = Array.Empty<VmDisk>();
         }
-        var attachments = hyperV.Concat((await wsl.ConfigureAwait(false)).Where(distro => distro.Vhdx != null)
+        var attachments = hyperV.Concat(wsl
             .Select(distro => new VmDisk("WSL / " + distro.Name, distro.Vhdx, "", -1, false, distro.Name)));
         return attachments.Where(disk => !string.IsNullOrEmpty(disk?.Path))
-            .GroupBy(disk => Normalize(disk.Path), StringComparer.OrdinalIgnoreCase).ToDictionary(
+            .GroupBy(disk => Normalize(paths.Resolve(disk.Path, null) ?? disk.Path), StringComparer.OrdinalIgnoreCase).ToDictionary(
             group => group.Key, group =>
             {
                 var disks = group.Distinct().ToArray();
@@ -99,6 +99,9 @@ internal static class VmDiskIo
 
     private static async Task<GuestIoSample> ReadWslDisk(string distro, CancellationToken cancellation)
     {
+        var running = await CpuProcessSampler.ReadRunningWslNames(cancellation).ConfigureAwait(false);
+        if (!running.Contains(distro))
+            throw new InvalidOperationException($"WSL distribution {distro} is stopped.");
         string code = await ReadScript("GuestDiskIo.py", cancellation).ConfigureAwait(false);
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
         deadline.CancelAfter(TimeSpan.FromSeconds(28));
