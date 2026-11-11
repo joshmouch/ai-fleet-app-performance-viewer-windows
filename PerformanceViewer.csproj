@@ -10,7 +10,7 @@
     <DebugType>embedded</DebugType>
     <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
-    <Version>1.0.6</Version>
+    <Version>1.0.7</Version>
     <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
     <AssemblyName>AI Fleet Cluster Performance Viewer</AssemblyName>
   </PropertyGroup>
