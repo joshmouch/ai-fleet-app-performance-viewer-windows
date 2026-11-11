@@ -12,7 +12,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Win32;
 
-internal sealed record CpuProcessRow(int Pid, string Process, double Cores);
+internal sealed record CpuProcessRow(int Pid, string Process, double Cores, double? GuestCpuShare = null);
 internal sealed record CpuProcessSample(int LogicalProcessors, double Seconds, CpuProcessRow[] Rows,
     double TotalCores = 0, double ProcessCores = 0);
 internal sealed record CpuMachineProcesses(string Name, CpuProcessRow[] Rows, double? VmCores = null);
@@ -132,7 +132,7 @@ internal static class CpuProcessSampler
                 continue;
             }
             double vmCores = wrappers.Sum(row => row.Cores);
-            expanded.Add(Scale(owner.Name, sample, vmCores / sample.TotalCores, vmCores));
+            expanded.Add(Scale(owner.Name, sample, sample.TotalCores, vmCores));
             replacedPids.UnionWith(wrappers.Select(row => row.Pid));
         }
         if (expandWsl)
@@ -146,9 +146,8 @@ internal static class CpuProcessSampler
                 unexpanded.Add("WSL");
             else if (wrapper != null)
             {
-                double scale = wrapper.Cores / busy;
                 expanded.AddRange(distros.Where(distro => distro.Sample.Rows.Length > 0).Select(distro =>
-                    Scale("WSL / " + distro.Name, distro.Sample, scale, distro.Sample.ProcessCores * scale)));
+                    Scale("WSL / " + distro.Name, distro.Sample, busy, wrapper.Cores, distro.Sample.ProcessCores)));
                 replacedPids.Add(wrapper.Pid);
             }
         }
@@ -156,8 +155,17 @@ internal static class CpuProcessSampler
             expanded.ToArray(), unexpanded.Order(StringComparer.OrdinalIgnoreCase).ToArray());
     }
 
-    private static CpuMachineProcesses Scale(string name, CpuProcessSample sample, double scale, double cores) =>
-        new(name, sample.Rows.Select(row => row with { Cores = row.Cores * scale }).ToArray(), cores);
+    private static CpuMachineProcesses Scale(string name, CpuProcessSample sample, double guestBusyCores,
+        double hostCores, double? groupGuestCores = null)
+    {
+        var rows = sample.Rows.Select(row =>
+        {
+            double share = row.Cores / guestBusyCores;
+            return row with { Cores = hostCores * share, GuestCpuShare = share };
+        }).ToArray();
+        double groupCores = groupGuestCores is double subtotal ? hostCores * (subtotal / guestBusyCores) : hostCores;
+        return new CpuMachineProcesses(name, rows, groupCores);
+    }
 
     private static int? FindWslProcess()
     {

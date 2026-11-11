@@ -53,11 +53,18 @@ internal sealed class CpuProcessDetails : Panel
         sidebar.Controls.Add(targets);
         sidebar.Controls.Add(sidebarTitle);
         var name = table.Columns.Add("Process", 200);
-        table.Columns.Add("Machine", 130);
-        table.Columns.Add("PID", 58, HorizontalAlignment.Right);
-        table.Columns.Add("CPU %", 66, HorizontalAlignment.Right);
-        table.Columns.Add("Cores used", 84, HorizontalAlignment.Right);
-        table.SizeChanged += (_, _) => name.Width = Math.Max(70, table.ClientSize.Width - 355);
+        var machineColumn = table.Columns.Add("Machine", 130);
+        table.Columns.Add("PID", 52, HorizontalAlignment.Right);
+        table.Columns.Add("Guest CPU %", 82, HorizontalAlignment.Right);
+        table.Columns.Add("Host CPU %", 80, HorizontalAlignment.Right);
+        table.Columns.Add("Host cores", 70, HorizontalAlignment.Right);
+        table.SizeChanged += (_, _) =>
+        {
+            int available = table.ClientSize.Width - SystemInformation.VerticalScrollBarWidth -
+                table.Columns.Cast<ColumnHeader>().Skip(2).Sum(column => column.Width);
+            machineColumn.Width = Math.Clamp(available - 70, 90, 130);
+            name.Width = Math.Max(70, available - machineColumn.Width);
+        };
         body.Controls.Add(table);
         body.Controls.Add(sidebar);
         Controls.Add(body);
@@ -185,7 +192,7 @@ internal sealed class CpuProcessDetails : Panel
         var machines = latest.Guests.Prepend(new CpuMachineProcesses(Environment.MachineName, host.Rows));
         int maximum = (int)limit.Value;
         bool group = ranking.SelectedIndex == 0 && latest.Guests.Length > 0;
-        status.Text = $"{host.Seconds:0.0} s host sample  |  {host.LogicalProcessors} logical CPUs  |  CPU % of Windows host";
+        status.Text = $"{host.Seconds:0.0} s host sample  |  Guest % of busy CPU  |  Host % of Windows capacity";
         if (latest.Unexpanded.Length > 0)
             status.Text += "  |  Host rows kept for " + string.Join(", ", latest.Unexpanded);
 
@@ -221,6 +228,7 @@ internal sealed class CpuProcessDetails : Panel
 
     private static ListViewItem NewRow(string machine, CpuProcessRow row, int processors, ListViewGroup group = null) =>
         new(new[] { row.Process, machine, row.Pid.ToString(),
+            row.GuestCpuShare is double share ? (100 * share).ToString("0.##") : "",
             (100 * row.Cores / processors).ToString("0.##"), row.Cores.ToString("0.##") }, group);
 
     protected override void Dispose(bool disposing)
