@@ -765,6 +765,7 @@ internal sealed class DiskIoDetails : Panel
     private VolumeFileIo capture;
     private System.Threading.CancellationTokenSource inventoryCancellation;
     private Task<Dictionary<string, VmDiskOwners>> inventory;
+    private VolumePathIndex inventoryPathIndex;
     private readonly Dictionary<VmDisk, (GuestIoWatch Watch, long LastNeeded)> guestWatches = new();
     private HashSet<string> expandedGuests = new(StringComparer.OrdinalIgnoreCase);
     private bool groupByMachine;
@@ -972,10 +973,13 @@ internal sealed class DiskIoDetails : Panel
             capture = new VolumeFileIo(detailsOpen, catalogDisks, captureIndex);
         else
             capture.SetScope(detailsOpen, catalogDisks, captureIndex);
-        if (inventory == null)
+        if (inventory == null || inventoryPathIndex != captureIndex)
         {
+            inventoryCancellation?.Cancel();
+            inventoryCancellation?.Dispose();
             inventoryCancellation = new();
-            inventory = VmDiskIo.ReadInventory(inventoryCancellation.Token);
+            inventoryPathIndex = captureIndex;
+            inventory = VmDiskIo.ReadInventory(inventoryCancellation.Token, inventoryPathIndex);
         }
     }
 
@@ -1294,6 +1298,7 @@ internal sealed class DiskIoDetails : Panel
             string path = row.Key.Path;
             var vm = byPath && row.Guest == null ? owners?.GetValueOrDefault(VmDiskIo.Normalize(path)) : null;
             var pending = Pending(row);
+            bool wslInactive = vm?.Attachment is { WslDistro: not null } wsl && !expandedGuests.Contains(wsl.ExpansionTarget);
             var cells = new List<string>();
             if (byPath)
             {
@@ -1306,7 +1311,7 @@ internal sealed class DiskIoDetails : Panel
                 Rate(value.TotalBytes, BytesPerMiB), Rate(value.ReadBytes, BytesPerMiB),
                 Rate(value.WriteBytes, BytesPerMiB), Rate(value.Operations) });
             if (!guestOnly)
-                cells.Add(row.Guest?.Total.ToString("N2") ?? pending.Label ?? "—");
+                cells.Add(row.Guest?.Total.ToString("N2") ?? pending.Label ?? (wslInactive ? "WSL inactive" : "—"));
             cells.AddRange(new[] { row.Key.Pid > 0 ? row.Key.Pid.ToString() : "—",
                 (value.TotalBytes / BytesPerMiB).ToString("N2"), value.Reads.ToString("N0"), value.Writes.ToString("N0"), value.Operations.ToString("N0") });
             if (!guestOnly)
@@ -1314,6 +1319,8 @@ internal sealed class DiskIoDetails : Panel
             if (!byPath)
                 cells.Add("");
             string help = byPath ? path + (vm?.Label != null ? "\nVM: " + vm.Label : "") : "";
+            if (wslInactive)
+                help += "\nGuest file sampling requires a running distribution and WSL selected under Guests.";
             if (pending.Help != null)
                 help = help.Length == 0 ? pending.Help : help + "\n" + pending.Help;
             return new ListViewItem(cells.ToArray(), group)
