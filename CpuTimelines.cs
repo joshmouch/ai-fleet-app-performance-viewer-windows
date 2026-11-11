@@ -1823,7 +1823,7 @@ internal sealed class Timeline : Form
     [STAThread]
     private static void Main()
     {
-        Application.EnableVisualStyles();
+        ApplicationConfiguration.Initialize();
         try
         {
             using (var counters = new CpuCounters())
