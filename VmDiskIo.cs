@@ -84,6 +84,26 @@ internal static class VmDiskIo
     public static Task<CpuProcessSample> SampleCpu(string vmName, CancellationToken cancellation) =>
         ReadGuest(vmName, "GuestCpu.sh", "CPU", 12, new[] { "/bin/sh", "-s" }, cancellation, CpuProcessSampler.ParseGuest);
 
+    private static string SettingsPath() => System.IO.Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "AIFleetPerformanceViewer", "settings.json");
+
+    /// <summary>DNS domain appended to a VM name to reach it over SSH; null when not configured.</summary>
+    internal static string GuestDomain()
+    {
+        string domain = Environment.GetEnvironmentVariable("PERFORMANCE_VIEWER_GUEST_DOMAIN");
+        if (string.IsNullOrWhiteSpace(domain))
+        {
+            try
+            {
+                using var settings = JsonDocument.Parse(File.ReadAllText(SettingsPath()));
+                if (settings.RootElement.TryGetProperty("guestDomain", out var value)) domain = value.GetString();
+            }
+            catch (Exception) { }
+        }
+        domain = domain?.Trim().Trim('.');
+        return !string.IsNullOrEmpty(domain) && Regex.IsMatch(domain, @"\A[a-zA-Z0-9.-]+\z") ? domain : null;
+    }
+
     internal static bool IsGuestAddress(string name) =>
         name != null && Regex.IsMatch(name, @"\A[a-zA-Z0-9][a-zA-Z0-9-]{0,62}\z");
 
@@ -92,6 +112,9 @@ internal static class VmDiskIo
     {
         if (!IsGuestAddress(vmName))
             throw new InvalidOperationException("This VM does not have a supported guest address.");
+        string domain = GuestDomain();
+        if (domain == null)
+            throw new InvalidOperationException("Guest sampling needs the VMs' DNS domain. Set the PERFORMANCE_VIEWER_GUEST_DOMAIN environment variable, or guestDomain in " + SettingsPath() + ".");
         string key = Environment.GetEnvironmentVariable("NODES_SSH_KEY");
         if (string.IsNullOrWhiteSpace(key))
             key = System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
@@ -108,7 +131,7 @@ internal static class VmDiskIo
             result = await Run(System.IO.Path.Combine(Environment.SystemDirectory, "OpenSSH", "ssh.exe"), new[]
             {
                 "-T", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", "-o", "IdentitiesOnly=yes",
-                "-o", "ConnectTimeout=5", "-i", key, "fleet@" + vmName + ".tail8400d9.ts.net"
+                "-o", "ConnectTimeout=5", "-i", key, "fleet@" + vmName + "." + domain
             }.Concat(command), code, deadline.Token).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (!cancellation.IsCancellationRequested)
