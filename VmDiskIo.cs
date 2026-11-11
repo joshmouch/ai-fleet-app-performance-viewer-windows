@@ -154,18 +154,46 @@ internal static class VmDiskIo
         }
     }
 
+    /// <summary>Ends every guest CPU session (its ssh process tree); the next SampleCpu reopens one. The CPU pane calls
+    /// this when it closes and when the app exits, so no ssh outlives the view that sampled through it.</summary>
+    public static void CloseCpuSessions()
+    {
+        foreach (string vmName in CpuSessions.Keys)
+            CloseCpuSession(vmName);
+    }
+
+    /// <summary>Ends one guest's CPU session, for a guest the pane no longer samples.</summary>
+    public static void CloseCpuSession(string vmName)
+    {
+        if (CpuSessions.TryRemove(vmName, out var session))
+            session.Close();
+    }
+
     private sealed class GuestCpuSession
     {
         private readonly object sync = new();
         private Process process;
         private TaskCompletionSource<string> waiter;
 
-        public void Close()
+        public void Close() => Close(expected: null);
+
+        /// <summary>Ends the session's process; with <paramref name="expected"/>, only while that process is still the
+        /// session's, checked and cleared under one lock, so a stream ending late cannot close a newer session.</summary>
+        private void Close(Process expected)
         {
             Process old;
             TaskCompletionSource<string> pending;
-            lock (sync) { old = process; process = null; pending = waiter; waiter = null; }
+            lock (sync)
+            {
+                if (expected != null && process != expected) return;
+                old = process; process = null; pending = waiter; waiter = null;
+            }
             pending?.TrySetException(new InvalidOperationException("The VM closed the guest CPU sampling connection."));
+            Stop(old);
+        }
+
+        private static void Stop(Process old)
+        {
             try { if (old != null && !old.HasExited) old.Kill(entireProcessTree: true); }
             catch (InvalidOperationException) { }
             catch (System.ComponentModel.Win32Exception) { }
@@ -183,7 +211,6 @@ internal static class VmDiskIo
                 waiter ??= mine;
                 mine = waiter;
             }
-            using var timeout = new CancellationTokenSource(limit);
             try { return await mine.Task.WaitAsync(limit, cancellation).ConfigureAwait(false); }
             catch (TimeoutException) { throw new InvalidOperationException("Guest CPU sampling did not finish."); }
         }
@@ -200,8 +227,9 @@ internal static class VmDiskIo
                 start.ArgumentList.Add(argument);
             start.ArgumentList.Add("/bin/sh -c 'eval \"$(printf %s " + encoded + " | base64 -d)\"' sh loop");
             var started = Process.Start(start);
+            Stop(process); // the previous, exited process: disposed rather than orphaned
             process = started;
-            started.ErrorDataReceived += (_, e) => { if (e.Data != null) try { File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "pv-ssh.log"), e.Data + "\r\n"); } catch (IOException) { } };
+            started.ErrorDataReceived += (_, _) => { }; // drained so ssh never blocks on a full stderr pipe; nothing reads it
             started.BeginErrorReadLine();
             _ = Task.Run(() => Stream(started));
         }
@@ -227,8 +255,7 @@ internal static class VmDiskIo
                 }
             }
             catch (Exception e) when (e is IOException or ObjectDisposedException or InvalidOperationException) { }
-            lock (sync) { if (process != started) return; }
-            Close();
+            Close(expected: started);
         }
     }
 

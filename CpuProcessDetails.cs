@@ -74,6 +74,7 @@ internal sealed class CpuProcessDetails : Panel
             commands.Suspend();
             previous.Cancel();
             previous.Dispose();
+            VmDiskIo.CloseCpuSessions();
             return;
         }
 
@@ -84,6 +85,8 @@ internal sealed class CpuProcessDetails : Panel
     public void SetOptions(CpuExpansionTarget[] guests, bool group, int limit, string search, int? bands)
     {
         bool changedGuests = !selected.SequenceEqual(guests);
+        foreach (var dropped in selected.Where(old => !old.IsWsl && !guests.Any(guest => string.Equals(guest.Name, old.Name, StringComparison.OrdinalIgnoreCase))))
+            VmDiskIo.CloseCpuSession(dropped.Name);
         selected = guests;
         groupByMachine = group;
         topRows = limit;
