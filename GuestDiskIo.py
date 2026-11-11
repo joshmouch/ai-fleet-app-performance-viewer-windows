@@ -1,7 +1,8 @@
-"""One bounded ext4 file I/O sample on a Hyper-V SCSI attachment."""
+"""One bounded ext4 I/O sample on a Hyper-V attachment or WSL root disk."""
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -20,6 +21,14 @@ def fail(message):
 
 def read_json(args):
     return json.loads(subprocess.check_output(args, text=True, timeout=4))
+
+
+def select_wsl_root():
+    mount, = read_json(["findmnt", "-J", "-l", "-M", "/", "-o", "SOURCE,FSTYPE,FSROOT,MAJ:MIN"])["filesystems"]
+    if mount["fstype"] != "ext4" or mount["fsroot"] != "/" or not mount["source"].startswith("/dev/"):
+        fail("The WSL root filesystem could not be matched to an ext4 block device.")
+    major, minor = map(int, mount["maj:min"].split(":"))
+    return mount["source"], {(major << 20) | minor: "/"}
 
 
 def select_disk(location):
@@ -207,8 +216,10 @@ def block_snapshot(device):
 
 
 def main():
-    location = int(sys.argv[1])
-    device, roots = select_disk(location)
+    if shutil.which("bpftrace") is None:
+        fail("bpftrace is unavailable in this guest.")
+    target = sys.argv[1]
+    device, roots = select_wsl_root() if target == "root" else select_disk(int(target))
     options = dict(os.environ, BPFTRACE_MAX_STRLEN="192", BPFTRACE_MAX_MAP_KEYS=str(MAP_LIMIT),
                    BPFTRACE_PERF_RB_PAGES="128")
     before = block_snapshot(device)
