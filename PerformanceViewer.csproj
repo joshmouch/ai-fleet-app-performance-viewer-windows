@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <PublishSingleFile>true</PublishSingleFile>
+    <SelfContained>false</SelfContained>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <DebugType>embedded</DebugType>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <AssemblyName>AI Fleet Cluster Performance Viewer</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="CpuTimelines.cs" />
+    <Compile Include="DiskIoDetails.cs" />
+    <Compile Include="VmDiskIo.cs" />
+    <Compile Include="CpuProcessDetails.cs" />
+    <EmbeddedResource Include="GuestDiskIo.py" LogicalName="GuestDiskIo.py" />
+    <EmbeddedResource Include="GuestCpu.py" LogicalName="GuestCpu.py" />
+    <PackageReference Include="Microsoft.Diagnostics.Tracing.TraceEvent" Version="4.0.0" />
+    <PackageReference Include="System.Management" Version="10.0.0" />
+  </ItemGroup>
+</Project>
