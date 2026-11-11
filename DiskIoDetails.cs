@@ -107,9 +107,9 @@ internal struct FileIoTotals
 
     public static void AddTo<TKey>(Dictionary<TKey, FileIoTotals> target, TKey key, FileIoTotals value)
     {
-        var total = target.GetValueOrDefault(key);
-        total.Add(value);
-        target[key] = total;
+        // One hash and probe per update: the slot is updated in place, starting at default for a new key.
+        ref var slot = ref System.Runtime.InteropServices.CollectionsMarshal.GetValueRefOrAddDefault(target, key, out _);
+        slot.Add(value);
     }
 }
 
@@ -1252,8 +1252,8 @@ internal sealed class DiskIoDetails : Panel
         double seconds, Dictionary<string, VmDiskOwners> owners,
         Dictionary<FileIoKey, (string Label, string Help)> pendingRows = null)
     {
-        var matched = entries.Where(row => RowFilter.Matches(filter, row.Key.Process, row.Machine,
-            row.Key.Pid.ToString(), row.Key.Path)).ToArray();
+        var matched = (filter.Length == 0 ? entries : entries.Where(row => RowFilter.Matches(filter, row.Key.Process, row.Machine,
+            row.Key.Pid.ToString(), row.Key.Path))).ToArray();
         var gaps = matched.Where(IsGap).ToArray();
         if (gaps.Length > 0 && seconds > 0)
         {

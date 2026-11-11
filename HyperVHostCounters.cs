@@ -67,10 +67,19 @@ internal sealed class HyperVHostCounters : IDisposable
                 throw new InvalidOperationException("Hyper-V processor topology is unavailable.");
 
             using var document = JsonDocument.Parse(Marshal.PtrToStringUni(result));
-            var topology = document.RootElement.GetProperty("Properties")[0].GetProperty("LogicalProcessors");
+            // A shape HCS did not promise is "topology unavailable" (the host-counters fallback), never an unhandled exception.
+            if (!document.RootElement.TryGetProperty("Properties", out var propertyList) || propertyList.ValueKind != JsonValueKind.Array
+                || propertyList.GetArrayLength() == 0 || !propertyList[0].TryGetProperty("LogicalProcessors", out var topology)
+                || topology.ValueKind != JsonValueKind.Array)
+                throw new InvalidOperationException("Hyper-V returned an unexpected processor topology.");
             var roots = new Dictionary<int, int>();
             foreach (var cpu in topology.EnumerateArray())
-                roots.Add(cpu.GetProperty("LpIndex").GetInt32(), cpu.GetProperty("RootVpIndex").GetInt32());
+            {
+                if (!cpu.TryGetProperty("LpIndex", out var lp) || !lp.TryGetInt32(out int lpIndex)
+                    || !cpu.TryGetProperty("RootVpIndex", out var vp) || !vp.TryGetInt32(out int rootVpIndex))
+                    throw new InvalidOperationException("Hyper-V returned an unexpected logical processor entry.");
+                roots.Add(lpIndex, rootVpIndex);
+            }
             if (roots.Count == 0)
                 throw new InvalidOperationException("Hyper-V returned no logical processors.");
             return roots;
