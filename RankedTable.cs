@@ -28,7 +28,7 @@ internal sealed class RankedTable<TRow> : ListView
         this.virtualizeBands = virtualizeBands;
         if (virtualizeBands)
             RetrieveVirtualItem += (_, e) => e.Item = e.ItemIndex < virtualRows.Length
-                ? CreateBandItem(virtualRows[e.ItemIndex], virtualUnit, createVirtualItem) : new ListViewItem();
+                ? CreateBandItem(virtualRows[e.ItemIndex], virtualUnit, createVirtualItem) : BandHeading("");
         View = View.Details;
         Dock = DockStyle.Fill;
         FullRowSelect = true;
@@ -212,15 +212,21 @@ internal sealed class RankedTable<TRow> : ListView
         dividerFont ??= new Font(Font, FontStyle.Bold);
         int band = row.Divider;
         string caption = band == 10 ? "No measured impact" : $"{band * 10}–{(band + 1) * 10}% of {unit}";
-        return new ListViewItem(caption)
-        {
-            Font = dividerFont,
-            BackColor = Color.FromArgb((7 * BackColor.R + ForeColor.R) / 8,
-                (7 * BackColor.G + ForeColor.G) / 8, (7 * BackColor.B + ForeColor.B) / 8),
-            Tag = new BandDivider(band),
-            ToolTipText = band == 10 ? "These rows have zero or unavailable measured impact." :
-                "Each row belongs to the band where its cumulative usage starts. Large rows can span bands."
-        };
+        var heading = BandHeading(caption);
+        heading.Font = dividerFont;
+        heading.BackColor = Color.FromArgb((7 * BackColor.R + ForeColor.R) / 8,
+            (7 * BackColor.G + ForeColor.G) / 8, (7 * BackColor.B + ForeColor.B) / 8);
+        heading.Tag = new BandDivider(band);
+        heading.ToolTipText = band == 10 ? "These rows have zero or unavailable measured impact." :
+            "Each row belongs to the band where its cumulative usage starts. Large rows can span bands.";
+        return heading;
+    }
+
+    private ListViewItem BandHeading(string caption)
+    {
+        var cells = new string[Columns.Count];
+        cells[0] = caption;
+        return new ListViewItem(cells);
     }
 
     protected override void WndProc(ref Message message)
