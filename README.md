@@ -2,7 +2,7 @@
 
 A Windows desktop viewer for CPU and disk activity on an AI Fleet cluster host. Follow disk activity from the host volume to the VHDX, its Hyper-V VM, and the processes and paths inside the guest.
 
-- **Show processes** opens an inline CPU process table. Check a Hyper-V VM or **WSL** on the left to replace its Windows CPU accounting row with processes from inside it. Set the number of processes and choose **Top per machine** or **Merged top**. All percentages use Windows host capacity. WSL shares one Windows CPU budget across its running WSL 2 distros.
+- **Show processes** opens an inline CPU process table. Check a Hyper-V VM or **WSL** on the left to replace its Windows CPU accounting row with processes from inside it. Set the number of processes and choose **Top per machine** or **Merged top**. **Guest CPU %** is the process share of the guest's measured CPU usage. **Host CPU %** is the process share of Windows CPU capacity and determines rank. WSL 2 distros share one guest CPU budget.
 - **Show disks** shows the disks that meet the selected activity and transfer thresholds. Select a disk for process and path I/O.
 - **VHDX files** adds the busiest virtual disk files on the disks already shown. Select a VM-backed file for its live guest I/O.
 
