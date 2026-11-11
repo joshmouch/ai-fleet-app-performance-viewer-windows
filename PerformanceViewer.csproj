@@ -20,6 +20,7 @@
     <Compile Include="DiskIoMerge.cs" />
     <Compile Include="VmDiskIo.cs" />
     <Compile Include="CpuProcessDetails.cs" />
+    <Compile Include="RankedTable.cs" />
     <Compile Include="CpuProcessSampler.cs" />
     <EmbeddedResource Include="GuestDiskIo.py" LogicalName="GuestDiskIo.py" />
     <EmbeddedResource Include="GuestCpu.sh" LogicalName="GuestCpu.sh" />

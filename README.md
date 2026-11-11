@@ -1,12 +1,12 @@
 # AI Fleet Cluster Performance Viewer
 
-A Windows desktop viewer for CPU and disk activity on an AI Fleet cluster host. Follow disk activity from the host volume to the VHDX, its Hyper-V VM, and the processes and paths inside the guest.
+A Windows desktop viewer for finding the processes behind CPU and disk activity across the Windows host, Hyper-V guests, and WSL.
 
-- Use **Guests**, **Group by machine**, and **Top** above the charts to control CPU and disk details. Grouping separates CPU tiles, disks and VHDX cards, and ranked rows by machine. Clear it for one grid and one ranking per table.
-- In the CPU view, checked guests add virtual processor timelines. In **Show processes**, **Guest CPU %** is the process share of the guest's measured usage. **Host CPU %** is its estimated share of Windows CPU capacity and determines rank. WSL 2 distros share one guest CPU budget.
-- With guests checked, Hyper-V counters split each host logical processor into Windows time and combined VM time. The overview also shows Hyper-V overhead. Guest virtual processor timelines show that guest's own processor usage. The host split includes all running VMs.
-- **Show disks** shows disks that meet the activity and transfer thresholds. Select a disk for process and path I/O. **VHDX files** adds the busiest virtual disk files on those disks.
-- For a checked Hyper-V VM with a matching VHDX and guest file I/O, the disk tables distribute the Windows bytes and operations across guest rows. **Guest MiB** shows guest file I/O, including cached I/O. The **Guest Processes** and **Guest Paths** tabs show the underlying guest sample for a selected VM disk.
+- **CPU** and **Disk** share a bottom details pane, a search field, guest selection, and grouping. Details start open. All discovered guests start checked and rankings start flat with 20 rows. Search filters the sampled rows before applying the **Top rows** limit.
+- Process tables fetch command lines for displayed rows. Hover over the command line to read it in full. Exited or protected processes can have no command line available.
+- On **CPU**, **CPU impact %** ranks Windows processes and guests against host CPU capacity. Guest impact is the measured VM CPU budget apportioned by the guest process's share of busy CPU. **Guest busy %** shows that share on its own. WSL distros share one VM CPU budget. A guest with no usable host budget can still show guest CPU usage. Guest CPU that could not be attributed to a process appears in the coverage summary above the ranking. CPU chart segments show Windows, all guests, and hypervisor overhead when Hyper-V counters are available.
+- On **Disk**, the default ranking spans all Windows disks. Select a disk or VHDX card to narrow it, or select **All disks** to return to the host-wide ranking. **I/O impact MiB/s** ranks completed Windows I/O and apportions the VHDX portion among available guest processes and paths. **Guest MiB/s** shows sampled guest file I/O, including cached I/O. Bytes and operation counts remain available and unmatched host I/O stays in the ranking. Double-click a VHDX path for the guest-only sample. In a Paths tab, select a row and press **Ctrl+C** to copy the full path.
+- **Disk filters** control which cards are shown and how they are ranked. VHDX cards are on by default. VHDX cards use the transfer threshold because active time is available only for Windows disk counters. Card thresholds apply to the cards while the details pane covers the selected disk, VHDX, or all disks.
 
 Publish with the .NET 10 SDK on Windows.
 
@@ -14,8 +14,7 @@ Publish with the .NET 10 SDK on Windows.
 dotnet publish PerformanceViewer.csproj -c Release
 ```
 
-The Windows x64 executable is under `bin/Release/net10.0-windows/win-x64/publish/` and uses the .NET 10 Desktop Runtime. Run elevated for Windows file I/O tracing and Hyper-V inventory. Hyper-V guest sampling uses Windows OpenSSH and the configured AI Fleet cluster SSH identity. Linux CPU sampling uses a POSIX shell, `awk`, and `getconf`. Guest disk I/O requires Python 3, noninteractive sudo for the sampler, and Linux tracing access.
-
+The Windows x64 executable is under `bin/Release/net10.0-windows/win-x64/publish/` and uses the .NET 10 Desktop Runtime. Run elevated for Windows file I/O tracing and Hyper-V inventory. Hyper-V guests use Windows OpenSSH and the configured AI Fleet cluster SSH identity. Linux CPU sampling uses a POSIX shell, `awk`, and `getconf`. Guest disk attribution requires an ext4 filesystem, Python 3, bpftrace, and Linux tracing access. Hyper-V samples use noninteractive sudo. WSL disk attribution targets the distro root VHDX and uses the distro root user.
 
 ## Configuration
 

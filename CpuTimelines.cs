@@ -189,7 +189,7 @@ internal sealed class Timeline : Form
     private const int DefaultUpdateSeconds = 10;
     private const double SamplingGraceSeconds = 1.5;
     private const int OverallPanelHeight = 112;
-    private const int ChartTop = 104;
+    private const int ChartTop = 74;
     private const int PaddingSize = 16;
     private const int CardGap = 6;
     private const int CardsTop = ChartTop + OverallPanelHeight + CardGap;
@@ -216,15 +216,26 @@ internal sealed class Timeline : Form
     private readonly ComboBox diskCutoff = new ComboBox();
     private readonly ComboBox transferCutoff = new ComboBox();
     private readonly ComboBox diskScope = new ComboBox();
-    private readonly Button viewButton = new Button();
-    private readonly Button processButton = new Button();
+    private readonly RadioButton cpuView = new() { Text = "CPU", Appearance = Appearance.Button, Checked = true };
+    private readonly RadioButton diskView = new() { Text = "Disk", Appearance = Appearance.Button };
+    private readonly Button detailsButton = new() { Text = "Hide details" };
+    private readonly Button settingsButton = new() { Text = "Settings ▾" };
+    private readonly Button diskSettingsButton = new() { Text = "Disk filters ▾", Visible = false };
+    private readonly TextBox find = new() { PlaceholderText = "Find process, path, machine", AccessibleName = "Filter detail rows" };
+    private readonly ContextMenuStrip settingsMenu = new();
+    private readonly ContextMenuStrip diskSettingsMenu = new();
+    private readonly FlowLayoutPanel toolbar = new() { WrapContents = false };
+    private readonly ComboBox diskRank = new();
+    private readonly Label description = new() { AutoEllipsis = true };
+    private bool detailsOpen = true;
     private readonly CheckBox showVirtualDisks = new CheckBox();
     private readonly Button guestOptions = new() { Text = "Guests", FlatStyle = FlatStyle.Flat };
     private readonly ContextMenuStrip guestMenu = new();
-    private readonly CheckBox groupByMachine = new() { Text = "Group by machine", AutoSize = true, Checked = true };
+    private readonly CheckBox groupByMachine = new() { Text = "Group by machine", AutoSize = true };
     private readonly NumericUpDown topRows = new() { Minimum = 1, Maximum = 50, Value = 10, AccessibleName = "Number of top rows" };
     private readonly VScrollBar cpuScroll = new() { Visible = false };
     private readonly HashSet<CpuExpansionTarget> selectedGuests = new();
+    private readonly HashSet<string> excludedGuests = new(StringComparer.OrdinalIgnoreCase);
     private readonly FlowLayoutPanel diskGrid = new FlowLayoutPanel();
     private readonly DiskIoDetails diskIoDetails = new DiskIoDetails();
     private readonly ToolTip diskCardTips = new ToolTip();
@@ -232,7 +243,6 @@ internal sealed class Timeline : Form
     private DiskCounters diskCounters;
     private PdhQuery guestCounters;
     private HyperVHostCounters hostCounters;
-    private bool triedHostCounters;
     private string[] diskCardLayout = Array.Empty<string>();
     private CpuExpansionTarget[] availableGuests = Array.Empty<CpuExpansionTarget>();
     private double nextGuestRefresh;
@@ -256,8 +266,6 @@ internal sealed class Timeline : Form
     private double nextSampleAt;
     private double lastSampleAt;
     private int UpdateSeconds { get { return (int)updateInterval.SelectedItem; } }
-    private int UpdateLabelLeft { get { return updateInterval.Left - 6 - TextRenderer.MeasureText(UpdateLabel, Font).Width; } }
-    private int DiskCutoffLabelLeft { get { return diskCutoff.Left - 6 - TextRenderer.MeasureText(DiskCutoffLabel, Font).Width; } }
     private TransferLimit SelectedTransferLimit { get { return (TransferLimit)transferCutoff.SelectedItem; } }
     private DiskScope SelectedDiskScope { get { return (DiskScope)diskScope.SelectedItem; } }
 
@@ -313,6 +321,9 @@ internal sealed class Timeline : Form
         public double WriteSum;
         public VirtualDiskIo VirtualDisk;
         public VmDiskOwners VirtualOwner;
+        public bool BelowFilter;
+        public double Rate(bool writesOnly = false) => VirtualDisk == null ? AverageTransfer(writesOnly) :
+            writesOnly ? Latest.WriteMiB : Latest.ReadMiB + Latest.WriteMiB;
         public double AverageActive { get { return ActiveSum / Coverage; } }
         public double AverageTransfer(bool writesOnly) { return (writesOnly ? WriteSum : ReadSum + WriteSum) / Coverage; }
     }
@@ -372,37 +383,30 @@ internal sealed class Timeline : Form
         updateInterval.DropDownStyle = ComboBoxStyle.DropDownList;
         updateInterval.FlatStyle = FlatStyle.Flat;
         updateInterval.AccessibleName = "Update interval";
-        updateInterval.Anchor = AnchorStyles.Top | AnchorStyles.Right;
         updateInterval.FormattingEnabled = true;
         updateInterval.Format += delegate(object sender, ListControlConvertEventArgs e) { e.Value = e.ListItem + " s"; };
         updateInterval.Items.AddRange(UpdateIntervals.Cast<object>().ToArray());
         updateInterval.SelectedItem = DefaultUpdateSeconds;
         updateInterval.Width = 74;
-        updateInterval.Location = new Point(ClientSize.Width - updateInterval.Width - 16, 44);
         updateInterval.SelectedIndexChanged += delegate
         {
             ScheduleSample(UpdateSeconds);
             Invalidate();
         };
-        Controls.Add(updateInterval);
 
         diskCutoff.DropDownStyle = ComboBoxStyle.DropDownList;
         diskCutoff.FlatStyle = FlatStyle.Flat;
         diskCutoff.AccessibleName = "Minimum average disk active time";
-        diskCutoff.Anchor = AnchorStyles.Top | AnchorStyles.Right;
         diskCutoff.FormattingEnabled = true;
         diskCutoff.Format += delegate(object sender, ListControlConvertEventArgs e) { e.Value = e.ListItem + "%"; };
         diskCutoff.Items.AddRange(new object[] { 5, 10, 15, DefaultDiskCutoff, 35, 50, 75, 90 });
         diskCutoff.SelectedItem = DefaultDiskCutoff;
         diskCutoff.Width = 66;
-        diskCutoff.Location = new Point(UpdateLabelLeft - 14 - diskCutoff.Width, updateInterval.Top);
         diskCutoff.SelectedIndexChanged += DiskFilterChanged;
-        Controls.Add(diskCutoff);
 
         transferCutoff.DropDownStyle = ComboBoxStyle.DropDownList;
         transferCutoff.FlatStyle = FlatStyle.Flat;
         transferCutoff.AccessibleName = "Minimum average disk transfer rate";
-        transferCutoff.Anchor = AnchorStyles.Top | AnchorStyles.Right;
         var defaultLimit = new TransferLimit(DefaultTransferCutoff, false);
         var rates = new[] { DefaultTransferCutoff, 5, 10, 25, 50 };
         transferCutoff.Items.Add(new TransferLimit(0, false));
@@ -412,41 +416,24 @@ internal sealed class Timeline : Form
         transferCutoff.SelectedItem = defaultLimit;
         transferCutoff.MaxDropDownItems = transferCutoff.Items.Count;
         transferCutoff.Width = 112;
-        transferCutoff.Location = new Point(DiskCutoffLabelLeft - 14 - transferCutoff.Width, updateInterval.Top);
         transferCutoff.SelectedIndexChanged += DiskFilterChanged;
-        Controls.Add(transferCutoff);
 
-        viewButton.Text = "Show disks";
-        viewButton.SetBounds(290, 14, 94, 25);
-        viewButton.FlatStyle = FlatStyle.Flat;
-        viewButton.Click += ToggleDiskView;
-        Controls.Add(viewButton);
-
-        processButton.Text = "Show processes";
-        processButton.SetBounds(390, 14, 113, 25);
-        processButton.FlatStyle = FlatStyle.Flat;
-        processButton.Click += (_, _) => ToggleProcessDetails();
-        Controls.Add(processButton);
         processDetails = new CpuProcessDetails(() => UpdateSeconds);
-        processDetails.CloseRequested += (_, _) => SetProcessDetails(false);
+        processDetails.CloseRequested += (_, _) => SetDetails(false);
+        diskIoDetails.CloseRequested += (_, _) => SetDetails(false);
         Controls.Add(processDetails);
 
-        guestOptions.SetBounds(16, 72, 124, 25);
-        guestOptions.Click += (_, _) => guestMenu.Show(guestOptions, new Point(0, guestOptions.Height));
-        groupByMachine.Location = new Point(151, 76);
         groupByMachine.CheckedChanged += (_, _) => SharedOptionsChanged();
-        var topLabel = new Label { Text = "Top", AutoSize = true, Location = new Point(291, 76) };
-        topRows.SetBounds(322, 73, 51, 25);
+        topRows.Width = 60;
         topRows.ValueChanged += (_, _) => SharedOptionsChanged();
-        Controls.AddRange(new Control[] { guestOptions, groupByMachine, topLabel, topRows, cpuScroll });
         cpuScroll.ValueChanged += (_, _) => Invalidate();
+        Controls.Add(cpuScroll);
         UpdateGuestMenu();
 
-        showVirtualDisks.Text = "VHDX files";
-        showVirtualDisks.Location = new Point(519, 76);
+        showVirtualDisks.Text = "Show VHDX cards";
         showVirtualDisks.AutoSize = true;
+        showVirtualDisks.Checked = true;
         showVirtualDisks.CheckedChanged += DiskFilterChanged;
-        Controls.Add(showVirtualDisks);
 
         diskScope.DropDownStyle = ComboBoxStyle.DropDownList;
         diskScope.FlatStyle = FlatStyle.Flat;
@@ -465,10 +452,63 @@ internal sealed class Timeline : Form
         };
         diskScope.Items.AddRange(new object[] { DiskScope.MountedAndSpaces, DiskScope.MountedOnly, DiskScope.All });
         diskScope.SelectedItem = DiskScope.MountedAndSpaces;
-        diskScope.SetBounds(385, 73, 124, updateInterval.Height);
+        diskScope.Width = 144;
         diskScope.DropDownWidth = 150;
         diskScope.SelectedIndexChanged += DiskFilterChanged;
-        Controls.Add(diskScope);
+
+        diskRank.DropDownStyle = ComboBoxStyle.DropDownList;
+        diskRank.AccessibleName = "Disk card ranking";
+        diskRank.Items.AddRange(new object[] { "Total MiB/s", "Read MiB/s", "Write MiB/s", "Active time %" });
+        diskRank.SelectedIndex = 0;
+        diskRank.Width = 144;
+        diskRank.SelectedIndexChanged += DiskFilterChanged;
+        AddSetting(settingsMenu, UpdateLabel, updateInterval);
+        AddSetting(settingsMenu, "Top rows", topRows);
+        AddSetting(settingsMenu, null, groupByMachine);
+        AddSetting(diskSettingsMenu, "Rank cards by", diskRank);
+        AddSetting(diskSettingsMenu, "Card scope", diskScope);
+        AddSetting(diskSettingsMenu, DiskCutoffLabel, diskCutoff);
+        AddSetting(diskSettingsMenu, TransferCutoffLabel, transferCutoff);
+        AddSetting(diskSettingsMenu, null, showVirtualDisks);
+        settingsButton.Click += (_, _) => OpenMenu(settingsMenu, settingsButton);
+        diskSettingsButton.Click += (_, _) => OpenMenu(diskSettingsMenu, diskSettingsButton);
+        guestOptions.Click += (_, _) => OpenMenu(guestMenu, guestOptions);
+        cpuView.CheckedChanged += (_, _) => { if (cpuView.Checked) SwitchView(false); };
+        diskView.CheckedChanged += (_, _) => { if (diskView.Checked) SwitchView(true); };
+        detailsButton.Click += (_, _) => SetDetails(!detailsOpen);
+        find.TextChanged += (_, _) => ApplyDetailOptions();
+        cpuView.TextAlign = diskView.TextAlign = ContentAlignment.MiddleCenter;
+        cpuView.FlatStyle = diskView.FlatStyle = FlatStyle.Flat;
+        foreach (var button in new[] { detailsButton, guestOptions, settingsButton, diskSettingsButton })
+            button.FlatStyle = FlatStyle.Flat;
+        toolbar.SetBounds(PaddingSize, 8, ClientSize.Width - 2 * PaddingSize, 32);
+        toolbar.Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Top;
+        void AddTool(Control control, int width)
+        {
+            control.Size = new Size(width, 26);
+            control.Margin = new Padding(0, 0, 5, 0);
+            toolbar.Controls.Add(control);
+        }
+        AddTool(cpuView, 49);
+        AddTool(diskView, 49);
+        AddTool(detailsButton, 94);
+        AddTool(guestOptions, 100);
+        AddTool(settingsButton, 85);
+        AddTool(diskSettingsButton, 94);
+        AddTool(find, 128);
+        find.Margin = new Padding(1, 2, 0, 0);
+        toolbar.Layout += (_, _) =>
+        {
+            int width = Math.Max(100, toolbar.ClientSize.Width - toolbar.Controls.Cast<Control>()
+                .Where(control => control != find && control.Visible).Sum(control => control.Width + control.Margin.Horizontal) - 2);
+            if (find.Width != width)
+                find.Width = width;
+        };
+        Controls.Add(toolbar);
+        description.SetBounds(PaddingSize, 42, ClientSize.Width - 2 * PaddingSize, 24);
+        description.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
+        description.TextAlign = ContentAlignment.MiddleLeft;
+        Controls.Add(description);
 
         diskGrid.SetBounds(PaddingSize, CardsTop, ClientSize.Width - 2 * PaddingSize, ClientSize.Height - CardsTop - PaddingSize);
         diskGrid.Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
@@ -478,14 +518,14 @@ internal sealed class Timeline : Form
         Controls.Add(diskGrid);
         diskIoDetails.LayoutChanged += delegate
         {
-            if (!diskIoDetails.HasSelection && selectedVirtualDisk != null)
+            if (!diskIoDetails.HasSelection)
             {
                 selectedVirtualDisk = null;
                 selectedDisk = null;
-                diskGrid.Invalidate(true);
+                if (showingDisks)
+                    RefreshDiskCards(clock.Elapsed.TotalSeconds);
                 Invalidate();
             }
-            UpdateProcessButton();
             LayoutDetailsRegion();
         };
         Controls.Add(diskIoDetails);
@@ -495,6 +535,8 @@ internal sealed class Timeline : Form
         Shown += delegate
         {
             ReadDisks();
+            TryOpenHostCounters();
+            SetDetails(true);
             RefreshGuestChoices();
             lastSampleAt = clock.Elapsed.TotalSeconds;
             nextSampleAt = clock.Elapsed.TotalSeconds + timer.Interval / 1000.0;
@@ -504,18 +546,32 @@ internal sealed class Timeline : Form
         {
             processDetails.SetOpen(false);
             diskIoDetails.TrackVirtualDisks(Array.Empty<int>(), volumePaths);
-            diskIoDetails.CloseDetails();
+            diskIoDetails.SetOpen(false, volumePaths);
         };
         FormClosed += delegate
         {
             timer.Dispose();
             guestMenu.Dispose();
+            settingsMenu.Dispose();
+            diskSettingsMenu.Dispose();
             guestCounters?.Dispose();
             hostCounters?.Dispose();
             diskCardTips.Dispose();
             if (diskCounters != null)
                 diskCounters.Dispose();
         };
+    }
+
+    private static void OpenMenu(ContextMenuStrip menu, Control button) => menu.Show(button, new Point(0, button.Height));
+
+    private static void AddSetting(ContextMenuStrip menu, string text, Control control)
+    {
+        var row = new Panel { Width = 260, Height = 30 };
+        if (text != null)
+            row.Controls.Add(new Label { Text = text, AutoSize = true, Location = new Point(4, 6) });
+        control.Location = new Point(text == null ? 4 : 108, 3);
+        row.Controls.Add(control);
+        menu.Items.Add(new ToolStripControlHost(row) { Margin = Padding.Empty, Padding = Padding.Empty });
     }
 
     protected override void OnHandleCreated(EventArgs e)
@@ -546,10 +602,26 @@ internal sealed class Timeline : Form
         transferCutoff.ForeColor = ForeColor;
         guestOptions.BackColor = topRows.BackColor = idleTile;
         guestOptions.ForeColor = topRows.ForeColor = ForeColor;
-        viewButton.BackColor = idleTile;
-        viewButton.ForeColor = ForeColor;
-        processButton.BackColor = idleTile;
-        processButton.ForeColor = ForeColor;
+        foreach (Control control in toolbar.Controls)
+        {
+            control.BackColor = idleTile;
+            control.ForeColor = ForeColor;
+        }
+        foreach (var radio in new[] { cpuView, diskView })
+            radio.FlatAppearance.CheckedBackColor = Blend(idleTile, lineColor, 0.22);
+        foreach (var menu in new[] { settingsMenu, diskSettingsMenu, guestMenu })
+        {
+            menu.BackColor = idleTile;
+            menu.ForeColor = ForeColor;
+            foreach (var host in menu.Items.OfType<ToolStripControlHost>())
+            {
+                host.Control.BackColor = idleTile;
+                host.Control.ForeColor = ForeColor;
+            }
+        }
+        diskRank.BackColor = idleTile;
+        diskRank.ForeColor = ForeColor;
+        description.ForeColor = Blend(ForeColor, BackColor, 0.3);
         processDetails.ApplyColors(BackColor, ForeColor, idleTile);
         diskScope.BackColor = idleTile;
         diskScope.ForeColor = ForeColor;
@@ -621,9 +693,9 @@ internal sealed class Timeline : Form
                 guestCounters?.Dispose();
                 guestCounters = null;
             }
-            try { sample.HostCpu = hostCounters?.Read(); }
-            catch (InvalidOperationException) { }
         }
+        try { sample.HostCpu = hostCounters?.Read(); }
+        catch (InvalidOperationException) { }
         sample.Disks = ReadDisks();
         history.Add(sample);
         history.RemoveAll(entry => entry.Time < now - MaxHistorySeconds);
@@ -633,7 +705,7 @@ internal sealed class Timeline : Form
                 (selectedVirtualDisk != null
                     ? !sample.Disks.Values.Any(disk => disk.Number == selectedVirtualDisk.Latest.Number)
                     : !sample.Disks.ContainsKey(selectedDisk)))
-                diskIoDetails.CloseDetails();
+                diskIoDetails.SelectAllDisks();
             RefreshDiskCards(now);
         }
         Invalidate();
@@ -664,30 +736,14 @@ internal sealed class Timeline : Form
         nextSampleAt = clock.Elapsed.TotalSeconds + seconds;
     }
 
-    private void SetProcessDetails(bool open)
+    private void SetDetails(bool open)
     {
-        processDetails.SetOpen(open);
-        UpdateProcessButton();
+        detailsOpen = open;
+        detailsButton.Text = open ? "Hide details" : "Show details";
+        processDetails.SetOpen(open && !showingDisks);
+        diskIoDetails.SetOpen(open && showingDisks, volumePaths);
         LayoutDetailsRegion();
         Invalidate();
-    }
-
-    private void ToggleProcessDetails()
-    {
-        if (!showingDisks)
-            SetProcessDetails(!processDetails.IsOpen);
-        else if (diskIoDetails.HasSelection)
-            diskIoDetails.CloseDetails();
-        else if (diskGrid.Controls.OfType<Button>().Select(card => (DiskSummary)card.Tag)
-            .FirstOrDefault(disk => disk.Id == selectedDisk) is { } picked)
-            SelectDiskCard(picked);
-    }
-
-    private void UpdateProcessButton()
-    {
-        bool visible = showingDisks ? diskIoDetails.HasSelection : processDetails.IsOpen;
-        processButton.Text = visible ? "Hide processes" : "Show processes";
-        processButton.Enabled = !showingDisks || visible || diskGrid.Controls.OfType<Button>().Any();
     }
 
     private async void RefreshGuestChoices()
@@ -701,11 +757,9 @@ internal sealed class Timeline : Form
             var guests = await Task.Run(CpuProcessSampler.ReadTargets);
             if (IsDisposed || availableGuests.SequenceEqual(guests))
                 return;
-            // Keep the user's check when a running VM is rediscovered with updated counter metadata.
-            var previous = selectedGuests.Select(guest => (guest.Name, guest.IsWsl)).ToHashSet();
             availableGuests = guests;
             selectedGuests.Clear();
-            selectedGuests.UnionWith(guests.Where(guest => previous.Contains((guest.Name, guest.IsWsl))));
+            selectedGuests.UnionWith(guests.Where(guest => !excludedGuests.Contains(guest.Name)));
             UpdateGuestMenu();
             SharedOptionsChanged();
         }
@@ -729,71 +783,72 @@ internal sealed class Timeline : Form
             item.CheckedChanged += (_, _) =>
             {
                 if (item.Checked)
+                {
                     selectedGuests.Add(guest);
+                    excludedGuests.Remove(guest.Name);
+                }
                 else
+                {
                     selectedGuests.Remove(guest);
+                    excludedGuests.Add(guest.Name);
+                }
                 SharedOptionsChanged();
             };
             guestMenu.Items.Add(item);
         }
     }
 
-    private void SharedOptionsChanged()
+    private void ApplyDetailOptions()
     {
         var guests = availableGuests.Where(selectedGuests.Contains).ToArray();
-        guestOptions.Text = guests.Length == 0 ? "Guests" : $"Guests ({guests.Length})";
-        processDetails.SetOptions(guests, groupByMachine.Checked, (int)topRows.Value);
-        diskIoDetails.SetOptions(guests, groupByMachine.Checked, (int)topRows.Value);
-        if (guests.Length == 0)
+        string filter = find.Text.Trim();
+        processDetails.SetOptions(guests, groupByMachine.Checked, (int)topRows.Value, filter);
+        diskIoDetails.SetOptions(guests, groupByMachine.Checked, (int)topRows.Value, filter);
+    }
+
+    private void SharedOptionsChanged()
+    {
+        guestOptions.Text = availableGuests.Length == 0 ? "Guests ▾" : $"Guests {selectedGuests.Count}/{availableGuests.Length} ▾";
+        ApplyDetailOptions();
+        if (selectedGuests.Count == 0)
         {
             guestCounters?.Dispose();
             guestCounters = null;
-            hostCounters?.Dispose();
-            hostCounters = null;
-            triedHostCounters = false;
-        }
-        else if (guestCounters == null)
-        {
-            try { guestCounters = new PdhQuery(@"\Hyper-V Hypervisor Virtual Processor(*)\% Guest Run Time"); }
-            catch (InvalidOperationException) { }
-        }
-        if (guests.Length > 0 && !triedHostCounters)
-        {
-            triedHostCounters = true;
-            try { hostCounters = new HyperVHostCounters(); }
-            catch (Exception e) when (e is InvalidOperationException or DllNotFoundException or EntryPointNotFoundException
-                or System.Text.Json.JsonException or KeyNotFoundException or ArgumentException) { }
         }
         if (showingDisks)
             RefreshDiskCards(clock.Elapsed.TotalSeconds);
         Invalidate();
     }
 
-    private async void ToggleDiskView(object sender, EventArgs e)
+    private void TryOpenHostCounters()
     {
-        showingDisks = !showingDisks;
-        if (showingDisks && processDetails.IsOpen)
-            SetProcessDetails(false);
-        viewButton.Text = showingDisks ? "Show CPUs" : "Show disks";
+        try { hostCounters = new HyperVHostCounters(); }
+        catch (Exception e) when (e is InvalidOperationException or DllNotFoundException or EntryPointNotFoundException
+            or System.Text.Json.JsonException or KeyNotFoundException or ArgumentException) { }
+    }
+
+    private async void SwitchView(bool disks)
+    {
+        if (showingDisks == disks)
+            return;
+        showingDisks = disks;
+        diskSettingsButton.Visible = disks;
         cpuScroll.Visible = false;
-        if (showingDisks)
+        SetDetails(detailsOpen);
+        if (disks)
             RefreshDiskCards(clock.Elapsed.TotalSeconds);
         else
         {
             diskIoDetails.TrackVirtualDisks(Array.Empty<int>(), volumePaths);
-            diskIoDetails.CloseDetails();
             diskGrid.Hide();
         }
-        UpdateProcessButton();
-        LayoutDetailsRegion();
-        Invalidate();
 
-        if (!showingDisks || loadingDiskNames)
+        if (!disks || loadingDiskNames || diskIdentities.Count > 0)
             return;
         loadingDiskNames = true;
         try
         {
-            diskIdentities = await Task.Run(() => LoadDiskIdentities());
+            diskIdentities = await Task.Run(LoadDiskIdentities);
             volumePaths = new VolumePathIndex(diskIdentities.Values
                 .Where(item => item.Volumes != null).SelectMany(item => item.Volumes));
         }
@@ -812,22 +867,7 @@ internal sealed class Timeline : Form
     {
         if (!showingDisks)
             return;
-        if (sender == showVirtualDisks && !showVirtualDisks.Checked && selectedVirtualDisk != null)
-            diskIoDetails.CloseDetails();
-        if (sender == diskScope && diskIoDetails.HasSelection)
-        {
-            var selected = selectedVirtualDisk?.Latest ?? history.LastOrDefault()?.GetDisk(selectedDisk);
-            if (selected.HasValue && !IncludesDisk(SelectedDiskScope, selected.Value.Number))
-                diskIoDetails.CloseDetails();
-        }
         RefreshDiskCards(clock.Elapsed.TotalSeconds);
-        if ((sender == diskCutoff || sender == transferCutoff) && diskIoDetails.HasSelection &&
-            !diskGrid.Controls.OfType<Button>().Any(card => ((DiskSummary)card.Tag).Id == selectedDisk))
-        {
-            diskIoDetails.CloseDetails();
-            selectedDisk = diskGrid.Controls.OfType<Button>().Select(card => (DiskSummary)card.Tag)
-                .FirstOrDefault(disk => disk.VirtualDisk == null)?.Id;
-        }
         Invalidate();
     }
 
@@ -969,14 +1009,13 @@ internal sealed class Timeline : Form
         }
     }
 
-    private DiskSummary[] FindActiveDisks(double now)
+    private DiskSummary[] ReadDiskSummaries(double now)
     {
         var latest = history.LastOrDefault();
         if (latest == null || latest.Disks == null)
             return new DiskSummary[0];
 
-        DiskScope scope = SelectedDiskScope;
-        var summaries = latest.Disks.Where(entry => IncludesDisk(scope, entry.Value.Number))
+        var summaries = latest.Disks
             .ToDictionary(entry => entry.Key, entry => new DiskSummary { Id = entry.Key, Latest = entry.Value },
                 StringComparer.OrdinalIgnoreCase);
         double cutoff = now - DiskActivityWindow;
@@ -998,13 +1037,21 @@ internal sealed class Timeline : Form
             }
         }
 
-        int minimumActive = (int)diskCutoff.SelectedItem;
-        TransferLimit limit = SelectedTransferLimit;
-        return summaries.Values.Where(disk => disk.Coverage >= MinimumDiskCoverage &&
-            disk.AverageActive >= minimumActive && disk.AverageTransfer(limit.WritesOnly) >= limit.MinimumMiB)
-            .OrderByDescending(disk => disk.AverageActive).ThenBy(disk => disk.Latest.Number)
-            .ThenBy(disk => disk.Id, StringComparer.OrdinalIgnoreCase).ToArray();
+        return summaries.Values.ToArray();
     }
+
+    private bool MeetsDiskFilters(DiskSummary disk) =>
+        IncludesDisk(SelectedDiskScope, disk.Latest.Number) && disk.Coverage >= MinimumDiskCoverage &&
+        disk.AverageActive >= (int)diskCutoff.SelectedItem &&
+        disk.AverageTransfer(SelectedTransferLimit.WritesOnly) >= SelectedTransferLimit.MinimumMiB;
+
+    private double DiskRankValue(DiskSummary disk) => diskRank.SelectedIndex switch
+    {
+        1 => disk.VirtualDisk == null ? disk.ReadSum / disk.Coverage : disk.Latest.ReadMiB,
+        2 => disk.Rate(writesOnly: true),
+        3 => disk.VirtualDisk == null ? disk.AverageActive : -1,
+        _ => disk.Rate()
+    };
 
     private bool IncludesDisk(DiskScope scope, int diskNumber)
     {
@@ -1019,18 +1066,24 @@ internal sealed class Timeline : Form
 
     private void RefreshDiskCards(double now)
     {
-        var physical = FindActiveDisks(now);
-        var active = physical.Concat(FindVirtualDisks(physical)).ToArray();
+        var summaries = ReadDiskSummaries(now);
+        var physical = summaries.Where(MeetsDiskFilters).ToArray();
+        var active = physical.Concat(FindVirtualDisks(summaries))
+            .OrderByDescending(DiskRankValue).ThenBy(disk => disk.Id, StringComparer.OrdinalIgnoreCase).ToArray();
+        if (selectedDisk != null && !active.Any(disk => disk.Id == selectedDisk))
+        {
+            var pinned = selectedVirtualDisk ?? summaries.FirstOrDefault(disk => disk.Id == selectedDisk);
+            if (pinned != null)
+            {
+                pinned.BelowFilter = true;
+                active = active.Prepend(pinned).ToArray();
+            }
+        }
         bool grouped = groupByMachine.Checked && active.Any(disk => disk.VirtualDisk != null);
         if (grouped)
             active = active.GroupBy(DiskCardGroup).SelectMany(group => group).ToArray();
         if (selectedVirtualDisk != null)
             selectedVirtualDisk = active.FirstOrDefault(disk => disk.Id == selectedDisk) ?? selectedVirtualDisk;
-        if (!diskIoDetails.HasSelection && !active.Any(disk => disk.Id == selectedDisk))
-        {
-            var busiest = physical.FirstOrDefault();
-            selectedDisk = busiest == null ? null : busiest.Id;
-        }
 
         var cards = diskGrid.Controls.OfType<Button>().ToArray();
         var layout = active.Select(disk => grouped ? DiskCardGroup(disk) + "\0" + disk.Id : disk.Id).ToArray();
@@ -1134,7 +1187,6 @@ internal sealed class Timeline : Form
             }
             cards[i].Invalidate();
         }
-        UpdateProcessButton();
     }
 
     private static string DiskCardGroup(DiskSummary disk) => disk.VirtualDisk == null
@@ -1155,14 +1207,16 @@ internal sealed class Timeline : Form
                     identity.Name + "  |  " + DiskLabel(picked.Id));
             diskIoDetails.SelectDisk(picked.Latest.Number, label, volumePaths);
         }
+        SetDetails(true);
         diskGrid.Invalidate(true);
         Invalidate();
     }
 
-    private DiskSummary[] FindVirtualDisks(DiskSummary[] physical)
+    private DiskSummary[] FindVirtualDisks(DiskSummary[] disks)
     {
         int[] numbers = showVirtualDisks.Checked
-            ? physical.Select(disk => disk.Latest.Number).Distinct().Order().ToArray()
+            ? disks.Where(disk => IncludesDisk(SelectedDiskScope, disk.Latest.Number))
+                .Select(disk => disk.Latest.Number).Distinct().Order().ToArray()
             : Array.Empty<int>();
         diskIoDetails.TrackVirtualDisks(numbers, volumePaths);
         virtualDiskStatus = null;
@@ -1178,6 +1232,7 @@ internal sealed class Timeline : Form
             return Array.Empty<DiskSummary>();
 
         var owners = diskIoDetails.VirtualDiskOwners;
+        var limit = SelectedTransferLimit;
         return snapshot.Entries.GroupBy(entry => VmDiskIo.Normalize(entry.Path), StringComparer.OrdinalIgnoreCase)
             .Select(group =>
             {
@@ -1198,7 +1253,8 @@ internal sealed class Timeline : Form
                         WriteMiB = total.WriteBytes / (1048576 * snapshot.Seconds)
                     }
                 };
-            }).OrderByDescending(disk => disk.VirtualDisk.Totals.TotalBytes)
+            }).Where(disk => disk.Rate(limit.WritesOnly) >= limit.MinimumMiB)
+            .OrderByDescending(DiskRankValue)
             .ThenBy(disk => disk.Id, StringComparer.Ordinal).Take(12).ToArray();
     }
 
@@ -1216,8 +1272,8 @@ internal sealed class Timeline : Form
     private void LayoutDetailsRegion()
     {
         int available = Math.Max(0, ClientSize.Height - CardsTop - PaddingSize);
-        bool showCpuDetails = processDetails.IsOpen;
-        bool showDiskDetails = showingDisks && diskIoDetails.HasSelection && !showCpuDetails;
+        bool showCpuDetails = detailsOpen && !showingDisks;
+        bool showDiskDetails = detailsOpen && showingDisks;
         Control details = showCpuDetails ? processDetails : showDiskDetails ? diskIoDetails : null;
         if (details != null)
         {
@@ -1260,41 +1316,31 @@ internal sealed class Timeline : Form
         Sample latest = history.LastOrDefault();
         if (end > nextSampleAt + SamplingGraceSeconds)
             latest = null;
-        var physical = !showingDisks && selectedGuests.Count > 0
-            ? history.LastOrDefault(sample => sample.HostCpu != null)?.HostCpu : null;
+        var physical = showingDisks ? null : history.LastOrDefault(sample => sample.HostCpu != null)?.HostCpu;
 
-        using (var title = new Font(Font.FontFamily, 18, FontStyle.Bold))
-        using (var text = new SolidBrush(ForeColor))
         using (var muted = new SolidBrush(Blend(ForeColor, BackColor, 0.3)))
         using (var card = new SolidBrush(idleTile))
         using (var grid = new Pen(ForeColor))
         using (var line = new Pen(lineColor, 1.5f))
         {
-            g.DrawString(showingDisks ? "Disk activity" : "Logical CPU timelines", title, text, 16, 12);
-            var selected = latest == null ? null : latest.GetDisk(selectedDisk);
-            string headline = showingDisks
-                ? (selected.HasValue ? "Disk " + selected.Value.Number + "   " + Percent(selected.Value.Active) + " active" : "")
-                : "Overall " + Percent(physical != null ? latest?.HostCpu?.Overall.Total : latest?.Total);
-            float headlineLeft = ClientSize.Width - 16 - g.MeasureString(headline, title).Width;
-            if (headlineLeft > processButton.Right + 10)
-                g.DrawString(headline, title, text, headlineLeft, 12);
-            var diskCards = diskGrid.Controls.OfType<Button>();
-            int virtualCount = showingDisks ? diskCards.Count(button => ((DiskSummary)button.Tag).VirtualDisk != null) : 0;
+            var selected = latest?.GetDisk(selectedDisk);
+            string name = selectedVirtualDisk != null ? System.IO.Path.GetFileName(selectedVirtualDisk.VirtualDisk.Path) :
+                selected is { } disk && diskIdentities.TryGetValue(disk.Number, out var identity)
+                    ? identity.AccessPaths?.FirstOrDefault() ?? DiskLabel(selectedDisk)
+                    : selectedDisk == null ? "All disks" : DiskLabel(selectedDisk);
+            var diskCards = diskGrid.Controls.OfType<Button>().Select(button => (DiskSummary)button.Tag).ToArray();
+            int virtualCount = diskCards.Count(disk => disk.VirtualDisk != null);
             string detail = showingDisks
-                ? diskError ?? (diskCards.Count() - virtualCount + " disks  |  " + DiskActivityWindow + " s avg" +
+                ? diskError ?? (name + (selected.HasValue ? "  ·  " + Percent(selected.Value.Active) + " active" : "") +
+                    "  |  " + (diskCards.Length - virtualCount) + " disk cards  |  " + DiskActivityWindow + " s average" +
                     (virtualCount > 0 ? "  |  " + virtualCount + " VHDX files" : "") +
+                    (diskCards.Length == 0 ? "  |  No cards meet the filters yet" : "") +
                     (virtualDiskStatus == null ? "" : "  |  " + virtualDiskStatus))
                 : error ?? (processors.Length == 0 ? "Collecting the first sample..." :
-                    (physical?.Processors.Count ?? processors.Length) + " logical processors   |   Last " + range.Duration +
-                    (physical != null || selectedGuests.Count == 0 ? "" : hostCounters != null
-                        ? "   |   Collecting Hyper-V CPU split" : "   |   Hyper-V CPU split unavailable"));
-            g.DrawString(UpdateLabel, Font, muted, UpdateLabelLeft, 48);
-            g.DrawString(DiskCutoffLabel, Font, muted, DiskCutoffLabelLeft, 48);
-            int detailRight = transferCutoff.Left - 6 - TextRenderer.MeasureText(TransferCutoffLabel, Font).Width;
-            g.DrawString(TransferCutoffLabel, Font, muted, detailRight, 48);
-            TextRenderer.DrawText(g, detail,
-                Font, new Rectangle(18, 48, detailRight - 24, 20), muted.Color,
-                TextFormatFlags.NoPadding | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis);
+                    "Overall " + Percent(latest?.HostCpu?.Overall.Total ?? latest?.Total) + "  |  " +
+                    (physical?.Processors.Count ?? processors.Length) + " logical processors  |  Last " + range.Duration);
+            if (description.Text != detail)
+                description.Text = detail;
 
             int width = ClientSize.Width - 2 * PaddingSize;
             g.FillRectangle(card, PaddingSize, ChartTop, width, OverallPanelHeight);
@@ -1324,13 +1370,13 @@ internal sealed class Timeline : Form
             using var overhead = new Pen(muted.Color) { DashStyle = System.Drawing.Drawing2D.DashStyle.Dot };
             var current = latest?.HostCpu?.Overall;
             string windows = "Windows CPU " + Percent(current?.Windows);
-            string guests = "All VM CPU " + Percent(current?.VirtualMachines);
+            string guests = "All guests " + Percent(current?.VirtualMachines);
             float x = chart.Left;
             g.DrawString(windows, Font, windowsText, x, ChartTop + 4);
             x += g.MeasureString(windows, Font).Width + 18;
             g.DrawString(guests, Font, vmText, x, ChartTop + 4);
             x += g.MeasureString(guests, Font).Width + 18;
-            g.DrawString("Hyper-V " + Percent(current?.Hypervisor), Font, muted, x, ChartTop + 4);
+            g.DrawString("Hyper-V overhead " + Percent(current?.Hypervisor), Font, muted, x, ChartTop + 4);
             DrawHistory(g, chart, line, range, sample => sample.HostCpu?.Overall.Windows);
             DrawHistory(g, chart, vmLine, range, sample => sample.HostCpu?.Overall.VirtualMachines);
             DrawHistory(g, chart, overhead, range, sample => sample.HostCpu?.Overall.Hypervisor);
@@ -1366,8 +1412,8 @@ internal sealed class Timeline : Form
         };
         foreach (var guest in availableGuests.Where(selectedGuests.Contains))
         {
-            string prefix = guest.CounterInstance + ":hv vp ";
-            var tiles = source == null || guest.CounterInstance == null ? Array.Empty<CpuTile>() :
+            string prefix = guest.CounterPrefix;
+            var tiles = source == null || prefix == null ? Array.Empty<CpuTile>() :
                 source.Keys.Where(key => key.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) &&
                         int.TryParse(key.AsSpan(prefix.Length), out _))
                     .OrderBy(key => int.Parse(key.AsSpan(prefix.Length)))
@@ -1480,39 +1526,24 @@ internal sealed class Timeline : Form
             var path = new Rectangle(PaddingSize + 12, ChartTop + 12, width - 24, 19);
             TextRenderer.DrawText(g, selected.VirtualDisk.Path, Font, path, ForeColor, flags | TextFormatFlags.PathEllipsis);
             g.DrawString(VirtualDiskLabel(selected), Font, muted, path.X, path.Bottom + 3);
-            string rates = diskGrid.Controls.OfType<Button>().Any(button => ((DiskSummary)button.Tag).Id == selected.Id)
+            string rates = !selected.BelowFilter
                 ? TransferRates(selected.Latest) + $"  |  {selected.VirtualDisk.Totals.Operations:N0} operations in {selected.Coverage:0} s"
                 : "Outside the current top VHDX files";
             g.DrawString(rates, Font, muted, path.X, path.Bottom + 26);
             return;
         }
-        if (selectedDisk == null)
-        {
-            DiskScope scope = SelectedDiskScope;
-            string message = diskError != null ? "Windows disk counters are unavailable." :
-                scope != DiskScope.All && loadingDiskNames ? "Looking up mounts and Storage Spaces disks..." :
-                scope == DiskScope.MountedOnly && !diskIdentities.Values.Any(identity => identity.AccessPaths != null)
-                    ? "Drive letters and folder mounts are unavailable." :
-                scope == DiskScope.MountedAndSpaces && diskIdentities.Count == 0
-                    ? "Disk identities are unavailable." :
-                "No disks in this scope meet the thresholds yet. The filter needs at least " +
-                MinimumDiskCoverage + " seconds of samples.";
-            g.DrawString(message, Font, muted, PaddingSize + 12, ChartTop + 12);
-            return;
-        }
-
         int half = width / 2;
         float plotTop = ChartTop + 27;
         float plotHeight = OverallPanelHeight - 49;
         var activeChart = new RectangleF(PaddingSize + 48, plotTop, half - 60, plotHeight);
         var rateChart = new RectangleF(PaddingSize + half + 48, plotTop, width - half - 60, plotHeight);
-        g.DrawString("Active time", Font, muted, activeChart.Left, ChartTop + 5);
-        g.DrawString("Transfer rate (MiB/s)", Font, muted, rateChart.Left, ChartTop + 5);
+        g.DrawString(selectedDisk == null ? "Busiest disk active time" : "Active time", Font, muted, activeChart.Left, ChartTop + 5);
+        g.DrawString(selectedDisk == null ? "Windows disk counters (MiB/s)" : "Transfer rate (MiB/s)", Font, muted, rateChart.Left, ChartTop + 5);
         DrawChartGrid(g, activeChart, grid);
         DrawChartGrid(g, rateChart, grid);
 
         double maxRate = Math.Max(1, Math.Ceiling(history.Skip(range.FirstSample)
-            .Select(sample => sample.GetDisk(selectedDisk).GetValueOrDefault())
+            .Select(sample => ReadChartDisk(sample).GetValueOrDefault())
             .Select(disk => Math.Max(disk.ReadMiB, disk.WriteMiB)).DefaultIfEmpty().Max()));
         using (var writeLine = new Pen(writeLineColor, line.Width))
         using (var readText = new SolidBrush(line.Color))
@@ -1520,12 +1551,26 @@ internal sealed class Timeline : Form
         {
             g.DrawString("Read", Font, readText, rateChart.Right - 75, ChartTop + 5);
             g.DrawString("Write", Font, writeText, rateChart.Right - 36, ChartTop + 5);
-            DrawHistory(g, rateChart, line, range, sample => sample.GetDiskValue(selectedDisk, disk => disk.ReadMiB), maxRate);
-            DrawHistory(g, rateChart, writeLine, range, sample => sample.GetDiskValue(selectedDisk, disk => disk.WriteMiB), maxRate);
+            DrawHistory(g, rateChart, line, range, sample => ReadChartDisk(sample)?.ReadMiB, maxRate);
+            DrawHistory(g, rateChart, writeLine, range, sample => ReadChartDisk(sample)?.WriteMiB, maxRate);
         }
-        DrawHistory(g, activeChart, line, range, sample => sample.GetDiskValue(selectedDisk, disk => disk.Active));
+        DrawHistory(g, activeChart, line, range, sample => ReadChartDisk(sample)?.Active);
         DrawAxes(g, activeChart, muted, range.Duration, 100, "%");
         DrawAxes(g, rateChart, muted, range.Duration, maxRate, "");
+    }
+
+    private DiskReading? ReadChartDisk(Sample sample)
+    {
+        if (selectedDisk != null)
+            return sample.GetDisk(selectedDisk);
+        if (sample.Disks is not { Count: > 0 } disks)
+            return null;
+        return new DiskReading
+        {
+            Active = disks.Values.Max(disk => disk.Active),
+            ReadMiB = disks.Values.Sum(disk => disk.ReadMiB),
+            WriteMiB = disks.Values.Sum(disk => disk.WriteMiB)
+        };
     }
 
     private void DrawDiskCard(object sender, PaintEventArgs e)
@@ -1577,6 +1622,8 @@ internal sealed class Timeline : Form
                 subtitle = kind + "  |  " + number;
             }
 
+            if (disk.BelowFilter)
+                subtitle = "Below card filters  |  " + subtitle;
             var lineFlags = TextFormatFlags.NoPadding | TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix;
             var textFlags = lineFlags | TextFormatFlags.EndEllipsis;
             int headingWidth = card.Width - 16;
@@ -1592,9 +1639,13 @@ internal sealed class Timeline : Form
             TextRenderer.DrawText(g, heading, nameFont, new Rectangle(8, 6, headingWidth, 17), ForeColor, headingFlags);
             TextRenderer.DrawText(g, subtitle, Font, new Rectangle(8, 23, card.Width - 16, 17), ForeColor, textFlags);
 
-            bool writesOnly = SelectedTransferLimit.WritesOnly;
-            string average = "Avg " + disk.AverageActive.ToString("0.#") + "% active  |  " +
-                disk.AverageTransfer(writesOnly).ToString("0.##") + " MiB/s " + (writesOnly ? "write" : "total");
+            string rate = diskRank.SelectedIndex switch
+            {
+                1 => $"{disk.ReadSum / disk.Coverage:0.##} MiB/s read",
+                2 => $"{disk.Rate(writesOnly: true):0.##} MiB/s write",
+                _ => $"{disk.Rate():0.##} MiB/s total"
+            };
+            string average = $"Avg {disk.AverageActive:0.#}% active  |  {rate}";
             TextRenderer.DrawText(g, average, Font, new Rectangle(8, 41, card.Width - 16, 17), ForeColor, textFlags);
             var chart = new RectangleF(8, 61, card.Width - 16, 25);
             DrawChartGrid(g, chart, grid);
@@ -1618,7 +1669,8 @@ internal sealed class Timeline : Form
         var row = new Rectangle(8, 6, card.Width - 16, 18);
         TextRenderer.DrawText(g, System.IO.Path.GetFileName(disk.VirtualDisk.Path), nameFont, row, ForeColor, flags);
         row.Offset(0, 18);
-        TextRenderer.DrawText(g, VirtualDiskLabel(disk), Font, row, ForeColor, flags);
+        string subtitle = disk.BelowFilter ? "Outside card ranking  |  " : "";
+        TextRenderer.DrawText(g, subtitle + VirtualDiskLabel(disk), Font, row, ForeColor, flags);
         row.Offset(0, 22);
         TextRenderer.DrawText(g, $"Avg {disk.Latest.ReadMiB + disk.Latest.WriteMiB:0.##} MiB/s total",
             Font, row, ForeColor, flags);
