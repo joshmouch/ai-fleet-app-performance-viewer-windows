@@ -139,91 +139,79 @@ internal static class VmDiskIo
 
     private sealed class GuestCpuSession
     {
-        private readonly SemaphoreSlim gate = new(1, 1);
+        private readonly object sync = new();
         private Process process;
-        private bool replyPending; // a caller stopped waiting; its reply is still on the wire
+        private TaskCompletionSource<string> waiter;
 
         public void Close()
         {
-            var old = process;
-            process = null;
+            Process old;
+            TaskCompletionSource<string> pending;
+            lock (sync) { old = process; process = null; pending = waiter; waiter = null; }
+            pending?.TrySetException(new InvalidOperationException("The VM closed the guest CPU sampling connection."));
             try { if (old != null && !old.HasExited) old.Kill(entireProcessTree: true); }
             catch (InvalidOperationException) { }
             catch (System.ComponentModel.Win32Exception) { }
             old?.Dispose();
         }
 
+        /// <summary>The next complete sample the VM streams after this call.</summary>
         public async Task<string> Sample(string[] target, string code, TimeSpan limit, CancellationToken cancellation)
         {
-            await gate.WaitAsync(cancellation).ConfigureAwait(false);
-            try
+            TaskCompletionSource<string> mine = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            lock (sync)
             {
-                using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
-                deadline.CancelAfter(limit);
-                using var timeout = new CancellationTokenSource(limit);
-                using var registration = timeout.Token.Register(Close);
-                try
-                {
-                    if (process == null || process.HasExited)
-                    {
-                        Open(target, code);
-                        replyPending = false;
-                    }
-                    var current = process;
-                    if (replyPending)
-                        await ReadReply(current, deadline.Token).ConfigureAwait(false);
-                    replyPending = true;
-                    await current.StandardInput.WriteLineAsync("go".AsMemory(), deadline.Token).ConfigureAwait(false);
-                    await current.StandardInput.FlushAsync(deadline.Token).ConfigureAwait(false);
-                    string reply = await ReadReply(current, deadline.Token).ConfigureAwait(false);
-                    replyPending = false;
-                    return reply;
-                }
-                catch (OperationCanceledException) when (!cancellation.IsCancellationRequested)
-                {
-                    throw new InvalidOperationException("Guest CPU sampling did not finish.");
-                }
-                catch (IOException)
-                {
-                    throw new InvalidOperationException("The VM closed the guest CPU sampling connection.");
-                }
+                if (process == null || process.HasExited)
+                    Open(target, code);
+                waiter ??= mine;
+                mine = waiter;
             }
-            finally { gate.Release(); }
-        }
-
-        private static async Task<string> ReadReply(Process current, CancellationToken cancellation)
-        {
-            var text = new StringBuilder();
-            while (true)
-            {
-                string line = await current.StandardOutput.ReadLineAsync(cancellation).ConfigureAwait(false)
-                    ?? throw new InvalidOperationException("Could not connect to the VM with the configured cluster SSH identity.");
-                if (line.StartsWith("__END__ ", StringComparison.Ordinal))
-                {
-                    if (line != "__END__ 0")
-                        throw new InvalidOperationException("The VM could not run the guest CPU sampler.");
-                    return text.ToString();
-                }
-                text.Append(line).Append('\n');
-            }
+            using var timeout = new CancellationTokenSource(limit);
+            try { return await mine.Task.WaitAsync(limit, cancellation).ConfigureAwait(false); }
+            catch (TimeoutException) { throw new InvalidOperationException("Guest CPU sampling did not finish."); }
         }
 
         private void Open(string[] target, string code)
         {
-            Close();
             string encoded = Convert.ToBase64String(new UTF8Encoding(false).GetBytes(code));
             var start = new ProcessStartInfo(SshExecutable)
             {
                 CreateNoWindow = true, UseShellExecute = false, RedirectStandardInput = true, RedirectStandardOutput = true,
-                RedirectStandardError = true, StandardOutputEncoding = Encoding.UTF8, StandardErrorEncoding = Encoding.UTF8,
-                StandardInputEncoding = new UTF8Encoding(false)
+                RedirectStandardError = true, StandardOutputEncoding = Encoding.UTF8, StandardErrorEncoding = Encoding.UTF8
             };
             foreach (string argument in target)
                 start.ArgumentList.Add(argument);
             start.ArgumentList.Add("/bin/sh -c 'eval \"$(printf %s " + encoded + " | base64 -d)\"' sh loop");
-            process = Process.Start(start);
-            process.ErrorDataReceived += (_, _) => { };
-            process.BeginErrorReadLine();
+            var started = Process.Start(start);
+            process = started;
+            started.ErrorDataReceived += (_, _) => { };
+            started.BeginErrorReadLine();
+            _ = Task.Run(() => Stream(started));
+        }
+
+        private async Task Stream(Process started)
+        {
+            var text = new StringBuilder();
+            try
+            {
+                while (await started.StandardOutput.ReadLineAsync().ConfigureAwait(false) is { } line)
+                {
+                    if (!line.StartsWith("__END__ ", StringComparison.Ordinal))
+                    {
+                        text.Append(line).Append('\n');
+                        continue;
+                    }
+                    string reply = text.ToString();
+                    text.Clear();
+                    TaskCompletionSource<string> pending;
+                    lock (sync) { pending = waiter; waiter = null; }
+                    if (line == "__END__ 0") pending?.TrySetResult(reply);
+                    else pending?.TrySetException(new InvalidOperationException("The VM could not run the guest CPU sampler."));
+                }
+            }
+            catch (Exception e) when (e is IOException or ObjectDisposedException or InvalidOperationException) { }
+            lock (sync) { if (process != started) return; }
+            Close();
         }
     }
 

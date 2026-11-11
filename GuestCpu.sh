@@ -52,10 +52,10 @@ ticks=$(getconf CLK_TCK)
 '
 }
 
-# With the argument "loop" one connection serves many samples: one stdin line requests one,
-# and each reply ends with a line "__END__ <status>".
+# With the argument "loop" one connection streams samples back to back; each reply ends
+# with a line "__END__ <status>". The loop ends when the reader closes the connection.
 if [ "${1:-}" = loop ]; then
-    while IFS= read -r _; do
+    while :; do
         status=0
         sample || status=$?
         printf '__END__ %s\n' "$status"
