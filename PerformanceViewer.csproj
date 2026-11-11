@@ -3,7 +3,9 @@
     <OutputType>WinExe</OutputType>
     <TargetFramework>net10.0-windows</TargetFramework>
     <UseWindowsForms>true</UseWindowsForms>
-    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
+    <!-- DpiUnaware, as 1.0.7 shipped: Windows scales the whole window. PerMonitorV2 needs one owner that scales the
+         layout constants, the owner-drawn offsets and the scroll-bar widths by DeviceDpi first (issue #11, fix 4). -->
+    <ApplicationHighDpiMode>DpiUnaware</ApplicationHighDpiMode>
     <ApplicationVisualStyles>true</ApplicationVisualStyles>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <PublishSingleFile>true</PublishSingleFile>
