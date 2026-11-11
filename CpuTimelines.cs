@@ -1361,23 +1361,44 @@ internal sealed class Timeline : Form
     private void DrawCpuOverview(Graphics g, Sample latest, HistoryRange range, int width, bool split,
         SolidBrush muted, Pen grid, Pen line, Pen vmLine)
     {
-        int top = split ? 26 : 12;
-        var chart = new RectangleF(PaddingSize + 48, ChartTop + top, width - 60, OverallPanelHeight - top - 22);
+        float statsWidth = 0;
+        if (split)
+        {
+            using var windowsFont = new Font(Font.FontFamily, 18, FontStyle.Bold);
+            using var guestsFont = new Font(Font.FontFamily, 15, FontStyle.Bold);
+            using var windowsText = new SolidBrush(line.Color);
+            using var guestsText = new SolidBrush(vmLine.Color);
+            var current = latest?.HostCpu?.Overall;
+            var stats = new[]
+            {
+                (Label: "Windows CPU", Value: current?.Windows, Font: windowsFont, Text: windowsText),
+                (Label: "All Guests", Value: current?.VirtualMachines, Font: guestsFont, Text: guestsText),
+                (Label: "Hyper-V overhead", Value: current?.Hypervisor, Font: Font, Text: muted)
+            };
+            const int inset = 12;
+            const int valueGap = 12;
+            float contentWidth = stats.Max(stat => g.MeasureString(stat.Label, stat.Font).Width +
+                valueGap + g.MeasureString("100%", stat.Font).Width);
+            statsWidth = contentWidth + inset * 2;
+            float rowHeight = (OverallPanelHeight - 12f) / stats.Length;
+            float left = PaddingSize + inset;
+            float right = left + contentWidth;
+            for (int i = 0; i < stats.Length; i++)
+            {
+                var stat = stats[i];
+                float y = ChartTop + 6 + (i + 0.5f) * rowHeight - stat.Font.GetHeight(g) / 2;
+                string value = Percent(stat.Value);
+                g.DrawString(stat.Label, stat.Font, stat.Text, left, y);
+                g.DrawString(value, stat.Font, stat.Text, right - g.MeasureString(value, stat.Font).Width, y);
+            }
+        }
+
+        var chart = new RectangleF(PaddingSize + statsWidth + 48, ChartTop + 12,
+            width - statsWidth - 60, OverallPanelHeight - 34);
         DrawChartGrid(g, chart, grid);
         if (split)
         {
-            using var windowsText = new SolidBrush(line.Color);
-            using var vmText = new SolidBrush(vmLine.Color);
             using var overhead = new Pen(muted.Color) { DashStyle = System.Drawing.Drawing2D.DashStyle.Dot };
-            var current = latest?.HostCpu?.Overall;
-            string windows = "Windows CPU " + Percent(current?.Windows);
-            string guests = "All guests " + Percent(current?.VirtualMachines);
-            float x = chart.Left;
-            g.DrawString(windows, Font, windowsText, x, ChartTop + 4);
-            x += g.MeasureString(windows, Font).Width + 18;
-            g.DrawString(guests, Font, vmText, x, ChartTop + 4);
-            x += g.MeasureString(guests, Font).Width + 18;
-            g.DrawString("Hyper-V overhead " + Percent(current?.Hypervisor), Font, muted, x, ChartTop + 4);
             DrawHistory(g, chart, line, range, sample => sample.HostCpu?.Overall.Windows);
             DrawHistory(g, chart, vmLine, range, sample => sample.HostCpu?.Overall.VirtualMachines);
             DrawHistory(g, chart, overhead, range, sample => sample.HostCpu?.Overall.Hypervisor);
