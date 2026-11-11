@@ -2,9 +2,9 @@
 
 A Windows desktop viewer for finding the processes behind CPU and disk activity across the Windows host, Hyper-V guests, and WSL.
 
-- **CPU** and **Disk** share a bottom details pane, a search field, guest selection, and grouping. Details start open. All discovered guests start checked and rankings start flat with 20 rows. Search filters the sampled rows before applying the **Top rows** limit.
+- **CPU** and **Disk** share a bottom details pane, a search field, guest selection, and ranking options. Details start open and all discovered guests start checked. Search filters the sampled rows before ranking them.
 - CPU and Disk use the same overview layout, with current readings at left and their history at right. Keep formatting changes aligned across both views.
-- **Settings → 10% usage bands** replaces the row limit with scrollable cumulative bands. CPU bands use sampled host-equivalent CPU time. Disk bands use captured bytes in the selected scope. Each process or path stays together in the band where its share starts, so large rows can span several bands. The denominator includes unattributed usage.
+- **Settings → Usage band %** starts at 10. Enter a whole percent from 1 to 100, or clear it to return to **Top rows** and optional machine grouping. CPU bands use sampled host-equivalent CPU time. Disk bands use captured bytes in the selected scope. Each row stays in the band where its cumulative share starts, so a large row can span several bands. The denominator includes unattributed usage. Band headers sum the displayed rows' numeric metrics, excluding PIDs. Guest busy percentages add the individual guest shares in that band.
 - Disk lists keep attribution gaps in the totals and show their rates above the rankings. **Disk filters → Show disk attribution gaps** includes those rows in the lists. Named paths can still show Windows kernel activity.
 - Process tables fetch command lines for displayed rows. Hover over the command line to read it in full. Exited or protected processes can have no command line available.
 - Right-click a process or path row and choose **Copy row** to copy its displayed values with their column labels.

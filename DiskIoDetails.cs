@@ -769,7 +769,7 @@ internal sealed class DiskIoDetails : Panel
     private readonly Dictionary<VmDisk, (GuestIoWatch Watch, long LastNeeded)> guestWatches = new();
     private HashSet<string> expandedGuests = new(StringComparer.OrdinalIgnoreCase);
     private bool groupByMachine;
-    private bool usageBands;
+    private int? bandWidth;
     private HashSet<int> fileDiskScope;
     private string fileDiskScopeLabel = "All disks";
     private bool showAttributionGaps;
@@ -853,7 +853,7 @@ internal sealed class DiskIoDetails : Panel
 
     private static RankedTable<DiskIoRow> NewTable(bool includePath, bool guestOnly = false)
     {
-        var table = new RankedTable<DiskIoRow>(virtualizeBands: includePath);
+        var table = new RankedTable<DiskIoRow>();
         if (includePath)
             table.AddColumn("Filename", 170, row => row.Key.Filename);
         ColumnHeader path = includePath ? table.AddColumn("Filepath", 220, row => row.Key.Filepath) : null;
@@ -861,21 +861,21 @@ internal sealed class DiskIoDetails : Panel
         table.AddColumn("Machine", 110, row => row.Machine);
         string basis = guestOnly ? "Guest " : "";
         string total = guestOnly ? "Guest MiB/s" : "I/O impact MiB/s";
-        var rank = table.AddColumn(total, guestOnly ? 108 : 126, row => row.Totals.TotalBytes, numeric: true);
-        table.AddColumn(basis + "Read MiB/s", guestOnly ? 110 : 85, row => row.Totals.ReadBytes, numeric: true);
-        table.AddColumn(basis + "Write MiB/s", guestOnly ? 110 : 85, row => row.Totals.WriteBytes, numeric: true);
-        table.AddColumn("Ops/s", 70, row => row.Totals.Operations, numeric: true);
+        var rank = table.AddMetric(total, guestOnly ? 108 : 126, row => row.Totals.TotalBytes, MiBRate);
+        table.AddMetric(basis + "Read MiB/s", guestOnly ? 110 : 85, row => row.Totals.ReadBytes, MiBRate);
+        table.AddMetric(basis + "Write MiB/s", guestOnly ? 110 : 85, row => row.Totals.WriteBytes, MiBRate);
+        table.AddMetric("Ops/s", 70, row => row.Totals.Operations, Rate);
         if (!guestOnly)
-            table.AddColumn("Guest MiB/s", 100, row => row.Guest?.Total, numeric: true);
+            table.AddMetric("Guest MiB/s", 100, row => row.Guest?.Total, (value, _) => FormatRate(value));
         table.AddColumn("PID", 65, row => row.Key.Pid, numeric: true);
-        table.AddColumn("Total MiB", 85, row => row.Totals.TotalBytes, numeric: true);
-        table.AddColumn("Reads", 70, row => row.Totals.Reads, numeric: true);
-        table.AddColumn("Writes", 70, row => row.Totals.Writes, numeric: true);
-        table.AddColumn("Total ops", 90, row => row.Totals.Operations, numeric: true);
+        table.AddMetric("Total MiB", 85, row => row.Totals.TotalBytes, (value, _) => FormatRate(value / BytesPerMiB));
+        table.AddMetric("Reads", 70, row => row.Totals.Reads, (value, _) => FormatCount(value));
+        table.AddMetric("Writes", 70, row => row.Totals.Writes, (value, _) => FormatCount(value));
+        table.AddMetric("Total ops", 90, row => row.Totals.Operations, (value, _) => FormatCount(value));
         if (!guestOnly)
         {
-            table.AddColumn("Guest read MiB/s", 130, row => row.Guest?.Read, numeric: true);
-            table.AddColumn("Guest write MiB/s", 130, row => row.Guest?.Write, numeric: true);
+            table.AddMetric("Guest read MiB/s", 130, row => row.Guest?.Read, (value, _) => FormatRate(value));
+            table.AddMetric("Guest write MiB/s", 130, row => row.Guest?.Write, (value, _) => FormatRate(value));
         }
         if (!includePath)
             table.AddColumn("Command line", 470, null);
@@ -891,6 +891,11 @@ internal sealed class DiskIoDetails : Panel
         return table;
     }
 
+    private static string FormatRate(double? value) => value?.ToString("N2") ?? "—";
+    private static string FormatCount(double value) => value.ToString("N0");
+    private static string Rate(double amount, double seconds) => seconds > 0 ? FormatRate(amount / seconds) : "—";
+    private static string MiBRate(double amount, double seconds) => Rate(amount / BytesPerMiB, seconds);
+
     public int HeightFor(int available) => expanded ? Math.Min(345, Math.Max(180, available * 3 / 5)) : 34;
 
     public void SetDiskScope(HashSet<int> disks, string label)
@@ -899,13 +904,13 @@ internal sealed class DiskIoDetails : Panel
         fileDiskScopeLabel = label;
     }
 
-    public void SetOptions(CpuExpansionTarget[] guests, bool group, int limit, string search, bool bands, bool showGaps)
+    public void SetOptions(CpuExpansionTarget[] guests, bool group, int limit, string search, int? bands, bool showGaps)
     {
         expandedGuests = guests.Select(guest => guest.Name)
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
         groupByMachine = group;
         topRows = limit;
-        usageBands = bands;
+        bandWidth = bands;
         showAttributionGaps = showGaps;
         filter = search;
         RefreshRows();
@@ -1253,41 +1258,39 @@ internal sealed class DiskIoDetails : Panel
         if (gaps.Length > 0 && seconds > 0)
         {
             if (byPath)
-                status.Text = $"Unresolved paths {Rate(gaps.Sum(row => row.Totals.TotalBytes), BytesPerMiB)} MiB/s  |  " + status.Text;
+                status.Text = $"Unresolved paths {MiBRate(gaps.Sum(row => row.Totals.TotalBytes), seconds)} MiB/s  |  " + status.Text;
             else
             {
                 long kernel = gaps.Where(IsWindowsKernel).Sum(row => row.Totals.TotalBytes);
                 long unidentified = gaps.Sum(row => row.Totals.TotalBytes) - kernel;
                 if (unidentified > 0)
-                    status.Text = $"Unidentified process {Rate(unidentified, BytesPerMiB)} MiB/s  |  " + status.Text;
+                    status.Text = $"Unidentified process {MiBRate(unidentified, seconds)} MiB/s  |  " + status.Text;
                 if (kernel > 0)
-                    status.Text = $"Windows kernel {Rate(kernel, BytesPerMiB)} MiB/s  |  " + status.Text;
+                    status.Text = $"Windows kernel {MiBRate(kernel, seconds)} MiB/s  |  " + status.Text;
             }
         }
 
         var ranked = showAttributionGaps ? matched : matched.Where(row => !IsGap(row) || Pending(row).Label != null);
-        table.Render(ranked, row => row.Machine, groupByMachine, topRows, Item, usageBands
-            ? (row => row.Totals.TotalBytes, (double)entries.Sum(row => row.Totals.TotalBytes), "I/O") : null, Identity);
+        table.Render(ranked, row => row.Machine, groupByMachine, topRows, Item, bandWidth is int width
+            ? (width, row => row.Totals.TotalBytes, (double)entries.Sum(row => row.Totals.TotalBytes), "I/O") : null,
+            (row, key) => key is RowSelection selection && selection.Key == row.Key && selection.Machine == row.Machine,
+            seconds);
         if (byPath)
             commands.Suspend();
         else
-            commands.Update(table, table.Columns.Count - 1, item =>
-            {
-                if (item.Tag is not RowSelection row)
-                    return null;
-                // The WSL disk trace reports kernel PIDs, which can differ from the distro's /proc IDs.
-                int pid = row.Machine.StartsWith("WSL / ", StringComparison.OrdinalIgnoreCase) ? 0 : row.Key.Pid;
-                return new ProcessIdentity(row.Machine, pid, row.Key.Process);
-            }, usageBands);
+            commands.Update(table, table.Columns.Count - 1, item => item.Tag is RowSelection row ? CommandIdentity(row) : null);
         return DiskIoMerge.Sum(matched.Select(row => row.Totals));
 
         static bool IsWindowsKernel(DiskIoRow row) => row.Machine == Environment.MachineName && row.Key.Pid == 4;
         bool IsGap(DiskIoRow row) => byPath ? row.Key.Path.Length == 0 || row.Key.Path == "(path unavailable)" :
             IsWindowsKernel(row) || row.Key.Pid <= 0 || row.Key.Process.Equals("Unknown", StringComparison.OrdinalIgnoreCase);
 
-        string Rate(long amount, double scale = 1) => seconds > 0 ? (amount / scale / seconds).ToString("N2") : "—";
-
-        static RowSelection Identity(DiskIoRow row) => new(row.Key, row.Machine);
+        static ProcessIdentity CommandIdentity(RowSelection row)
+        {
+            // The WSL trace reports kernel PIDs, which can differ from the distro's /proc IDs.
+            int pid = row.Machine.StartsWith("WSL / ", StringComparison.OrdinalIgnoreCase) ? 0 : row.Key.Pid;
+            return new ProcessIdentity(row.Machine, pid, row.Key.Process);
+        }
 
         (string Label, string Help) Pending(DiskIoRow row) =>
             row.Guest == null && pendingRows != null ? pendingRows.GetValueOrDefault(row.Key) : default;
@@ -1308,14 +1311,14 @@ internal sealed class DiskIoDetails : Panel
             string process = IsWindowsKernel(row) ? "System (Windows kernel)" :
                 row.Key.Pid <= 0 ? "Unidentified process" : row.Key.Process;
             cells.AddRange(new[] { process, row.Machine,
-                Rate(value.TotalBytes, BytesPerMiB), Rate(value.ReadBytes, BytesPerMiB),
-                Rate(value.WriteBytes, BytesPerMiB), Rate(value.Operations) });
+                MiBRate(value.TotalBytes, seconds), MiBRate(value.ReadBytes, seconds),
+                MiBRate(value.WriteBytes, seconds), Rate(value.Operations, seconds) });
             if (!guestOnly)
                 cells.Add(row.Guest?.Total.ToString("N2") ?? pending.Label ?? (wslInactive ? "WSL inactive" : "—"));
             cells.AddRange(new[] { row.Key.Pid > 0 ? row.Key.Pid.ToString() : "—",
-                (value.TotalBytes / BytesPerMiB).ToString("N2"), value.Reads.ToString("N0"), value.Writes.ToString("N0"), value.Operations.ToString("N0") });
+                FormatRate(value.TotalBytes / BytesPerMiB), FormatCount(value.Reads), FormatCount(value.Writes), FormatCount(value.Operations) });
             if (!guestOnly)
-                cells.AddRange(new[] { row.Guest?.Read.ToString("N2") ?? "—", row.Guest?.Write.ToString("N2") ?? "—" });
+                cells.AddRange(new[] { FormatRate(row.Guest?.Read), FormatRate(row.Guest?.Write) });
             if (!byPath)
                 cells.Add("");
             string help = byPath ? path + (vm?.Label != null ? "\nVM: " + vm.Label : "") : "";
@@ -1323,11 +1326,15 @@ internal sealed class DiskIoDetails : Panel
                 help += "\nGuest file sampling requires a running distribution and WSL selected under Guests.";
             if (pending.Help != null)
                 help = help.Length == 0 ? pending.Help : help + "\n" + pending.Help;
-            return new ListViewItem(cells.ToArray(), group)
+            var selection = new RowSelection(row.Key, row.Machine);
+            var item = new ListViewItem(cells.ToArray(), group)
             {
-                Tag = Identity(row),
+                Tag = selection,
                 ToolTipText = help
             };
+            if (!byPath)
+                commands.Fill(item, cells.Count - 1, CommandIdentity(selection));
+            return item;
         }
     }
 }

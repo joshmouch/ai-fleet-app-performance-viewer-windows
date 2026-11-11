@@ -16,21 +16,36 @@ internal sealed class ProcessCommands : IDisposable
     private readonly Dictionary<ProcessIdentity, (long ReadAt, string Command)> cache = new();
     private ListView table;
     private int column;
-    private bool viewportOnly;
     private Func<ListViewItem, ProcessIdentity> identify;
     private CancellationTokenSource pending;
     private bool disposed;
 
-    public void Update(ListView visibleTable, int commandColumn, Func<ListViewItem, ProcessIdentity> identity, bool viewportOnly = false)
+    public void Update(ListView visibleTable, int commandColumn, Func<ListViewItem, ProcessIdentity> identity)
     {
         table = visibleTable;
         column = commandColumn;
         identify = identity;
-        this.viewportOnly = viewportOnly;
         Refresh();
     }
 
     public void Suspend() => table = null;
+
+    public bool Fill(ListViewItem item, int commandColumn, ProcessIdentity process)
+    {
+        if (process.Pid <= 0)
+            item.SubItems[commandColumn].Text = "—";
+        else if (cache.TryGetValue(process, out var entry))
+        {
+            item.SubItems[commandColumn].Text = entry.Command ?? "—";
+            item.ToolTipText = entry.Command ?? "Command line unavailable";
+        }
+        else
+        {
+            item.SubItems[commandColumn].Text = "…";
+            return false;
+        }
+        return true;
+    }
 
     public void Refresh()
     {
@@ -41,27 +56,15 @@ internal sealed class ProcessCommands : IDisposable
             cache.Remove(key);
 
         var missing = new HashSet<ProcessIdentity>();
-        int start = viewportOnly ? table.TopItem?.Index ?? 0 : 0;
-        int end = viewportOnly ? Math.Min(table.Items.Count, start + table.ClientSize.Height / FontRowHeight() + 2)
+        int start = table.VirtualMode ? table.TopItem?.Index ?? 0 : 0;
+        int end = table.VirtualMode ? Math.Min(table.Items.Count, start + table.ClientSize.Height / FontRowHeight() + 2)
             : table.Items.Count;
         for (int i = start; i < end; i++)
         {
             var item = table.Items[i];
             var process = identify(item);
-            if (process == null)
-                continue;
-            if (process.Pid <= 0)
-                item.SubItems[column].Text = "—";
-            else if (cache.TryGetValue(process, out var entry))
-            {
-                item.SubItems[column].Text = entry.Command ?? "—";
-                item.ToolTipText = entry.Command ?? "Command line unavailable";
-            }
-            else
-            {
-                item.SubItems[column].Text = "…";
+            if (process != null && !(table.VirtualMode ? cache.ContainsKey(process) || process.Pid <= 0 : Fill(item, column, process)))
                 missing.Add(process);
-            }
         }
 
         if (pending == null && missing.Count > 0)
@@ -85,6 +88,8 @@ internal sealed class ProcessCommands : IDisposable
             var commands = batches.SelectMany(batch => batch).ToDictionary(pair => pair.Key, pair => pair.Value);
             foreach (var process in processes)
                 cache[process] = (readAt, commands.GetValueOrDefault(process));
+            if (table?.VirtualMode == true)
+                table.Invalidate();
         }
         catch (Exception) when (current.IsCancellationRequested) { }
         finally

@@ -20,7 +20,7 @@ internal sealed class CpuProcessDetails : Panel
     private CpuExpansionTarget[] selected = Array.Empty<CpuExpansionTarget>();
     private ClusterCpuSample latest;
     private bool groupByMachine;
-    private bool usageBands;
+    private int? bandWidth;
     private string filter = "";
     private sealed record ProcessRow(string Machine, CpuProcessRow Process, double? Impact, double? Cores);
     private int topRows;
@@ -45,9 +45,9 @@ internal sealed class CpuProcessDetails : Panel
 
         table.AddColumn("Process", 142, row => row.Process.Process);
         table.AddColumn("Machine", 130, row => row.Machine);
-        var impact = table.AddColumn("CPU impact %", 112, row => row.Impact, numeric: true);
-        table.AddColumn("Guest busy %", 110, row => row.Process.GuestCpuShare, numeric: true);
-        table.AddColumn("Host cores", 88, row => row.Cores, numeric: true);
+        var impact = table.AddMetric("CPU impact %", 112, row => row.Impact, (value, _) => Format(value));
+        table.AddMetric("Guest busy %", 110, row => GuestPercent(row), (value, _) => Format(value));
+        table.AddMetric("Host cores", 88, row => row.Cores, (value, _) => Format(value));
         table.AddColumn("PID", 72, row => row.Process.Pid, numeric: true);
         commandColumn = table.AddColumn("Command line", 350, null);
         table.SortBy(impact);
@@ -81,13 +81,13 @@ internal sealed class CpuProcessDetails : Panel
         StartSampling();
     }
 
-    public void SetOptions(CpuExpansionTarget[] guests, bool group, int limit, string search, bool bands)
+    public void SetOptions(CpuExpansionTarget[] guests, bool group, int limit, string search, int? bands)
     {
         bool changedGuests = !selected.SequenceEqual(guests);
         selected = guests;
         groupByMachine = group;
         topRows = limit;
-        usageBands = bands;
+        bandWidth = bands;
         filter = search;
         if (changedGuests && IsOpen)
             StartSampling();
@@ -114,7 +114,7 @@ internal sealed class CpuProcessDetails : Panel
         var cancellation = current.Token;
         latest = null;
         commands.Suspend();
-        table.Items.Clear();
+        table.ClearRows();
         table.Groups.Clear();
         status.Text = "Collecting CPU usage…";
         try
@@ -133,7 +133,7 @@ internal sealed class CpuProcessDetails : Panel
                 {
                     latest = null;
                     commands.Suspend();
-                    table.Items.Clear();
+                    table.ClearRows();
                     table.Groups.Clear();
                     status.Text = e.Message;
                 }
@@ -179,16 +179,26 @@ internal sealed class CpuProcessDetails : Panel
             .Concat(latest.Guests.SelectMany(machine => machine.Rows.Select(row => new ProcessRow(machine.Name, row,
                 100 * row.AttributedCores / host.LogicalProcessors, row.AttributedCores)))).ToArray();
         table.Render(rows.Where(row => RowFilter.Matches(filter, row.Process.Process, row.Machine, row.Process.Pid.ToString())),
-            row => row.Machine, groupByMachine, topRows, NewRow, usageBands
-                ? (row => row.Cores, rows.Sum(row => row.Cores ?? 0) + missing, "CPU") : null);
-        commands.Update(table, commandColumn.Index, item => item.Tag as ProcessIdentity, usageBands);
+            row => row.Machine, groupByMachine, topRows, NewRow, bandWidth is int width
+                ? (width, row => row.Cores, rows.Sum(row => row.Cores ?? 0) + missing, "CPU") : null,
+            (row, key) => key is ProcessIdentity process && process.Machine == row.Machine &&
+                process.Pid == row.Process.Pid && process.Name == row.Process.Process && process.Started == row.Process.Started);
+        commands.Update(table, commandColumn.Index, item => item.Tag as ProcessIdentity);
     }
 
-    private static ListViewItem NewRow(ProcessRow row, ListViewGroup group) =>
-        new(new[] { row.Process.Process, row.Machine, row.Impact?.ToString("0.##") ?? "—",
-            (100 * row.Process.GuestCpuShare)?.ToString("0.##") ?? "—",
-            row.Cores?.ToString("0.##") ?? "—", row.Process.Pid > 0 ? row.Process.Pid.ToString() : "—", "" }, group)
-        { Tag = new ProcessIdentity(row.Machine, row.Process.Pid, row.Process.Process, row.Process.Started) };
+    private static double? GuestPercent(ProcessRow row) => 100 * row.Process.GuestCpuShare;
+
+    private static string Format(double? value) => value?.ToString("0.##") ?? "—";
+
+    private ListViewItem NewRow(ProcessRow row, ListViewGroup group)
+    {
+        var process = new ProcessIdentity(row.Machine, row.Process.Pid, row.Process.Process, row.Process.Started);
+        var item = new ListViewItem(new[] { row.Process.Process, row.Machine, Format(row.Impact),
+            Format(GuestPercent(row)), Format(row.Cores), row.Process.Pid > 0 ? row.Process.Pid.ToString() : "—", "" }, group)
+        { Tag = process };
+        commands.Fill(item, commandColumn.Index, process);
+        return item;
+    }
 
     protected override void Dispose(bool disposing)
     {
