@@ -139,7 +139,7 @@ internal static class VmDiskIo
     public static async Task<CpuProcessSample> SampleCpu(string vmName, CancellationToken cancellation)
     {
         var target = GuestSshArguments(vmName);
-        var session = CpuSessions.GetOrAdd(vmName, _ => new GuestCpuSession());
+        var session = CpuSessions.GetOrAdd(vmName, name => new GuestCpuSession(name));
         try
         {
             string output = await session.Sample(target, await ReadScript("GuestCpu.sh", cancellation).ConfigureAwait(false),
@@ -154,18 +154,69 @@ internal static class VmDiskIo
         }
     }
 
-    private sealed class GuestCpuSession
+    /// <summary>Ends every guest CPU session not named in <paramref name="activeVmNames"/> (its ssh process tree), for
+    /// good: a sample still in flight on an ended session cannot reopen it. The CPU pane calls this after cancelling its
+    /// sampler, with no names when it closes or the app exits and with its selected guests when the selection changes,
+    /// so no ssh outlives the view that sampled through it.</summary>
+    public static void RetainCpuSessions(IEnumerable<string> activeVmNames)
     {
+        var active = new HashSet<string>(activeVmNames, StringComparer.OrdinalIgnoreCase);
+        foreach (string vmName in CpuSessions.Keys.Where(name => !active.Contains(name)).ToArray())
+            if (CpuSessions.TryRemove(vmName, out var session))
+                session.End();
+    }
+
+    private sealed class GuestCpuSession(string vmName)
+    {
+        private const int ErrorTailLines = 5;
         private readonly object sync = new();
+        private readonly Queue<string> errorTail = new();
         private Process process;
         private TaskCompletionSource<string> waiter;
+        private bool ended;
 
-        public void Close()
+        /// <summary>Resets the session after a failed sample; the next sample reopens it.</summary>
+        public void Close() => Close(expected: null);
+
+        /// <summary>Ends the session for good (its owner no longer samples this guest): a later sample is cancelled
+        /// instead of reopening ssh.</summary>
+        public void End()
+        {
+            lock (sync) ended = true;
+            Close(expected: null);
+        }
+
+        /// <summary>Ends the session's process; with <paramref name="expected"/>, only while that process is still the
+        /// session's, checked and cleared under one lock, so a stream ending late cannot close a newer session.</summary>
+        private void Close(Process expected)
         {
             Process old;
             TaskCompletionSource<string> pending;
-            lock (sync) { old = process; process = null; pending = waiter; waiter = null; }
-            pending?.TrySetException(new InvalidOperationException("The VM closed the guest CPU sampling connection."));
+            string cause;
+            lock (sync)
+            {
+                if (expected != null && process != expected) return;
+                old = process; process = null; pending = waiter; waiter = null;
+                cause = Cause(old, "closed the guest CPU sampling connection");
+            }
+            pending?.TrySetException(new InvalidOperationException(cause));
+            Stop(old);
+        }
+
+        /// <summary>Why the session failed, for the sample that waited on it: ssh's connect failure (exit 255) as the one-shot
+        /// samplers say it, else what the VM did plus the last lines ssh wrote to stderr. Called under <c>sync</c>.</summary>
+        private string Cause(Process failed, string what)
+        {
+            bool unreachable = false;
+            try { unreachable = failed != null && failed.HasExited && failed.ExitCode == 255; }
+            catch (InvalidOperationException) { }
+            if (unreachable) return $"Could not connect to the VM {vmName} with the configured cluster SSH identity.";
+            string tail = string.Join(" | ", errorTail);
+            return $"The VM {vmName} {what}." + (tail.Length > 0 ? $" ssh: {tail}" : "");
+        }
+
+        private static void Stop(Process old)
+        {
             try { if (old != null && !old.HasExited) old.Kill(entireProcessTree: true); }
             catch (InvalidOperationException) { }
             catch (System.ComponentModel.Win32Exception) { }
@@ -178,12 +229,13 @@ internal static class VmDiskIo
             TaskCompletionSource<string> mine = new(TaskCreationOptions.RunContinuationsAsynchronously);
             lock (sync)
             {
+                if (ended) throw new OperationCanceledException($"The guest CPU session for {vmName} has ended.");
+                cancellation.ThrowIfCancellationRequested(); // a cancelled sampler never opens ssh its owner already closed
                 if (process == null || process.HasExited)
                     Open(target, code);
                 waiter ??= mine;
                 mine = waiter;
             }
-            using var timeout = new CancellationTokenSource(limit);
             try { return await mine.Task.WaitAsync(limit, cancellation).ConfigureAwait(false); }
             catch (TimeoutException) { throw new InvalidOperationException("Guest CPU sampling did not finish."); }
         }
@@ -200,8 +252,19 @@ internal static class VmDiskIo
                 start.ArgumentList.Add(argument);
             start.ArgumentList.Add("/bin/sh -c 'eval \"$(printf %s " + encoded + " | base64 -d)\"' sh loop");
             var started = Process.Start(start);
+            Stop(process); // the previous, exited process: disposed rather than orphaned
             process = started;
-            started.ErrorDataReceived += (_, e) => { if (e.Data != null) try { File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "pv-ssh.log"), e.Data + "\r\n"); } catch (IOException) { } };
+            errorTail.Clear();
+            // Drained so ssh never blocks on a full stderr pipe; its last lines are the cause a failed sample reports.
+            started.ErrorDataReceived += (_, e) =>
+            {
+                if (e.Data == null) return;
+                lock (sync)
+                {
+                    errorTail.Enqueue(e.Data);
+                    while (errorTail.Count > ErrorTailLines) errorTail.Dequeue();
+                }
+            };
             started.BeginErrorReadLine();
             _ = Task.Run(() => Stream(started));
         }
@@ -221,14 +284,14 @@ internal static class VmDiskIo
                     string reply = text.ToString();
                     text.Clear();
                     TaskCompletionSource<string> pending;
-                    lock (sync) { pending = waiter; waiter = null; }
+                    string cause;
+                    lock (sync) { pending = waiter; waiter = null; cause = Cause(started, "could not run the guest CPU sampler"); }
                     if (line == "__END__ 0") pending?.TrySetResult(reply);
-                    else pending?.TrySetException(new InvalidOperationException("The VM could not run the guest CPU sampler."));
+                    else pending?.TrySetException(new InvalidOperationException(cause));
                 }
             }
             catch (Exception e) when (e is IOException or ObjectDisposedException or InvalidOperationException) { }
-            lock (sync) { if (process != started) return; }
-            Close();
+            Close(expected: started);
         }
     }
 

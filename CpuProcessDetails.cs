@@ -74,6 +74,7 @@ internal sealed class CpuProcessDetails : Panel
             commands.Suspend();
             previous.Cancel();
             previous.Dispose();
+            VmDiskIo.RetainCpuSessions(Array.Empty<string>());
             return;
         }
 
@@ -90,7 +91,10 @@ internal sealed class CpuProcessDetails : Panel
         bandWidth = bands;
         filter = search;
         if (changedGuests && IsOpen)
-            StartSampling();
+        {
+            StartSampling(); // cancels the previous sampler first, so it cannot re-add a guest dropped below
+            VmDiskIo.RetainCpuSessions(guests.Where(guest => !guest.IsWsl).Select(guest => guest.Name));
+        }
         else if (IsOpen)
             Render();
     }
