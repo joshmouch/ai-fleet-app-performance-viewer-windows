@@ -1026,8 +1026,6 @@ internal sealed class Timeline : Form
             card.Width = Math.Max(1, width / columns - CardGap);
     }
 
-    private int CardsHeight => diskGrid.Height;
-
     private void LayoutDetailsRegion()
     {
         int available = Math.Max(0, ClientSize.Height - CardsTop - PaddingSize);
@@ -1128,10 +1126,11 @@ internal sealed class Timeline : Form
             if (processors.Length == 0)
                 return;
 
-            int height = CardsHeight;
+            int height = diskGrid.Height;
             if (height <= 0)
                 return;
-            int columns = Math.Max(1, (int)Math.Ceiling(Math.Sqrt(processors.Length * width / (height * 1.65))));
+            int columns = Math.Clamp((int)Math.Ceiling(Math.Sqrt(processors.Length * width / (height * 1.65))),
+                1, Math.Max(1, width / (66 + CardGap)));
             int rows = (processors.Length + columns - 1) / columns;
             float cellWidth = (width - (columns - 1) * CardGap) / (float)columns;
             float cellHeight = (height - (rows - 1) * CardGap) / (float)rows;
@@ -1145,9 +1144,19 @@ internal sealed class Timeline : Form
                 grid.Color = Blend(card.Color, ForeColor, 0.22);
                 g.FillRectangle(card, x, y, cellWidth, cellHeight);
                 string reading = Percent(utilization);
-                g.DrawString("CPU " + id, Font, text, x + 4, y + 2);
-                g.DrawString(reading, Font, text, x + cellWidth - g.MeasureString(reading, Font).Width - 4, y + 2);
-                var chart = new RectangleF(x + 5, y + 22, cellWidth - 10, cellHeight - 28);
+                const TextFormatFlags labelFlags = TextFormatFlags.NoPadding | TextFormatFlags.SingleLine;
+                int readingWidth = TextRenderer.MeasureText(g, reading, Font, Size.Empty, labelFlags).Width;
+                int labelWidth = Math.Max(0, (int)cellWidth - readingWidth - 11);
+                int labelHeight = Math.Min(Font.Height, Math.Max(0, (int)cellHeight - 3));
+                var label = new Rectangle((int)x + 4, (int)y + 2, labelWidth, labelHeight);
+                string name = "CPU " + id;
+                if (TextRenderer.MeasureText(g, name, Font, Size.Empty, labelFlags).Width > labelWidth)
+                    name = id;
+                TextRenderer.DrawText(g, name, Font, label, ForeColor, labelFlags | TextFormatFlags.EndEllipsis);
+                var readingBounds = new Rectangle((int)(x + cellWidth) - readingWidth - 4, label.Y, readingWidth, labelHeight);
+                TextRenderer.DrawText(g, reading, Font, readingBounds, ForeColor, labelFlags);
+                int plotOffset = cellHeight < 44 ? Font.Height + 4 : 22;
+                var chart = new RectangleF(x + 5, y + plotOffset, cellWidth - 10, cellHeight - plotOffset - 5);
                 if (chart.Width > 0 && chart.Height > 0)
                 {
                     DrawChartGrid(g, chart, grid);
