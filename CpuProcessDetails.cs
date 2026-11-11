@@ -9,15 +9,20 @@ using System.Windows.Forms;
 internal sealed class CpuProcessDetails : Panel
 {
     private readonly Label status = new() { AutoEllipsis = true };
-    private readonly ListView table = new() { View = View.Details, FullRowSelect = true, Dock = DockStyle.Fill };
+    private readonly RankedTable<ProcessRow> table = new();
+    private readonly ProcessCommands commands = new();
+    private readonly ToolTip coverageHelp = new();
+    private readonly ColumnHeader commandColumn;
     private readonly Button close = new() { Text = "Close" };
     private readonly Func<int> interval;
     private CancellationTokenSource lifetime;
     private CancellationTokenSource sample;
     private CpuExpansionTarget[] selected = Array.Empty<CpuExpansionTarget>();
     private ClusterCpuSample latest;
-    private bool groupByMachine = true;
-    private int topRows = 10;
+    private bool groupByMachine;
+    private string filter = "";
+    private sealed record ProcessRow(string Machine, CpuProcessRow Process, double? Impact, double? Cores);
+    private int topRows;
 
     public bool IsOpen => lifetime != null;
     public event EventHandler CloseRequested;
@@ -37,18 +42,20 @@ internal sealed class CpuProcessDetails : Panel
         status.Anchor = AnchorStyles.Left | AnchorStyles.Top | AnchorStyles.Right;
         header.Controls.AddRange(new Control[] { title, close, status });
 
-        var name = table.Columns.Add("Process", 200);
-        var machineColumn = table.Columns.Add("Machine", 130);
-        table.Columns.Add("PID", 52, HorizontalAlignment.Right);
-        table.Columns.Add("Guest CPU %", 82, HorizontalAlignment.Right);
-        table.Columns.Add("Host CPU %", 80, HorizontalAlignment.Right);
-        table.Columns.Add("Host cores", 70, HorizontalAlignment.Right);
+        table.AddColumn("Process", 142, row => row.Process.Process);
+        table.AddColumn("Machine", 130, row => row.Machine);
+        var impact = table.AddColumn("CPU impact %", 112, row => row.Impact, numeric: true);
+        table.AddColumn("Guest busy %", 110, row => row.Process.GuestCpuShare, numeric: true);
+        table.AddColumn("Host cores", 88, row => row.Cores, numeric: true);
+        table.AddColumn("PID", 72, row => row.Process.Pid, numeric: true);
+        commandColumn = table.AddColumn("Command line", 350, null);
+        table.SortBy(impact);
+        table.RankingChanged += (_, _) => Render();
         table.SizeChanged += (_, _) =>
         {
             int available = table.ClientSize.Width - SystemInformation.VerticalScrollBarWidth -
-                table.Columns.Cast<ColumnHeader>().Skip(2).Sum(column => column.Width);
-            machineColumn.Width = Math.Clamp(available - 70, 90, 130);
-            name.Width = Math.Max(70, available - machineColumn.Width);
+                table.Columns.Cast<ColumnHeader>().Where(column => column != commandColumn).Sum(column => column.Width);
+            commandColumn.Width = Math.Max(250, available - 4);
         };
         Controls.Add(table);
         Controls.Add(header);
@@ -62,6 +69,7 @@ internal sealed class CpuProcessDetails : Panel
         {
             var previous = lifetime;
             lifetime = null;
+            commands.Suspend();
             previous.Cancel();
             previous.Dispose();
             return;
@@ -71,12 +79,13 @@ internal sealed class CpuProcessDetails : Panel
         StartSampling();
     }
 
-    public void SetOptions(CpuExpansionTarget[] guests, bool group, int limit)
+    public void SetOptions(CpuExpansionTarget[] guests, bool group, int limit, string search)
     {
         bool changedGuests = !selected.SequenceEqual(guests);
         selected = guests;
         groupByMachine = group;
         topRows = limit;
+        filter = search;
         if (changedGuests && IsOpen)
             StartSampling();
         else if (IsOpen)
@@ -101,6 +110,7 @@ internal sealed class CpuProcessDetails : Panel
         sample = current;
         var cancellation = current.Token;
         latest = null;
+        commands.Suspend();
         table.Items.Clear();
         table.Groups.Clear();
         status.Text = "Collecting CPU usage…";
@@ -119,6 +129,7 @@ internal sealed class CpuProcessDetails : Panel
                 catch (Exception e) when (!cancellation.IsCancellationRequested)
                 {
                     latest = null;
+                    commands.Suspend();
                     table.Items.Clear();
                     table.Groups.Clear();
                     status.Text = e.Message;
@@ -140,51 +151,47 @@ internal sealed class CpuProcessDetails : Panel
         if (latest == null)
             return;
         var host = latest.Host;
-        var machines = latest.Guests.Prepend(new CpuMachineProcesses(Environment.MachineName, host.Rows));
-        bool group = groupByMachine && latest.Guests.Length > 0;
-        status.Text = $"{host.Seconds:0.0} s host sample  |  Guest % of busy CPU  |  Host % of Windows capacity";
-        if (latest.Unexpanded.Length > 0)
-            status.Text += "  |  Host rows kept for " + string.Join(", ", latest.Unexpanded);
-
-        table.BeginUpdate();
-        try
-        {
-            table.Items.Clear();
-            table.Groups.Clear();
-            table.ShowGroups = group;
-            if (group)
-            {
-                foreach (var machine in machines)
-                {
-                    string heading = machine.VmCores is double cores
-                        ? $"{machine.Name}  |  {100 * cores / host.LogicalProcessors:0.##}% host CPU"
-                        : machine.Name;
-                    var section = new ListViewGroup(heading);
-                    table.Groups.Add(section);
-                    table.Items.AddRange(machine.Rows.OrderByDescending(row => row.Cores).ThenBy(row => row.Pid)
-                        .Take(topRows).Select(row => NewRow(machine.Name, row, host.LogicalProcessors, section)).ToArray());
-                }
-            }
-            else
-            {
-                table.Items.AddRange(machines.SelectMany(machine => machine.Rows.Select(row => (machine.Name, Row: row)))
-                    .OrderByDescending(entry => entry.Row.Cores).ThenBy(entry => entry.Name, StringComparer.OrdinalIgnoreCase)
-                    .ThenBy(entry => entry.Row.Pid).Take(topRows)
-                    .Select(entry => NewRow(entry.Name, entry.Row, host.LogicalProcessors)).ToArray());
-            }
-        }
-        finally { table.EndUpdate(); }
+        var measured = latest.Coverage.Where(guest => guest.HostCores.HasValue).ToArray();
+        double budget = measured.Sum(guest => guest.HostCores.Value);
+        double missing = measured.Sum(guest => Math.Max(0, guest.HostCores.Value - guest.AttributedCores));
+        string sampleTime = $"{host.Seconds:0.0} s sample";
+        status.Text = budget > 0
+            ? $"Guest CPU {100 * Math.Clamp(1 - missing / budget, 0, 1):0}% attributed  |  {100 * missing / host.LogicalProcessors:0.##}% of host capacity unattributed  |  {sampleTime}"
+            : sampleTime;
+        var unavailable = latest.Coverage.Where(guest => !guest.SampleAvailable || !guest.HostCores.HasValue)
+            .Select(guest => guest.Machine).ToArray();
+        if (unavailable.Length > 0)
+            status.Text += "  |  Incomplete samples: " + string.Join(", ", unavailable);
+        string help = string.Join("\n", latest.Coverage.Select(guest =>
+            $"{guest.Machine}: " + (guest.HostCores is double cores
+                ? $"{100 * guest.AttributedCores / host.LogicalProcessors:0.##}% of host capacity attributed out of {100 * cores / host.LogicalProcessors:0.##}% measured"
+                : "Host CPU budget unavailable") + (guest.SampleAvailable ? "" : " (guest sample unavailable)"))
+            .Prepend("CPU impact % is measured against host capacity. Guest busy % is each process's share of its guest's used CPU."));
+        if (coverageHelp.GetToolTip(status) != help)
+            coverageHelp.SetToolTip(status, help);
+        var rows = host.Rows.Select(row => new ProcessRow(Environment.MachineName, row,
+                100 * row.Cores / host.LogicalProcessors, row.Cores))
+            .Concat(latest.Guests.SelectMany(machine => machine.Rows.Select(row => new ProcessRow(machine.Name, row,
+                100 * row.AttributedCores / host.LogicalProcessors, row.AttributedCores))));
+        table.Render(rows.Where(row => RowFilter.Matches(filter, row.Process.Process, row.Machine, row.Process.Pid.ToString())),
+            row => row.Machine, groupByMachine, topRows, NewRow);
+        commands.Update(table, commandColumn.Index, item => (ProcessIdentity)item.Tag);
     }
 
-    private static ListViewItem NewRow(string machine, CpuProcessRow row, int processors, ListViewGroup group = null) =>
-        new(new[] { row.Process, machine, row.Pid.ToString(),
-            row.GuestCpuShare is double share ? (100 * share).ToString("0.##") : "",
-            (100 * row.Cores / processors).ToString("0.##"), row.Cores.ToString("0.##") }, group);
+    private static ListViewItem NewRow(ProcessRow row, ListViewGroup group) =>
+        new(new[] { row.Process.Process, row.Machine, row.Impact?.ToString("0.##") ?? "—",
+            (100 * row.Process.GuestCpuShare)?.ToString("0.##") ?? "—",
+            row.Cores?.ToString("0.##") ?? "—", row.Process.Pid > 0 ? row.Process.Pid.ToString() : "—", "" }, group)
+        { Tag = new ProcessIdentity(row.Machine, row.Process.Pid, row.Process.Process, row.Process.Started) };
 
     protected override void Dispose(bool disposing)
     {
         if (disposing)
+        {
             SetOpen(false);
+            commands.Dispose();
+            coverageHelp.Dispose();
+        }
         base.Dispose(disposing);
     }
 }

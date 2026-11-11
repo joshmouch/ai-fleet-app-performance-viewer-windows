@@ -20,9 +20,12 @@
     <Compile Include="DiskIoMerge.cs" />
     <Compile Include="VmDiskIo.cs" />
     <Compile Include="CpuProcessDetails.cs" />
+    <Compile Include="RankedTable.cs" />
+    <Compile Include="ProcessCommands.cs" />
     <Compile Include="CpuProcessSampler.cs" />
     <EmbeddedResource Include="GuestDiskIo.py" LogicalName="GuestDiskIo.py" />
     <EmbeddedResource Include="GuestCpu.sh" LogicalName="GuestCpu.sh" />
+    <EmbeddedResource Include="GuestCommands.sh" LogicalName="GuestCommands.sh" />
     <PackageReference Include="Microsoft.Diagnostics.Tracing.TraceEvent" Version="4.0.0" />
     <PackageReference Include="System.Management" Version="10.0.0" />
   </ItemGroup>
