@@ -15,6 +15,7 @@
   <ItemGroup>
     <Compile Include="CpuTimelines.cs" />
     <Compile Include="DiskIoDetails.cs" />
+    <Compile Include="DiskIoMerge.cs" />
     <Compile Include="VmDiskIo.cs" />
     <Compile Include="CpuProcessDetails.cs" />
     <Compile Include="CpuProcessSampler.cs" />

@@ -17,8 +17,9 @@ internal sealed record CpuProcessSample(int LogicalProcessors, double Seconds, C
     double TotalCores = 0, double ProcessCores = 0);
 internal sealed record CpuMachineProcesses(string Name, CpuProcessRow[] Rows, double? VmCores = null);
 internal sealed record ClusterCpuSample(CpuProcessSample Host, CpuMachineProcesses[] Guests, string[] Unexpanded);
-internal sealed record CpuExpansionTarget(string Name, bool IsWsl = false)
+internal sealed record CpuExpansionTarget(string Name, bool IsWsl = false, string CounterName = null)
 {
+    public string CounterInstance => IsWsl ? CounterName : Name;
     public override string ToString() => Name;
 }
 
@@ -39,9 +40,24 @@ internal static class CpuProcessSampler
             targets.AddRange(ReadGuests().Select(guest => new CpuExpansionTarget(guest.Name)));
         }
         catch (Exception e) when (e is ManagementException or UnauthorizedAccessException or COMException) { }
-        if (FindWslProcess().HasValue)
-            targets.Add(new CpuExpansionTarget("WSL", IsWsl: true));
+        if (FindWslProcess() is int wslPid)
+            targets.Add(new CpuExpansionTarget("WSL", IsWsl: true, CounterName: ReadWslCounterName(wslPid)));
         return targets.ToArray();
+    }
+
+    private static string ReadWslCounterName(int wslPid)
+    {
+        try
+        {
+            using var wsl = new ManagementObject($"Win32_Process.Handle='{wslPid}'");
+            using var worker = new ManagementObject($"Win32_Process.Handle='{wsl["ParentProcessId"]}'");
+            if (worker["CommandLine"] is string command)
+                foreach (string argument in command.Split(' ', StringSplitOptions.RemoveEmptyEntries))
+                    if (Guid.TryParse(argument.Trim('"'), out Guid vm))
+                        return vm.ToString();
+        }
+        catch (Exception e) when (e is ManagementException or UnauthorizedAccessException or COMException) { }
+        return null;
     }
 
     private static Guest[] ReadGuests()
