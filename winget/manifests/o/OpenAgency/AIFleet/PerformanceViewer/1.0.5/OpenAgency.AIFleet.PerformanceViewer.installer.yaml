@@ -1,0 +1,17 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.6.0.schema.json
+PackageIdentifier: OpenAgency.AIFleet.PerformanceViewer
+PackageVersion: 1.0.5
+InstallerType: zip
+NestedInstallerType: portable
+NestedInstallerFiles:
+- RelativeFilePath: AI Fleet Cluster Performance Viewer.exe
+  PortableCommandAlias: aifleet-performance-viewer
+Dependencies:
+  PackageDependencies:
+  - PackageIdentifier: Microsoft.DotNet.DesktopRuntime.10
+Installers:
+- Architecture: x64
+  InstallerUrl: https://github.com/joshmouch/ai-fleet-app-performance-viewer-windows/releases/download/v1.0.5/AIFleetPerformanceViewer-1.0.5-win-x64.zip
+  InstallerSha256: E6F91C2241FFD2C74DA7B70F9AF4EEE0DF8EA550E09B77F05856E8C2B05D49DE
+ManifestType: installer
+ManifestVersion: 1.6.0
