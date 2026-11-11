@@ -1086,44 +1086,44 @@ internal sealed class DiskIoDetails : Panel
         var expansions = guestSamples.Where(pair => pair.Sample.Seconds > 0 && pair.Sample.Paths.Count > 0)
             .Select(pair => new DiskIoExpansion(pair.Group.Key.VMName, pair.Group.ToArray(),
                 byPath ? pair.Sample.Paths : pair.Sample.Processes, pair.Sample.Seconds)).ToArray();
-        string window = $"Completed disk I/O  |  {snapshot.Seconds:0} s window";
-        if (snapshot.DiskBytes == 0)
-            window = "No completed disk I/O in the current window.";
-        else if (byPath && selectedPath == null)
+        string window = snapshot.DiskBytes == 0 ? "No disk I/O in this sample" : $"{snapshot.Seconds:0} s sample";
+        if (byPath && selectedPath == null && snapshot.DiskBytes > 0)
             window += $"  |  {(double)snapshot.NamedBytes / snapshot.DiskBytes:P0} of bytes matched to paths";
         status.Text = snapshot.Status ?? window;
-        if (snapshot.EventsLost > 0)
-            status.Text += "  |  Windows dropped " + snapshot.EventsLost + " trace events";
-        if (byPath && snapshot.OmittedBytes > 0)
-            status.Text += "  |  Path limit reached";
+        var notes = new List<string>();
         if (snapshot.OutsideScopeBytes > 0 && snapshot.Seconds > 0)
-            status.Text += $"  |  Outside scope {snapshot.OutsideScopeBytes / BytesPerMiB / snapshot.Seconds:N1} MiB/s";
-
-        if (byPath && inventory is { IsFaulted: true })
-            status.Text += "  |  " + inventory.Exception.GetBaseException().Message;
-        if (byPath && owners != null && entries.Keys.Any(key => owners.TryGetValue(VmDiskIo.Normalize(key.Path), out var match) && match.Attachment != null))
-            status.Text += "  |  Double-click a VHDX for guest I/O";
-        var rows = DiskIoMerge.Expand(entries, expansions, byPath);
-        bool hasGuestRows = rows.Any(row => row.Guest != null);
-        if (hasGuestRows)
-            status.Text += "  |  Guest I/O impact estimated";
-        var missing = guestSamples.Where(candidate => candidate.Sample.Seconds <= 0 || candidate.Sample.Paths.Count == 0).ToArray();
-        var unavailable = missing.Where(candidate => candidate.Sample.Error != null).ToArray();
-        if (unavailable.Length > 0)
-            status.Text += "  |  Guest I/O unavailable on " + unavailable.Length + " VHDX" + (unavailable.Length == 1 ? "" : " files");
-        if (missing.Length > unavailable.Length)
-            status.Text += "  |  Waiting on " + (missing.Length - unavailable.Length) + " guest disks";
-        var errors = unavailable.Select(candidate => $"{candidate.Group.Key.VMName} / " +
-            System.IO.Path.GetFileName(candidate.Group.First().Key.Path) + ": " + candidate.Sample.Error);
-        var totals = FillTable(byPath ? paths : processes, rows, byPath, guestOnly: false, snapshot.Seconds, owners);
+        {
+            notes.Add($"Disks excluded by {fileDiskScopeLabel} contributed {snapshot.OutsideScopeBytes / BytesPerMiB / snapshot.Seconds:N1} MiB/s.");
+            notes.Add("This can include Storage Spaces backing drives doing work already measured on the virtual disks. Choose All disks under Disk filters to see those devices.");
+        }
+        if (snapshot.EventsLost > 0)
+            notes.Add($"Windows dropped {snapshot.EventsLost:N0} trace events.");
         if (byPath && selectedPath == null && snapshot.DiskBytes > snapshot.NamedBytes)
         {
             long missingName = snapshot.DiskBytes - snapshot.NamedBytes - snapshot.KeylessBytes - snapshot.OmittedBytes;
-            errors = errors.Prepend($"Unresolved I/O: {snapshot.KeylessBytes / BytesPerMiB:N1} MiB without a file key, " +
-                $"{missingName / BytesPerMiB:N1} MiB without a name for its key, " +
-                $"{snapshot.OmittedBytes / BytesPerMiB:N1} MiB over the path limit.");
+            if (snapshot.KeylessBytes > 0)
+                notes.Add($"Windows supplied no file key for {snapshot.KeylessBytes / BytesPerMiB:N1} MiB.");
+            if (missingName > 0)
+                notes.Add($"The trace had no filename for the file keys on {missingName / BytesPerMiB:N1} MiB.");
+            if (snapshot.OmittedBytes > 0)
+                notes.Add($"The viewer reached its per-sample capacity for tracking individual paths. It still counted all {snapshot.OmittedBytes / BytesPerMiB:N1} MiB in the I/O totals.");
         }
-        SetStatusHelp(string.Join("\n", errors.Prepend(status.Text)));
+        if (byPath && inventory is { IsFaulted: true })
+            notes.Add(inventory.Exception.GetBaseException().Message);
+        if (byPath && owners != null && entries.Keys.Any(key => owners.TryGetValue(VmDiskIo.Normalize(key.Path), out var match) && match.Attachment != null))
+            notes.Add("Double-click a VHDX to see guest I/O.");
+        var rows = DiskIoMerge.Expand(entries, expansions, byPath);
+        bool hasGuestRows = rows.Any(row => row.Guest != null);
+        if (hasGuestRows)
+            notes.Add("Guest I/O impact is estimated from the guest's share of the VHDX traffic.");
+        var missing = guestSamples.Where(candidate => candidate.Sample.Seconds <= 0 || candidate.Sample.Paths.Count == 0).ToArray();
+        int waiting = missing.Count(candidate => candidate.Sample.Error == null);
+        if (waiting > 0)
+            notes.Add($"Waiting for I/O from {waiting} guest {(waiting == 1 ? "disk" : "disks")}.");
+        notes.AddRange(missing.Where(candidate => candidate.Sample.Error != null).Select(candidate =>
+            $"{candidate.Group.Key.VMName} / {System.IO.Path.GetFileName(candidate.Group.First().Key.Path)} — {candidate.Sample.Error}"));
+        var totals = FillTable(byPath ? paths : processes, rows, byPath, guestOnly: false, snapshot.Seconds, owners);
+        SetStatusHelp(string.Join("\n", notes.Prepend(status.Text)));
         string description = hasGuestRows
             ? "Guest rows divide their VHDX's measured Windows I/O using the guest's file I/O proportions."
             : "Completed Windows I/O for the current selection.";
