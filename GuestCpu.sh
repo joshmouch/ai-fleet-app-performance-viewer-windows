@@ -18,6 +18,7 @@ snapshot() {
     done
 }
 
+sample() {
 ticks=$(getconf CLK_TCK)
 { snapshot; sleep 1; snapshot; } | awk -v ticks="$ticks" '
     /^snapshot$/ { sample++; next }
@@ -49,3 +50,16 @@ ticks=$(getconf CLK_TCK)
         printf "sample\t%.6f\t%d\t%d\t%d\t%d\n", time[2] - time[1], ticks, busy[2] - busy[1], process_ticks, cpus[2]
     }
 '
+}
+
+# With the argument "loop" one connection serves many samples: one stdin line requests one,
+# and each reply ends with a line "__END__ <status>".
+if [ "${1:-}" = loop ]; then
+    while IFS= read -r _; do
+        status=0
+        sample || status=$?
+        printf '__END__ %s\n' "$status"
+    done
+else
+    sample
+fi
