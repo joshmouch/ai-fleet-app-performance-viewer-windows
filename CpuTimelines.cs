@@ -231,6 +231,8 @@ internal sealed class Timeline : Form
     private readonly List<Sample> history = new List<Sample>();
     private DiskCounters diskCounters;
     private PdhQuery guestCounters;
+    private HyperVHostCounters hostCounters;
+    private bool triedHostCounters;
     private string[] diskCardLayout = Array.Empty<string>();
     private CpuExpansionTarget[] availableGuests = Array.Empty<CpuExpansionTarget>();
     private double nextGuestRefresh;
@@ -270,6 +272,7 @@ internal sealed class Timeline : Form
         public double? Total;
         public Dictionary<string, double> Values;
         public Dictionary<string, double> GuestValues;
+        public HyperVHostSample HostCpu;
         public Dictionary<string, DiskReading> Disks;
 
         public double? GetUtilization(string processor)
@@ -283,6 +286,9 @@ internal sealed class Timeline : Form
 
         public double? GetGuestUtilization(string counter) =>
             GuestValues != null && GuestValues.TryGetValue(counter, out double value) ? value : null;
+
+        public CpuTimeSplit? GetHostCpu(int processor) =>
+            HostCpu != null && HostCpu.Processors.TryGetValue(processor, out var value) ? value : null;
 
         public DiskReading? GetDisk(string id)
         {
@@ -505,6 +511,7 @@ internal sealed class Timeline : Form
             timer.Dispose();
             guestMenu.Dispose();
             guestCounters?.Dispose();
+            hostCounters?.Dispose();
             diskCardTips.Dispose();
             if (diskCounters != null)
                 diskCounters.Dispose();
@@ -614,6 +621,8 @@ internal sealed class Timeline : Form
                 guestCounters?.Dispose();
                 guestCounters = null;
             }
+            try { sample.HostCpu = hostCounters?.Read(); }
+            catch (InvalidOperationException) { }
         }
         sample.Disks = ReadDisks();
         history.Add(sample);
@@ -739,11 +748,21 @@ internal sealed class Timeline : Form
         {
             guestCounters?.Dispose();
             guestCounters = null;
+            hostCounters?.Dispose();
+            hostCounters = null;
+            triedHostCounters = false;
         }
         else if (guestCounters == null)
         {
             try { guestCounters = new PdhQuery(@"\Hyper-V Hypervisor Virtual Processor(*)\% Guest Run Time"); }
             catch (InvalidOperationException) { }
+        }
+        if (guests.Length > 0 && !triedHostCounters)
+        {
+            triedHostCounters = true;
+            try { hostCounters = new HyperVHostCounters(); }
+            catch (Exception e) when (e is InvalidOperationException or DllNotFoundException or EntryPointNotFoundException
+                or System.Text.Json.JsonException or KeyNotFoundException or ArgumentException) { }
         }
         if (showingDisks)
             RefreshDiskCards(clock.Elapsed.TotalSeconds);
@@ -1241,6 +1260,8 @@ internal sealed class Timeline : Form
         Sample latest = history.LastOrDefault();
         if (end > nextSampleAt + SamplingGraceSeconds)
             latest = null;
+        var physical = !showingDisks && selectedGuests.Count > 0
+            ? history.LastOrDefault(sample => sample.HostCpu != null)?.HostCpu : null;
 
         using (var title = new Font(Font.FontFamily, 18, FontStyle.Bold))
         using (var text = new SolidBrush(ForeColor))
@@ -1253,7 +1274,7 @@ internal sealed class Timeline : Form
             var selected = latest == null ? null : latest.GetDisk(selectedDisk);
             string headline = showingDisks
                 ? (selected.HasValue ? "Disk " + selected.Value.Number + "   " + Percent(selected.Value.Active) + " active" : "")
-                : "Overall " + Percent(latest == null ? null : latest.Total);
+                : "Overall " + Percent(physical != null ? latest?.HostCpu?.Overall.Total : latest?.Total);
             float headlineLeft = ClientSize.Width - 16 - g.MeasureString(headline, title).Width;
             if (headlineLeft > processButton.Right + 10)
                 g.DrawString(headline, title, text, headlineLeft, 12);
@@ -1264,7 +1285,9 @@ internal sealed class Timeline : Form
                     (virtualCount > 0 ? "  |  " + virtualCount + " VHDX files" : "") +
                     (virtualDiskStatus == null ? "" : "  |  " + virtualDiskStatus))
                 : error ?? (processors.Length == 0 ? "Collecting the first sample..." :
-                    processors.Length + " logical processors   |   Last " + range.Duration + "   |   Stronger blue = busier");
+                    (physical?.Processors.Count ?? processors.Length) + " logical processors   |   Last " + range.Duration +
+                    (physical != null || selectedGuests.Count == 0 ? "" : hostCounters != null
+                        ? "   |   Collecting Hyper-V CPU split" : "   |   Hyper-V CPU split unavailable"));
             g.DrawString(UpdateLabel, Font, muted, UpdateLabelLeft, 48);
             g.DrawString(DiskCutoffLabel, Font, muted, DiskCutoffLabelLeft, 48);
             int detailRight = transferCutoff.Left - 6 - TextRenderer.MeasureText(TransferCutoffLabel, Font).Width;
@@ -1282,30 +1305,64 @@ internal sealed class Timeline : Form
                 return;
             }
 
-            var overallChart = new RectangleF(PaddingSize + 48, ChartTop + 12, width - 60, OverallPanelHeight - 34);
-            DrawChartGrid(g, overallChart, grid);
-            DrawHistory(g, overallChart, line, range, sample => sample.Total);
-            DrawAxes(g, overallChart, muted, range.Duration, 100, "%");
-
-            DrawCpuTiles(g, latest, range, width, card, grid, line);
+            using var vmLine = new Pen(writeLineColor, line.Width);
+            DrawCpuOverview(g, latest, range, width, physical != null, muted, grid, line, vmLine);
+            DrawCpuTiles(g, latest, range, width, physical, card, grid, line, vmLine);
         }
     }
 
-    private sealed record CpuTile(string Machine, string Processor, string GuestCounter = null)
+    private void DrawCpuOverview(Graphics g, Sample latest, HistoryRange range, int width, bool split,
+        SolidBrush muted, Pen grid, Pen line, Pen vmLine)
     {
-        public double? Read(Sample sample) => GuestCounter == null
-            ? sample?.GetUtilization(Processor) : sample?.GetGuestUtilization(GuestCounter);
+        int top = split ? 26 : 12;
+        var chart = new RectangleF(PaddingSize + 48, ChartTop + top, width - 60, OverallPanelHeight - top - 22);
+        DrawChartGrid(g, chart, grid);
+        if (split)
+        {
+            using var windowsText = new SolidBrush(line.Color);
+            using var vmText = new SolidBrush(vmLine.Color);
+            using var overhead = new Pen(muted.Color) { DashStyle = System.Drawing.Drawing2D.DashStyle.Dot };
+            var current = latest?.HostCpu?.Overall;
+            string windows = "Windows CPU " + Percent(current?.Windows);
+            string guests = "All VM CPU " + Percent(current?.VirtualMachines);
+            float x = chart.Left;
+            g.DrawString(windows, Font, windowsText, x, ChartTop + 4);
+            x += g.MeasureString(windows, Font).Width + 18;
+            g.DrawString(guests, Font, vmText, x, ChartTop + 4);
+            x += g.MeasureString(guests, Font).Width + 18;
+            g.DrawString("Hyper-V " + Percent(current?.Hypervisor), Font, muted, x, ChartTop + 4);
+            DrawHistory(g, chart, line, range, sample => sample.HostCpu?.Overall.Windows);
+            DrawHistory(g, chart, vmLine, range, sample => sample.HostCpu?.Overall.VirtualMachines);
+            DrawHistory(g, chart, overhead, range, sample => sample.HostCpu?.Overall.Hypervisor);
+        }
+        else
+            DrawHistory(g, chart, line, range, sample => sample.Total);
+        DrawAxes(g, chart, muted, range.Duration, 100, "%");
     }
 
-    private void DrawCpuTiles(Graphics g, Sample latest, HistoryRange range, int width, SolidBrush card, Pen grid, Pen line)
+    private sealed record CpuTile(string Machine, string Processor, string GuestCounter = null, int? LogicalProcessor = null)
+    {
+        public double? Read(Sample sample) => LogicalProcessor is int logical
+            ? sample?.GetHostCpu(logical)?.Windows
+            : GuestCounter == null ? sample?.GetUtilization(Processor) : sample?.GetGuestUtilization(GuestCounter);
+
+        public double? ReadVmTime(Sample sample) =>
+            LogicalProcessor is int logical ? sample?.GetHostCpu(logical)?.VirtualMachines : null;
+    }
+
+    private void DrawCpuTiles(Graphics g, Sample latest, HistoryRange range, int width, HyperVHostSample physical,
+        SolidBrush card, Pen grid, Pen line, Pen vmLine)
     {
         int height = diskGrid.Height;
         if (processors.Length == 0 || height <= 0)
             return;
         var source = history.LastOrDefault(sample => sample.GuestValues != null)?.GuestValues;
+        var hostTiles = physical == null ? processors.Select(id => new CpuTile(Environment.MachineName, id)).ToArray()
+            : physical.Processors.Keys.Order().Select(index => new CpuTile(Environment.MachineName,
+                index.ToString(), LogicalProcessor: index)).ToArray();
         var sections = new List<(string Title, CpuTile[] Tiles)>
         {
-            (Environment.MachineName + " logical processors", processors.Select(id => new CpuTile(Environment.MachineName, id)).ToArray())
+            (Environment.MachineName + " logical processors", hostTiles)
         };
         foreach (var guest in availableGuests.Where(selectedGuests.Contains))
         {
@@ -1324,7 +1381,7 @@ internal sealed class Timeline : Form
             sections = new() { (null, sections.SelectMany(section => section.Tiles).ToArray()) };
         int count = sections.Sum(section => section.Tiles.Length);
         int header = grouped ? 24 : 0;
-        int minHeight = showSource ? 52 : 38;
+        int minHeight = showSource || physical != null ? 52 : 38;
         int columns = Math.Clamp((int)Math.Ceiling(Math.Sqrt(count * width / (height * 1.65))),
             1, Math.Max(1, width / (76 + CardGap)));
         int rows = sections.Sum(section => (section.Tiles.Length + columns - 1) / columns);
@@ -1365,7 +1422,7 @@ internal sealed class Timeline : Form
             {
                 float top = y + i / columns * (cellHeight + CardGap);
                 if (top + cellHeight >= CardsTop && top < CardsTop + height)
-                    DrawCpuTile(g, section.Tiles[i], latest, range, card, grid, line,
+                    DrawCpuTile(g, section.Tiles[i], latest, range, card, grid, line, vmLine,
                         new RectangleF(PaddingSize + i % columns * (cellWidth + CardGap), top, cellWidth, cellHeight), showSource);
             }
             y += ((section.Tiles.Length + columns - 1) / columns) * (cellHeight + CardGap);
@@ -1374,7 +1431,7 @@ internal sealed class Timeline : Form
     }
 
     private void DrawCpuTile(Graphics g, CpuTile tile, Sample latest, HistoryRange range,
-        SolidBrush card, Pen grid, Pen line, RectangleF bounds, bool showSource)
+        SolidBrush card, Pen grid, Pen line, Pen vmLine, RectangleF bounds, bool showSource)
     {
         double? utilization = tile.Read(latest);
         card.Color = Blend(idleTile, busyTile, Math.Clamp(utilization.GetValueOrDefault(), 0, 100) / 100);
@@ -1385,22 +1442,25 @@ internal sealed class Timeline : Form
             TextFormatFlags.PreserveGraphicsClipping | TextFormatFlags.NoPrefix;
         int readingWidth = TextRenderer.MeasureText(g, reading, Font, Size.Empty, flags).Width;
         var label = new Rectangle((int)bounds.X + 4, (int)bounds.Y + 2, Math.Max(0, (int)bounds.Width - readingWidth - 11), Font.Height);
-        string name = (tile.GuestCounter == null ? "CPU " : "VP ") + tile.Processor;
+        string name = (tile.LogicalProcessor.HasValue ? "LP " : tile.GuestCounter == null ? "CPU " : "VP ") + tile.Processor;
         if (TextRenderer.MeasureText(g, name, Font, Size.Empty, flags).Width > label.Width)
             name = tile.Processor;
         TextRenderer.DrawText(g, name, Font, label, ForeColor, flags | TextFormatFlags.EndEllipsis);
         TextRenderer.DrawText(g, reading, Font,
             new Rectangle((int)bounds.Right - readingWidth - 4, label.Y, readingWidth, Font.Height), ForeColor, flags);
         int plotOffset = Font.Height + 5;
-        if (showSource)
+        if (tile.LogicalProcessor.HasValue || showSource)
         {
-            TextRenderer.DrawText(g, tile.Machine, Font, new Rectangle(label.X, label.Bottom, (int)bounds.Width - 8, Font.Height),
-                ForeColor, flags | TextFormatFlags.EndEllipsis);
+            string secondary = tile.LogicalProcessor.HasValue ? "VMs " + Percent(tile.ReadVmTime(latest)) : tile.Machine;
+            TextRenderer.DrawText(g, secondary, Font, new Rectangle(label.X, label.Bottom, (int)bounds.Width - 8, Font.Height),
+                tile.LogicalProcessor.HasValue ? vmLine.Color : ForeColor, flags | TextFormatFlags.EndEllipsis);
             plotOffset += Font.Height;
         }
         var chart = new RectangleF(bounds.X + 5, bounds.Y + plotOffset, bounds.Width - 10, bounds.Height - plotOffset - 5);
         DrawChartGrid(g, chart, grid);
         DrawHistory(g, chart, line, range, tile.Read);
+        if (tile.LogicalProcessor.HasValue)
+            DrawHistory(g, chart, vmLine, range, tile.ReadVmTime);
     }
 
     protected override void OnMouseWheel(MouseEventArgs e)
