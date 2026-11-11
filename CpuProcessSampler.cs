@@ -233,31 +233,54 @@ internal static class CpuProcessSampler
 
     internal sealed record WslDistro(string Name, string Vhdx);
 
-    internal static async Task<WslDistro[]> ReadRunningWslDistros(CancellationToken cancellation)
+    internal static WslDistro[] ReadWslDistros()
     {
         try
         {
-            using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
-            deadline.CancelAfter(TimeSpan.FromSeconds(10));
-            var list = await VmDiskIo.Run(Wsl, new[] { "--list", "--running", "--quiet" }, null, deadline.Token,
-                Encoding.Unicode).ConfigureAwait(false);
-            if (list.ExitCode != 0)
-                return Array.Empty<WslDistro>();
-            var running = list.Output.Split('\n', StringSplitOptions.RemoveEmptyEntries)
-                .Select(line => line.Trim('\r', '\uFEFF')).ToHashSet(StringComparer.OrdinalIgnoreCase);
             using var registry = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Lxss");
             var distros = new List<WslDistro>();
             foreach (string key in registry?.GetSubKeyNames() ?? Array.Empty<string>())
             {
                 using var distro = registry.OpenSubKey(key);
-                if (distro?.GetValue("Version") is 2 && distro.GetValue("DistributionName") is string name && running.Contains(name))
+                if (distro?.GetValue("Version") is 2 && distro.GetValue("DistributionName") is string name)
                 {
                     string basePath = distro.GetValue("BasePath") as string;
                     string file = distro.GetValue("VhdFileName") as string ?? "ext4.vhdx";
-                    distros.Add(new WslDistro(name, basePath == null ? null : Path.Combine(basePath, file)));
+                    distros.Add(new WslDistro(name, string.IsNullOrWhiteSpace(basePath) ? null : Path.Combine(basePath, file)));
                 }
             }
             return distros.OrderBy(distro => distro.Name, StringComparer.OrdinalIgnoreCase).ToArray();
+        }
+        catch (Exception e) when (e is UnauthorizedAccessException or System.Security.SecurityException or IOException)
+        {
+            return Array.Empty<WslDistro>();
+        }
+    }
+
+    internal static async Task<HashSet<string>> ReadRunningWslNames(CancellationToken cancellation)
+    {
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
+        deadline.CancelAfter(TimeSpan.FromSeconds(10));
+        var list = await VmDiskIo.Run(Wsl, new[] { "--list", "--running", "--quiet" }, null, deadline.Token,
+            Encoding.Unicode).ConfigureAwait(false);
+        if (list.ExitCode != 0)
+        {
+            const string disabled = "ERROR_SERVICE_DISABLED";
+            if (list.Output.Contains(disabled, StringComparison.Ordinal) ||
+                list.Error.Replace("\0", "").Contains(disabled, StringComparison.Ordinal))
+                throw new InvalidOperationException("The Windows WSL service is disabled.");
+            throw new InvalidOperationException("Windows could not list the running WSL distributions.");
+        }
+        return list.Output.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+            .Select(line => line.Trim('\r', '\uFEFF')).ToHashSet(StringComparer.OrdinalIgnoreCase);
+    }
+
+    private static async Task<WslDistro[]> ReadRunningWslDistros(CancellationToken cancellation)
+    {
+        try
+        {
+            var running = await ReadRunningWslNames(cancellation).ConfigureAwait(false);
+            return ReadWslDistros().Where(distro => running.Contains(distro.Name)).ToArray();
         }
         catch (Exception) when (!cancellation.IsCancellationRequested)
         {
