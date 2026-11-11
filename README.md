@@ -15,3 +15,22 @@ dotnet publish PerformanceViewer.csproj -c Release
 ```
 
 The Windows x64 executable is under `bin/Release/net10.0-windows/win-x64/publish/` and uses the .NET 10 Desktop Runtime. Run elevated for Windows file I/O tracing and Hyper-V inventory. Hyper-V guest sampling uses Windows OpenSSH and the configured AI Fleet cluster SSH identity. Linux CPU sampling uses a POSIX shell, `awk`, and `getconf`. Guest disk I/O requires Python 3, noninteractive sudo for the sampler, and Linux tracing access.
+
+
+## Configuration
+
+Guest sampling connects to each VM as `fleet@<vm-name>.<domain>`. The domain has no default. Set it with the `PERFORMANCE_VIEWER_GUEST_DOMAIN` environment variable, or with `guestDomain` in `%LOCALAPPDATA%\AIFleetPerformanceViewer\settings.json`:
+
+```json
+{ "guestDomain": "your-tailnet.ts.net" }
+```
+
+Without it the viewer still shows host CPU and disk activity, and guest views report that the domain is not configured. `NODES_SSH_KEY` overrides the SSH identity path.
+
+## Install
+
+```powershell
+winget install OpenAgency.AIFleet.PerformanceViewer
+```
+
+Released under the MIT License.
