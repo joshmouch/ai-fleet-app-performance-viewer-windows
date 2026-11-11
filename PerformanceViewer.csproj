@@ -15,6 +15,7 @@
     <AssemblyName>AI Fleet Cluster Performance Viewer</AssemblyName>
   </PropertyGroup>
   <ItemGroup>
+    <FrameworkReference Include="Microsoft.WindowsDesktop.App.WPF" />
     <Compile Include="CpuTimelines.cs" />
     <Compile Include="HyperVHostCounters.cs" />
     <Compile Include="DiskIoDetails.cs" />

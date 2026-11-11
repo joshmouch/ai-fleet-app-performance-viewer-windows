@@ -3,6 +3,8 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Drawing;
 using System.Runtime.InteropServices;
+using System.Windows.Automation;
+using System.Windows.Automation.Provider;
 using System.Windows.Forms;
 
 internal sealed class RankedTable<TRow> : ListView
@@ -23,6 +25,7 @@ internal sealed class RankedTable<TRow> : ListView
     private Font dividerFont;
     private bool rendering;
     private bool viewportQueued;
+    private RankedListAccessibility bandAccessibility;
     private int sortColumn;
     private int impactColumn;
     private bool descending;
@@ -261,6 +264,12 @@ internal sealed class RankedTable<TRow> : ListView
 
     protected override void WndProc(ref Message message)
     {
+        if (VirtualMode && message.Msg == RankedListAccessibility.GetObject)
+        {
+            bandAccessibility ??= new RankedListAccessibility(this);
+            if (bandAccessibility.TryGetObject(ref message))
+                return;
+        }
         base.WndProc(ref message);
         if (!VirtualMode || rendering || viewportQueued || !IsHandleCreated ||
             message.Msg is not (0x0115 or 0x020A or 0x0100) || ViewportChanged == null)
@@ -297,6 +306,188 @@ internal sealed class RankedTable<TRow> : ListView
         }
         base.Dispose(disposing);
     }
+}
+
+internal sealed class RankedListAccessibility(ListView table) : Control.ControlAccessibleObject(table)
+{
+    public const int GetObject = 0x003D;
+    private BandAutomation automation;
+
+    public bool TryGetObject(ref Message message)
+    {
+        const int clientObject = -4, uiaRootObject = -25;
+        switch (unchecked((int)message.LParam.ToInt64()))
+        {
+            case uiaRootObject:
+                automation ??= new BandAutomation(table, this);
+                message.Result = AutomationInteropProvider.ReturnRawElementProvider(table.Handle, message.WParam, message.LParam, automation);
+                return true;
+            case clientObject:
+                var accessible = Marshal.GetComInterfaceForObject(this, typeof(Accessibility.IAccessible));
+                try { message.Result = LresultFromObject(typeof(Accessibility.IAccessible).GUID, message.WParam, accessible); }
+                finally { Marshal.Release(accessible); }
+                return true;
+            default:
+                return false;
+        }
+    }
+    public override AccessibleRole Role => AccessibleRole.List;
+
+    // A native accessibility traversal otherwise realizes every item in the live trace.
+    public (int Start, int Count) Viewport
+    {
+        get
+        {
+            if (!table.IsHandleCreated || table.VirtualListSize == 0)
+                return (0, 0);
+            int start = table.TopItem?.Index ?? 0;
+            int height = Math.Max(1, table.GetItemRect(start).Height);
+            int count = Math.Min(table.VirtualListSize - start, table.ClientSize.Height / height + 1);
+            return (start, count);
+        }
+    }
+
+    public override int GetChildCount() => Viewport.Count;
+
+    public override AccessibleObject GetChild(int index)
+    {
+        var (start, count) = Viewport;
+        return (uint)index < (uint)count ? new AccessibleRow(this, table, start + index) : null;
+    }
+
+    public override AccessibleObject GetFocused() => ForItem(table.FocusedItem?.Index ?? -1);
+
+    public override AccessibleObject GetSelected() =>
+        ForItem(table.SelectedIndices.Count > 0 ? table.SelectedIndices[0] : -1);
+
+    public override AccessibleObject HitTest(int x, int y)
+    {
+        var point = table.PointToClient(new Point(x, y));
+        return ForItem(table.GetItemAt(point.X, point.Y)?.Index ?? -1) ??
+            (Bounds.Contains(x, y) ? this : null);
+    }
+
+    public override AccessibleObject Navigate(AccessibleNavigation navdir) => navdir switch
+    {
+        AccessibleNavigation.FirstChild => GetChild(0),
+        AccessibleNavigation.LastChild => GetChild(GetChildCount() - 1),
+        _ => base.Navigate(navdir)
+    };
+
+    public AccessibleObject ForItem(int index)
+    {
+        var (start, count) = Viewport;
+        return index >= start && index - start < count ? new AccessibleRow(this, table, index) : null;
+    }
+
+
+
+    private sealed class AccessibleRow(RankedListAccessibility parent, ListView table, int index) : AccessibleObject
+    {
+        public int Index => index;
+        private ListViewItem Item => table.VirtualMode && (uint)index < (uint)table.VirtualListSize
+            ? table.Items[index] : null;
+        public override AccessibleObject Parent => parent;
+        public override AccessibleRole Role => AccessibleRole.ListItem;
+        public override Rectangle Bounds => Item is { } item ? table.RectangleToScreen(item.Bounds) : Rectangle.Empty;
+        public override string Name => Item is { } item
+            ? string.Join(", ", item.SubItems.Cast<ListViewItem.ListViewSubItem>()
+                .Where(cell => !string.IsNullOrWhiteSpace(cell.Text)).Select(cell => cell.Text)) : "";
+        public override AccessibleStates State => AccessibleStates.Focusable | AccessibleStates.Selectable |
+            (Item is { Selected: true } ? AccessibleStates.Selected : AccessibleStates.None) |
+            (Item is { Focused: true } ? AccessibleStates.Focused : AccessibleStates.None);
+
+        public override AccessibleObject Navigate(AccessibleNavigation navdir) => navdir switch
+        {
+            AccessibleNavigation.Next or AccessibleNavigation.Down => parent.ForItem(index + 1),
+            AccessibleNavigation.Previous or AccessibleNavigation.Up => parent.ForItem(index - 1),
+            _ => null
+        };
+
+        public override void Select(AccessibleSelection flags)
+        {
+            if (Item is not { } item)
+                return;
+            if ((flags & AccessibleSelection.TakeFocus) != 0)
+            {
+                table.Focus();
+                item.Focused = true;
+            }
+            if ((flags & AccessibleSelection.TakeSelection) != 0)
+                table.SelectedIndices.Clear();
+            if ((flags & (AccessibleSelection.TakeSelection | AccessibleSelection.AddSelection)) != 0)
+                item.Selected = true;
+            if ((flags & AccessibleSelection.RemoveSelection) != 0)
+                item.Selected = false;
+        }
+    }
+
+    private sealed class BandAutomation(ListView table, RankedListAccessibility accessibility, int index = -1)
+        : IRawElementProviderFragmentRoot, ISelectionItemProvider
+    {
+        private bool IsRoot => index < 0;
+        private AccessibleObject Item => IsRoot ? accessibility : accessibility.ForItem(index);
+        public ProviderOptions ProviderOptions => ProviderOptions.ServerSideProvider;
+        public IRawElementProviderSimple HostRawElementProvider => IsRoot && table.IsHandleCreated
+            ? AutomationInteropProvider.HostProviderFromHandle(table.Handle) : null;
+        public IRawElementProviderFragmentRoot FragmentRoot => IsRoot ? this : accessibility.automation;
+        public System.Windows.Rect BoundingRectangle => Item is { Bounds: var bounds }
+            ? new System.Windows.Rect(bounds.X, bounds.Y, bounds.Width, bounds.Height) : System.Windows.Rect.Empty;
+
+        public object GetPatternProvider(int patternId) =>
+            !IsRoot && patternId == SelectionItemPatternIdentifiers.Pattern.Id ? this : null;
+
+        public object GetPropertyValue(int propertyId)
+        {
+            if (propertyId == AutomationElementIdentifiers.ControlTypeProperty.Id)
+                return (IsRoot ? ControlType.List : ControlType.ListItem).Id;
+            if (propertyId == AutomationElementIdentifiers.NameProperty.Id)
+                return Item?.Name ?? "";
+            if (propertyId == AutomationElementIdentifiers.IsOffscreenProperty.Id)
+                return Item == null;
+            if (propertyId == AutomationElementIdentifiers.IsKeyboardFocusableProperty.Id)
+                return true;
+            if (propertyId == AutomationElementIdentifiers.HasKeyboardFocusProperty.Id)
+                return IsRoot ? table.Focused : HasState(AccessibleStates.Focused) && table.Focused;
+            return null;
+        }
+
+        public IRawElementProviderFragment Navigate(NavigateDirection direction) => direction switch
+        {
+            NavigateDirection.Parent when !IsRoot => accessibility.automation,
+            NavigateDirection.FirstChild when IsRoot => Provider(accessibility.GetChild(0)),
+            NavigateDirection.LastChild when IsRoot => Provider(accessibility.GetChild(accessibility.GetChildCount() - 1)),
+            NavigateDirection.NextSibling when !IsRoot => Provider(accessibility.ForItem(index + 1)),
+            NavigateDirection.PreviousSibling when !IsRoot => Provider(accessibility.ForItem(index - 1)),
+            _ => null
+        };
+
+        public int[] GetRuntimeId() => IsRoot ? null : new[] { AutomationInteropProvider.AppendRuntimeId, index };
+        public IRawElementProviderSimple[] GetEmbeddedFragmentRoots() => null;
+        public void SetFocus()
+        {
+            if (IsRoot)
+                table.Focus();
+            else
+                Item?.Select(AccessibleSelection.TakeFocus);
+        }
+
+        public IRawElementProviderFragment ElementProviderFromPoint(double x, double y) =>
+            Provider(accessibility.HitTest((int)x, (int)y)) ?? this;
+        public IRawElementProviderFragment GetFocus() => Provider(accessibility.GetFocused());
+        private BandAutomation Provider(AccessibleObject item) => item is AccessibleRow row
+            ? new BandAutomation(table, accessibility, row.Index) : null;
+        private bool HasState(AccessibleStates state) => Item is { } item && (item.State & state) != 0;
+        public bool IsSelected => HasState(AccessibleStates.Selected);
+        public IRawElementProviderSimple SelectionContainer => accessibility.automation;
+        public void Select() => Item?.Select(AccessibleSelection.TakeSelection);
+        public void AddToSelection() => Item?.Select(AccessibleSelection.AddSelection);
+        public void RemoveFromSelection() => Item?.Select(AccessibleSelection.RemoveSelection);
+    }
+
+    [DllImport("oleacc.dll")]
+    private static extern IntPtr LresultFromObject(in Guid interfaceId, IntPtr flags, IntPtr accessible);
+
 }
 
 internal static class RowFilter
