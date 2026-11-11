@@ -174,7 +174,7 @@ internal sealed class CpuProcessDetails : Panel
         string help = string.Join("\n", latest.Coverage.Select(guest =>
             $"{guest.Machine}: " + (guest.HostCores is double cores
                 ? $"{100 * guest.AttributedCores / host.LogicalProcessors:0.##}% of host capacity attributed out of {100 * cores / host.LogicalProcessors:0.##}% measured"
-                : "Host CPU budget unavailable") + (guest.SampleAvailable ? "" : " (guest sample unavailable)"))
+                : "Host CPU budget unavailable") + (guest.SampleAvailable ? "" : guest.Failure is { Length: > 0 } failure ? $" (guest sample unavailable: {failure})" : " (guest sample unavailable)"))
             .Prepend("CPU impact % is measured against host capacity. Guest busy % is each process's share of its guest's used CPU."));
         if (coverageHelp.GetToolTip(status) != help)
             coverageHelp.SetToolTip(status, help);

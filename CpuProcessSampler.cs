@@ -17,7 +17,8 @@ internal sealed record CpuProcessRow(int Pid, string Process, double Cores, doub
 internal sealed record CpuProcessSample(int LogicalProcessors, double Seconds, CpuProcessRow[] Rows,
     double TotalCores = 0, double ProcessCores = 0);
 internal sealed record CpuMachineProcesses(string Name, CpuProcessRow[] Rows);
-internal sealed record GuestCpuCoverage(string Machine, double? HostCores, double AttributedCores, bool SampleAvailable);
+/// <param name="Failure">Why the guest sample is unavailable, as the session reported it; null when it is available or no cause is known.</param>
+internal sealed record GuestCpuCoverage(string Machine, double? HostCores, double AttributedCores, bool SampleAvailable, string Failure = null);
 internal sealed record ClusterCpuSample(CpuProcessSample Host, CpuMachineProcesses[] Guests, GuestCpuCoverage[] Coverage);
 internal sealed record CpuExpansionTarget(string Name, bool IsWsl = false, string CounterName = null)
 {
@@ -128,7 +129,7 @@ internal static class CpuProcessSampler
         var hostTask = Task.Run(() => ReadHost(cancellation), cancellation);
         var hypervisorTask = Task.Run(() => ReadGuestBudgets(targets, cancellation), cancellation);
         var guestTasks = targets.Where(target => !target.IsWsl)
-            .Select(async target => (Target: target, Sample: await ReadGuest(target.Name, cancellation).ConfigureAwait(false)))
+            .Select(async target => (Target: target, Read: await ReadGuest(target.Name, cancellation).ConfigureAwait(false)))
             .ToArray();
         var wslTask = ReadWsl(distrosToSample.Select(distro => distro.Name).ToArray(), cancellation);
         await Task.WhenAll(guestTasks.Cast<Task>().Append(hostTask).Append(wslTask).Append(hypervisorTask)).ConfigureAwait(false);
@@ -140,12 +141,12 @@ internal static class CpuProcessSampler
         var replacedPids = new HashSet<int>();
         foreach (var task in guestTasks)
         {
-            var (target, sample) = await task.ConfigureAwait(false);
+            var (target, (sample, failure)) = await task.ConfigureAwait(false);
             var owner = owners.FirstOrDefault(owner => owner.Name == target.Name);
             var wrappers = host.Rows.Where(row => owner?.AccountingPids.Contains(row.Pid) == true).ToArray();
             double? budget = budgets.GetValueOrDefault(target) ?? (wrappers.Length > 0 ? wrappers.Sum(row => row.Cores) : null);
             var rows = sample == null ? Array.Empty<CpuProcessRow>() : Scale(sample, sample.TotalCores, budget);
-            coverage.Add(new GuestCpuCoverage(target.Name, budget, AssignedCores(rows), sample != null));
+            coverage.Add(new GuestCpuCoverage(target.Name, budget, AssignedCores(rows), sample != null, failure));
             if (rows.Length > 0)
                 expanded.Add(new CpuMachineProcesses(target.Name, rows));
             if (budget.HasValue)
@@ -331,10 +332,11 @@ internal static class CpuProcessSampler
             Math.Max(busy, processTicks) / divisor, processTicks / divisor);
     }
 
-    private static async Task<CpuProcessSample> ReadGuest(string name, CancellationToken cancellation)
+    /// <summary>The guest's sample, or null with the reason the session gave (shown beside the guest's coverage).</summary>
+    private static async Task<(CpuProcessSample Sample, string Failure)> ReadGuest(string name, CancellationToken cancellation)
     {
-        try { return await VmDiskIo.SampleCpu(name, cancellation).ConfigureAwait(false); }
-        catch (Exception) when (!cancellation.IsCancellationRequested) { return null; }
+        try { return (await VmDiskIo.SampleCpu(name, cancellation).ConfigureAwait(false), null); }
+        catch (Exception e) when (!cancellation.IsCancellationRequested) { return (null, e.Message); }
     }
 
     public static async Task<CpuProcessSample> ReadHost(CancellationToken cancellation)

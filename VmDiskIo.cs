@@ -183,23 +183,25 @@ internal static class VmDiskIo
         public void End()
         {
             lock (sync) ended = true;
-            Close(expected: null);
+            Close(expected: null, deliberate: true);
         }
 
         /// <summary>Ends the session's process; with <paramref name="expected"/>, only while that process is still the
         /// session's, checked and cleared under one lock, so a stream ending late cannot close a newer session.</summary>
-        private void Close(Process expected)
+        private void Close(Process expected, bool deliberate = false)
         {
             Process old;
             TaskCompletionSource<string> pending;
-            string cause;
+            string cause = null;
             lock (sync)
             {
                 if (expected != null && process != expected) return;
                 old = process; process = null; pending = waiter; waiter = null;
-                cause = Cause(old, "closed the guest CPU sampling connection");
+                if (pending != null && !deliberate) cause = Cause(old, "closed the guest CPU sampling connection");
             }
-            pending?.TrySetException(new InvalidOperationException(cause));
+            // An owner that ended the session cancels its own sample; only a connection that failed reports why.
+            if (deliberate) pending?.TrySetCanceled();
+            else pending?.TrySetException(new InvalidOperationException(cause));
             Stop(old);
         }
 
@@ -210,7 +212,7 @@ internal static class VmDiskIo
             bool unreachable = false;
             try { unreachable = failed != null && failed.HasExited && failed.ExitCode == 255; }
             catch (InvalidOperationException) { }
-            if (unreachable) return $"Could not connect to the VM {vmName} with the configured cluster SSH identity.";
+            if (unreachable) return GuestSshUnreachable(vmName);
             string tail = string.Join(" | ", errorTail);
             return $"The VM {vmName} {what}." + (tail.Length > 0 ? $" ssh: {tail}" : "");
         }
@@ -261,6 +263,7 @@ internal static class VmDiskIo
                 if (e.Data == null) return;
                 lock (sync)
                 {
+                    if (!ReferenceEquals(process, started)) return; // a stale process's late line is not this session's
                     errorTail.Enqueue(e.Data);
                     while (errorTail.Count > ErrorTailLines) errorTail.Dequeue();
                 }
@@ -284,13 +287,24 @@ internal static class VmDiskIo
                     string reply = text.ToString();
                     text.Clear();
                     TaskCompletionSource<string> pending;
-                    string cause;
-                    lock (sync) { pending = waiter; waiter = null; cause = Cause(started, "could not run the guest CPU sampler"); }
+                    string cause = null;
+                    lock (sync)
+                    {
+                        pending = waiter; waiter = null;
+                        if (line != "__END__ 0" && pending != null) cause = Cause(started, "could not run the guest CPU sampler");
+                    }
                     if (line == "__END__ 0") pending?.TrySetResult(reply);
                     else pending?.TrySetException(new InvalidOperationException(cause));
                 }
             }
             catch (Exception e) when (e is IOException or ObjectDisposedException or InvalidOperationException) { }
+            // Let ssh exit and its stderr drain before the cause is read, so the exit code and last lines are ssh's final ones.
+            try
+            {
+                using var settle = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+                await started.WaitForExitAsync(settle.Token).ConfigureAwait(false);
+            }
+            catch (Exception e) when (e is OperationCanceledException or InvalidOperationException or ObjectDisposedException) { }
             Close(expected: started);
         }
     }
@@ -346,6 +360,10 @@ internal static class VmDiskIo
         };
     }
 
+    /// <summary>What ssh's exit 255 means for every guest sampler: the VM is not reachable with the cluster identity.</summary>
+    private static string GuestSshUnreachable(string vmName) =>
+        $"Could not connect to the VM {vmName} with the configured cluster SSH identity.";
+
     private static async Task<T> ReadGuest<T>(string vmName, string script, string label, int seconds,
         string[] command, CancellationToken cancellation, Func<string, T> parse = null) where T : class
     {
@@ -367,7 +385,7 @@ internal static class VmDiskIo
         {
             string guestError = result.Error.Split('\n').FirstOrDefault(line => line.StartsWith("Guest disk I/O: ", StringComparison.Ordinal));
             throw new InvalidOperationException(guestError?.TrimEnd() ??
-                (result.ExitCode == 255 ? "Could not connect to the VM with the configured cluster SSH identity."
+                (result.ExitCode == 255 ? GuestSshUnreachable(vmName)
                     : $"The VM could not run the guest {label} sampler."));
         }
         return (parse == null ? JsonSerializer.Deserialize<T>(result.Output) : parse(result.Output))
