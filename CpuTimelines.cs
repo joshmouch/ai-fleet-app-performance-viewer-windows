@@ -446,12 +446,7 @@ internal sealed class Timeline : Form
         {
             if (e.ListItem is not DiskScope scope)
                 return;
-            switch (scope)
-            {
-                case DiskScope.MountedAndSpaces: e.Value = "Mounts + Spaces"; break;
-                case DiskScope.MountedOnly: e.Value = "Mounted only"; break;
-                case DiskScope.All: e.Value = "All disks"; break;
-            }
+            e.Value = DiskScopeLabel(scope);
         };
         diskScope.Items.AddRange(new object[] { DiskScope.MountedAndSpaces, DiskScope.MountedOnly, DiskScope.All });
         diskScope.SelectedItem = DiskScope.MountedAndSpaces;
@@ -476,7 +471,7 @@ internal sealed class Timeline : Form
         AddSetting(settingsMenu, null, usageBands);
         AddSetting(settingsMenu, null, groupByMachine);
         AddSetting(diskSettingsMenu, "Rank cards by", diskRank);
-        AddSetting(diskSettingsMenu, "Card scope", diskScope);
+        AddSetting(diskSettingsMenu, "Disk scope", diskScope);
         AddSetting(diskSettingsMenu, DiskCutoffLabel, diskCutoff);
         AddSetting(diskSettingsMenu, TransferCutoffLabel, transferCutoff);
         AddSetting(diskSettingsMenu, null, showVirtualDisks);
@@ -1065,6 +1060,15 @@ internal sealed class Timeline : Form
         _ => disk.Rate()
     };
 
+    private static string DiskScopeLabel(DiskScope scope) => scope switch
+    {
+        DiskScope.MountedAndSpaces => "Mounts + Spaces",
+        DiskScope.MountedOnly => "Mounted only",
+        _ => "All disks"
+    };
+
+    private DiskScope ActiveDiskScope => diskIdentities.Count == 0 ? DiskScope.All : SelectedDiskScope;
+
     private bool IncludesDisk(DiskScope scope, int diskNumber)
     {
         if (scope == DiskScope.All)
@@ -1078,6 +1082,9 @@ internal sealed class Timeline : Form
 
     private void RefreshDiskCards(double now, Sample sample = null)
     {
+        var scope = ActiveDiskScope;
+        diskIoDetails.SetDiskScope(scope == DiskScope.All ? null :
+            diskIdentities.Keys.Where(number => IncludesDisk(scope, number)).ToHashSet(), DiskScopeLabel(scope));
         var summaries = ReadDiskSummaries(now);
         var physical = summaries.Where(MeetsDiskFilters).ToArray();
         var active = physical.Concat(FindVirtualDisks(summaries, sample))
@@ -1342,7 +1349,7 @@ internal sealed class Timeline : Form
             string name = selectedVirtualDisk != null ? System.IO.Path.GetFileName(selectedVirtualDisk.VirtualDisk.Path) :
                 selected is { } disk && diskIdentities.TryGetValue(disk.Number, out var identity)
                     ? identity.AccessPaths?.FirstOrDefault() ?? DiskLabel(selectedDisk)
-                    : selectedDisk == null ? "All disks" : DiskLabel(selectedDisk);
+                    : selectedDisk == null ? DiskScopeLabel(ActiveDiskScope) : DiskLabel(selectedDisk);
             var diskCards = diskGrid.Controls.OfType<Button>().Select(button => (DiskSummary)button.Tag).ToArray();
             int virtualCount = diskCards.Count(disk => disk.VirtualDisk != null);
             string detail = showingDisks
@@ -1606,11 +1613,15 @@ internal sealed class Timeline : Form
             return sample.GetDisk(selectedDisk);
         if (sample.Disks is not { Count: > 0 } disks)
             return null;
+        var scope = ActiveDiskScope;
+        var included = disks.Values.Where(disk => IncludesDisk(scope, disk.Number)).ToArray();
+        if (included.Length == 0)
+            return null;
         return new DiskReading
         {
-            Active = disks.Values.Max(disk => disk.Active),
-            ReadMiB = disks.Values.Sum(disk => disk.ReadMiB),
-            WriteMiB = disks.Values.Sum(disk => disk.WriteMiB)
+            Active = included.Max(disk => disk.Active),
+            ReadMiB = included.Sum(disk => disk.ReadMiB),
+            WriteMiB = included.Sum(disk => disk.WriteMiB)
         };
     }
 
