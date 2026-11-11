@@ -184,7 +184,7 @@ internal static class VmDiskIo
             start.ArgumentList.Add("/bin/sh -c 'eval \"$(printf %s " + encoded + " | base64 -d)\"' sh loop");
             var started = Process.Start(start);
             process = started;
-            started.ErrorDataReceived += (_, _) => { };
+            started.ErrorDataReceived += (_, e) => { if (e.Data != null) try { File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "pv-ssh.log"), e.Data + "\r\n"); } catch (IOException) { } };
             started.BeginErrorReadLine();
             _ = Task.Run(() => Stream(started));
         }

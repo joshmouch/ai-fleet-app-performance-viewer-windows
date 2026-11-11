@@ -25,7 +25,7 @@ internal static class DiskIoMerge
             var weights = Sum(expansion.GuestRows.Values);
             foreach (var entry in expansion.HostPaths)
             {
-                var key = byPath ? entry.Key : entry.Key with { Path = "" };
+                var key = byPath ? entry.Key : entry.Key.ProcessKey;
                 var remaining = host[key];
                 if (weights.ReadBytes > 0) remaining.ReadBytes -= entry.Value.ReadBytes;
                 if (weights.WriteBytes > 0) remaining.WriteBytes -= entry.Value.WriteBytes;
