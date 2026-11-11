@@ -9,6 +9,11 @@ internal sealed class RankedTable<TRow> : ListView
     private sealed record Column(string Title, Func<TRow, IComparable> Value, bool Numeric);
     private readonly List<Column> columns = new();
     private sealed record BandDivider(int Band);
+    private readonly record struct BandRow(TRow Row, int Divider = -1);
+    private readonly bool virtualizeBands;
+    private BandRow[] virtualRows = Array.Empty<BandRow>();
+    private Func<TRow, ListViewGroup, ListViewItem> createVirtualItem;
+    private string virtualUnit;
     private Font dividerFont;
     private bool usageBands;
     private bool rendering;
@@ -18,8 +23,12 @@ internal sealed class RankedTable<TRow> : ListView
     public event EventHandler RankingChanged;
     public event EventHandler ViewportChanged;
 
-    public RankedTable()
+    public RankedTable(bool virtualizeBands = false)
     {
+        this.virtualizeBands = virtualizeBands;
+        if (virtualizeBands)
+            RetrieveVirtualItem += (_, e) => e.Item = e.ItemIndex < virtualRows.Length
+                ? CreateBandItem(virtualRows[e.ItemIndex], virtualUnit, createVirtualItem) : new ListViewItem();
         View = View.Details;
         Dock = DockStyle.Fill;
         FullRowSelect = true;
@@ -58,7 +67,8 @@ internal sealed class RankedTable<TRow> : ListView
 
     public void Render(IEnumerable<TRow> rows, Func<TRow, string> machine, bool group, int limit,
         Func<TRow, ListViewGroup, ListViewItem> createItem,
-        (Func<TRow, double?> Weight, double Total, string Unit)? bands = null)
+        (Func<TRow, double?> Weight, double Total, string Unit)? bands = null,
+        Func<TRow, object> rowKey = null)
     {
         if (usageBands != bands.HasValue)
         {
@@ -71,7 +81,7 @@ internal sealed class RankedTable<TRow> : ListView
         var ordered = (usageBands || descending ? known.ThenByDescending(entry => entry.Value) : known.ThenBy(entry => entry.Value))
             .Select(entry => entry.Row).ToArray();
         var groups = group && !usageBands ? ordered.GroupBy(machine, StringComparer.OrdinalIgnoreCase).ToArray() : null;
-        var selected = SelectedItems.Count > 0 ? SelectedItems[0].Tag : null;
+        var selected = SelectedIndices.Count > 0 ? Items[SelectedIndices[0]].Tag : null;
         var focused = FocusedItem?.Tag;
         var topItem = ShowGroups ? null : TopItem;
         var top = topItem?.Tag;
@@ -80,6 +90,18 @@ internal sealed class RankedTable<TRow> : ListView
         BeginUpdate();
         try
         {
+            if (virtualizeBands && bands is { } virtualBands)
+            {
+                RenderVirtualBands(CreateBands(ordered, virtualBands.Weight, virtualBands.Total).ToArray(),
+                    virtualBands.Unit, createItem, rowKey, selected, focused, top, topIndex);
+                return;
+            }
+
+            if (VirtualMode)
+            {
+                ClearRows();
+                VirtualMode = false;
+            }
             Items.Clear();
             Groups.Clear();
             ShowGroups = groups is { Length: > 1 };
@@ -93,7 +115,8 @@ internal sealed class RankedTable<TRow> : ListView
                 }
             }
             else if (bands is { } usage)
-                Items.AddRange(CreateBands(ordered, usage.Weight, usage.Total, usage.Unit, createItem).ToArray());
+                Items.AddRange(CreateBands(ordered, usage.Weight, usage.Total)
+                    .Select(row => CreateBandItem(row, usage.Unit, createItem)).ToArray());
             else
                 Items.AddRange(ordered.Take(limit).Select(row => createItem(row, null)).ToArray());
 
@@ -114,13 +137,57 @@ internal sealed class RankedTable<TRow> : ListView
             rendering = false;
         }
     }
-    private IEnumerable<ListViewItem> CreateBands(TRow[] rows, Func<TRow, double?> weight, double total, string unit,
-        Func<TRow, ListViewGroup, ListViewItem> createItem)
+    public void ClearRows()
     {
-        if (rows.Length == 0)
-            yield break;
+        if (!VirtualMode)
+        {
+            Items.Clear();
+            return;
+        }
+        virtualRows = Array.Empty<BandRow>();
+        VirtualListSize = 0;
+        createVirtualItem = null;
+    }
 
-        dividerFont ??= new Font(Font, FontStyle.Bold);
+    private void RenderVirtualBands(BandRow[] rows, string unit, Func<TRow, ListViewGroup, ListViewItem> createItem,
+        Func<TRow, object> rowKey, object selected, object focused, object top, int topIndex)
+    {
+        if (!VirtualMode)
+        {
+            Items.Clear();
+            Groups.Clear();
+            ShowGroups = false;
+            VirtualMode = true;
+        }
+        SelectedIndices.Clear();
+        virtualRows = rows;
+        createVirtualItem = createItem;
+        virtualUnit = unit;
+        VirtualListSize = rows.Length;
+        int selectedIndex = Find(selected), focusedIndex = Find(focused);
+        if (selectedIndex >= 0)
+            SelectedIndices.Add(selectedIndex);
+        if (focusedIndex >= 0)
+            FocusedItem = Items[focusedIndex];
+        if (rows.Length > 0 && topIndex > 0)
+        {
+            int index = Find(top);
+            TopItem = Items[index >= 0 ? index : Math.Min(topIndex, rows.Length - 1)];
+        }
+        Invalidate();
+
+        int Find(object key)
+        {
+            if (key == null)
+                return -1;
+            if (key is BandDivider divider)
+                return Array.FindIndex(rows, row => row.Divider == divider.Band);
+            return rowKey == null ? -1 : Array.FindIndex(rows, row => row.Divider < 0 && Equals(rowKey(row.Row), key));
+        }
+    }
+
+    private static IEnumerable<BandRow> CreateBands(TRow[] rows, Func<TRow, double?> weight, double total)
+    {
         double used = 0;
         int previous = -1;
         foreach (var row in rows)
@@ -129,22 +196,31 @@ internal sealed class RankedTable<TRow> : ListView
             int band = value > 0 && total > 0 ? Math.Clamp((int)(10 * used / total + 1e-9), 0, 9) : 10;
             if (band != previous)
             {
-                string caption = band == 10 ? "No measured impact" : $"{band * 10}–{(band + 1) * 10}% of {unit}";
-                yield return new ListViewItem(caption)
-                {
-                    Font = dividerFont,
-                    BackColor = Color.FromArgb((7 * BackColor.R + ForeColor.R) / 8,
-                        (7 * BackColor.G + ForeColor.G) / 8, (7 * BackColor.B + ForeColor.B) / 8),
-                    Tag = new BandDivider(band),
-                    ToolTipText = band == 10 ? "These rows have zero or unavailable measured impact." :
-                        "Each row belongs to the band where its cumulative usage starts. Large rows can span bands."
-                };
+                yield return new BandRow(default, band);
                 previous = band;
             }
             if (value > 0)
                 used += value;
-            yield return createItem(row, null);
+            yield return new BandRow(row);
         }
+    }
+
+    private ListViewItem CreateBandItem(BandRow row, string unit, Func<TRow, ListViewGroup, ListViewItem> createItem)
+    {
+        if (row.Divider < 0)
+            return createItem(row.Row, null);
+        dividerFont ??= new Font(Font, FontStyle.Bold);
+        int band = row.Divider;
+        string caption = band == 10 ? "No measured impact" : $"{band * 10}–{(band + 1) * 10}% of {unit}";
+        return new ListViewItem(caption)
+        {
+            Font = dividerFont,
+            BackColor = Color.FromArgb((7 * BackColor.R + ForeColor.R) / 8,
+                (7 * BackColor.G + ForeColor.G) / 8, (7 * BackColor.B + ForeColor.B) / 8),
+            Tag = new BandDivider(band),
+            ToolTipText = band == 10 ? "These rows have zero or unavailable measured impact." :
+                "Each row belongs to the band where its cumulative usage starts. Large rows can span bands."
+        };
     }
 
     protected override void WndProc(ref Message message)

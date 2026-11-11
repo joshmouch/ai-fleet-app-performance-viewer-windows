@@ -789,17 +789,17 @@ internal sealed class DiskIoDetails : Panel
         };
         paths.KeyDown += (_, e) =>
         {
-            if (e.KeyCode == Keys.Enter && paths.SelectedItems.Count > 0)
+            if (e.KeyCode == Keys.Enter && paths.SelectedIndices.Count > 0)
             {
                 e.Handled = true;
-                OpenGuest(paths.SelectedItems[0]);
+                OpenGuest(paths.Items[paths.SelectedIndices[0]]);
             }
         };
         foreach (var table in new[] { paths, guestPaths })
             table.KeyDown += (_, e) =>
             {
-                if (e.Control && e.KeyCode == Keys.C && table.SelectedItems.Count > 0 &&
-                    table.SelectedItems[0].Tag is RowSelection { Key.Path.Length: > 0 } row)
+                if (e.Control && e.KeyCode == Keys.C && table.SelectedIndices.Count > 0 &&
+                    table.Items[table.SelectedIndices[0]].Tag is RowSelection { Key.Path.Length: > 0 } row)
                 {
                     try { Clipboard.SetText(row.Key.Path); }
                     catch (ExternalException) { }
@@ -813,7 +813,7 @@ internal sealed class DiskIoDetails : Panel
 
     private static RankedTable<DiskIoRow> NewTable(bool includePath, bool guestOnly = false)
     {
-        var table = new RankedTable<DiskIoRow>();
+        var table = new RankedTable<DiskIoRow>(virtualizeBands: includePath);
         ColumnHeader path = includePath ? table.AddColumn("Path", 275, row => row.Key.Path) : null;
         var process = table.AddColumn("Process", 120, row => row.Key.Process);
         table.AddColumn("Machine", 110, row => row.Machine);
@@ -1096,8 +1096,8 @@ internal sealed class DiskIoDetails : Panel
         guestDisk = null;
         tabs.TabPages.Remove(guestPathTab);
         tabs.TabPages.Remove(guestProcessTab);
-        guestPaths.Items.Clear();
-        guestProcesses.Items.Clear();
+        guestPaths.ClearRows();
+        guestProcesses.ClearRows();
     }
 
     private static VmDisk WatchKey(VmDisk disk) => disk with { Path = "" };
@@ -1196,7 +1196,7 @@ internal sealed class DiskIoDetails : Panel
 
         var ranked = showAttributionGaps ? matched : matched.Where(row => !IsGap(row));
         table.Render(ranked, row => row.Machine, groupByMachine, topRows, Item, usageBands
-            ? (row => row.Totals.TotalBytes, (double)entries.Sum(row => row.Totals.TotalBytes), "I/O") : null);
+            ? (row => row.Totals.TotalBytes, (double)entries.Sum(row => row.Totals.TotalBytes), "I/O") : null, Identity);
         if (byPath)
             commands.Suspend();
         else
@@ -1215,6 +1215,8 @@ internal sealed class DiskIoDetails : Panel
             IsWindowsKernel(row) || row.Key.Pid <= 0 || row.Key.Process.Equals("Unknown", StringComparison.OrdinalIgnoreCase);
 
         string Rate(long amount, double scale = 1) => seconds > 0 ? (amount / scale / seconds).ToString("N2") : "—";
+
+        static RowSelection Identity(DiskIoRow row) => new(row.Key, row.Machine);
 
         ListViewItem Item(DiskIoRow row, ListViewGroup group)
         {
@@ -1248,7 +1250,7 @@ internal sealed class DiskIoDetails : Panel
                 cells.Add("");
             return new ListViewItem(cells.ToArray(), group)
             {
-                Tag = new RowSelection(row.Key, row.Machine),
+                Tag = Identity(row),
                 ToolTipText = byPath ? path + (vm?.Label != null ? "\nVM: " + vm.Label : "") : ""
             };
         }
