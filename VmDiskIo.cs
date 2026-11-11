@@ -24,13 +24,9 @@ internal sealed record GuestIoSample(string Device, int Seconds, GuestIoRow[] Ro
 
 internal static class VmDiskIo
 {
-    /// <summary>The VM disk inventory. Runs on the thread pool, so its synchronous process start and WMI reads never run on
-    /// the caller's UI thread.</summary>
-    public static Task<Dictionary<string, VmDiskOwners>> ReadInventory(CancellationToken cancellation, VolumePathIndex paths) =>
-        Task.Run(() => ReadInventoryOnPool(cancellation, paths), cancellation);
-
-    private static async Task<Dictionary<string, VmDiskOwners>> ReadInventoryOnPool(CancellationToken cancellation,
-        VolumePathIndex paths)
+    /// <summary>The VM disk inventory. Its WSL registry and process reads are synchronous, so the caller runs it on the
+    /// thread pool.</summary>
+    public static async Task<Dictionary<string, VmDiskOwners>> ReadInventory(CancellationToken cancellation, VolumePathIndex paths)
     {
         const string script = """
             $ErrorActionPreference = 'Stop'
@@ -71,7 +67,7 @@ internal static class VmDiskIo
             }, StringComparer.OrdinalIgnoreCase);
     }
 
-    private static async Task<T> ReadHyperV<T>(string script, CancellationToken cancellation)
+    private static async Task<T> ReadHyperV<T>(string script, CancellationToken cancellation) where T : class
     {
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
         deadline.CancelAfter(TimeSpan.FromSeconds(15));
@@ -80,7 +76,23 @@ internal static class VmDiskIo
             Convert.ToBase64String(Encoding.Unicode.GetBytes(script)) }, null, deadline.Token).ConfigureAwait(false);
         if (result.ExitCode != 0)
             throw new InvalidOperationException("Hyper-V inventory unavailable.");
-        return JsonSerializer.Deserialize<T>(result.Output);
+        return Deserialize<T>(result.Output, "Hyper-V inventory unavailable.");
+    }
+
+    /// <summary>The one reader of the JSON the guest and Hyper-V scripts print: text that is not the promised JSON, or is
+    /// JSON null, fails with <paramref name="failure"/> instead of a parser or null-reference exception.</summary>
+    private static T Deserialize<T>(string json, string failure) where T : class
+    {
+        try { return JsonSerializer.Deserialize<T>(json) ?? throw new InvalidOperationException(failure); }
+        catch (JsonException) { throw new InvalidOperationException(failure); }
+    }
+
+    private static GuestIoSample ParseGuestIo(string json, string failure)
+    {
+        var sample = Deserialize<GuestIoSample>(json, failure);
+        if (sample.Rows == null || Array.IndexOf(sample.Rows, null) >= 0)
+            throw new InvalidOperationException(failure);
+        return sample;
     }
 
     public static string Normalize(string path)
@@ -98,8 +110,9 @@ internal static class VmDiskIo
             throw new InvalidOperationException("Guest disk matching requires a VM with one Hyper-V SCSI controller.");
         if (!IsGuestAddress(disk.VMName) || disk.Location < 0 || disk.Location > 63)
             throw new InvalidOperationException("This VM does not have a supported guest address.");
-        return ReadGuest<GuestIoSample>(disk.VMName, "GuestDiskIo.py", "I/O", 28,
-            new[] { "sudo", "-n", "/usr/bin/python3", "-I", "-", disk.Location.ToString(System.Globalization.CultureInfo.InvariantCulture) }, cancellation);
+        return ReadGuest(disk.VMName, "GuestDiskIo.py", "I/O", 28,
+            new[] { "sudo", "-n", "/usr/bin/python3", "-I", "-", disk.Location.ToString(System.Globalization.CultureInfo.InvariantCulture) }, cancellation,
+            output => ParseGuestIo(output, "The VM returned no guest I/O sample."));
     }
 
     private static async Task<GuestIoSample> ReadWslDisk(string distro, CancellationToken cancellation)
@@ -121,7 +134,7 @@ internal static class VmDiskIo
         var running = await CpuProcessSampler.ReadRunningWslNames(cancellation).ConfigureAwait(false);
         if (!running.Contains(distro))
             throw new InvalidOperationException($"WSL distribution {distro} is stopped.");
-        string code = await ReadScript("GuestDiskIo.py", cancellation).ConfigureAwait(false);
+        string code = ReadScript("GuestDiskIo.py");
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
         deadline.CancelAfter(TimeSpan.FromSeconds(120));
         var result = await Run(CpuProcessSampler.Wsl,
@@ -133,8 +146,7 @@ internal static class VmDiskIo
             throw new InvalidOperationException(error?.TrimEnd() ??
                 $"Could not run the WSL disk sampler in {distro}. It requires Python 3 and bpftrace.");
         }
-        return JsonSerializer.Deserialize<GuestIoSample>(result.Output)
-            ?? throw new InvalidOperationException("WSL returned no guest disk sample.");
+        return ParseGuestIo(result.Output, "WSL returned no guest disk sample.");
     }
 
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, GuestCpuSession> CpuSessions =
@@ -147,8 +159,7 @@ internal static class VmDiskIo
         var session = CpuSessions.GetOrAdd(vmName, name => new GuestCpuSession(name));
         try
         {
-            string output = await session.Sample(target, await ReadScript("GuestCpu.sh", cancellation).ConfigureAwait(false),
-                TimeSpan.FromSeconds(12), cancellation).ConfigureAwait(false);
+            string output = await session.Sample(target, TimeSpan.FromSeconds(12), cancellation).ConfigureAwait(false);
             return CpuProcessSampler.ParseGuest(output)
                 ?? throw new InvalidOperationException("The VM returned no guest CPU sample.");
         }
@@ -231,7 +242,7 @@ internal static class VmDiskIo
         }
 
         /// <summary>The next complete sample the VM streams after this call.</summary>
-        public async Task<string> Sample(string[] target, string code, TimeSpan limit, CancellationToken cancellation)
+        public async Task<string> Sample(string[] target, TimeSpan limit, CancellationToken cancellation)
         {
             TaskCompletionSource<string> mine = new(TaskCreationOptions.RunContinuationsAsynchronously);
             lock (sync)
@@ -239,7 +250,7 @@ internal static class VmDiskIo
                 if (ended) throw new OperationCanceledException($"The guest CPU session for {vmName} has ended.");
                 cancellation.ThrowIfCancellationRequested(); // a cancelled sampler never opens ssh its owner already closed
                 if (process == null || process.HasExited)
-                    Open(target, code);
+                    Open(target);
                 waiter ??= mine;
                 mine = waiter;
             }
@@ -247,9 +258,9 @@ internal static class VmDiskIo
             catch (TimeoutException) { throw new InvalidOperationException("Guest CPU sampling did not finish."); }
         }
 
-        private void Open(string[] target, string code)
+        private void Open(string[] target)
         {
-            string encoded = Convert.ToBase64String(new UTF8Encoding(false).GetBytes(code));
+            string encoded = Convert.ToBase64String(new UTF8Encoding(false).GetBytes(ReadScript("GuestCpu.sh")));
             var start = new ProcessStartInfo(SshExecutable)
             {
                 CreateNoWindow = true, UseShellExecute = false, RedirectStandardInput = true, RedirectStandardOutput = true,
@@ -321,21 +332,65 @@ internal static class VmDiskIo
     private static string SettingsPath() => System.IO.Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "AIFleetPerformanceViewer", "settings.json");
 
-    /// <summary>DNS domain appended to a VM name to reach it over SSH; null when not configured.</summary>
-    internal static string GuestDomain()
+    private static readonly object SettingsSync = new();
+    private static (DateTime Written, string Domain, string Problem)? settingsRead;
+
+    /// <summary>The DNS domain appended to a VM name to reach it over SSH, or why it cannot be used; both null means not
+    /// configured. The environment variable is read on every call; settings.json is parsed again only when its presence or
+    /// last-write time changes, so every sample and render calls this without parsing or exceptions.</summary>
+    internal static (string Domain, string Problem) ResolveGuestDomain()
     {
-        string domain = Environment.GetEnvironmentVariable("PERFORMANCE_VIEWER_GUEST_DOMAIN");
+        const string variable = "PERFORMANCE_VIEWER_GUEST_DOMAIN";
+        string source = variable;
+        string domain = Environment.GetEnvironmentVariable(variable);
         if (string.IsNullOrWhiteSpace(domain))
         {
-            try
-            {
-                using var settings = JsonDocument.Parse(File.ReadAllText(SettingsPath()));
-                if (settings.RootElement.TryGetProperty("guestDomain", out var value)) domain = value.GetString();
-            }
-            catch (Exception) { }
+            string problem;
+            (domain, problem) = ReadSettingsDomain();
+            if (problem != null)
+                return (null, problem);
+            source = "guestDomain in " + SettingsPath();
         }
         domain = domain?.Trim().Trim('.');
-        return !string.IsNullOrEmpty(domain) && Regex.IsMatch(domain, @"\A[a-zA-Z0-9.-]+\z") ? domain : null;
+        if (string.IsNullOrEmpty(domain))
+            return (null, null);
+        return Regex.IsMatch(domain, @"\A[a-zA-Z0-9.-]+\z") ? (domain, null) : (null, source + " is not a valid DNS domain.");
+    }
+
+    private static (string Domain, string Problem) ReadSettingsDomain()
+    {
+        string path = SettingsPath();
+        DateTime written = File.Exists(path) ? File.GetLastWriteTimeUtc(path) : DateTime.MinValue;
+        lock (SettingsSync)
+        {
+            if (settingsRead is { } cached && cached.Written == written)
+                return (cached.Domain, cached.Problem);
+            var result = written == DateTime.MinValue ? (Domain: (string)null, Problem: (string)null) : ParseSettings(path);
+            settingsRead = (written, result.Domain, result.Problem);
+            return result;
+        }
+    }
+
+    private static (string Domain, string Problem) ParseSettings(string path)
+    {
+        try
+        {
+            // The README documents settings.json as hand-edited, so comments and trailing commas are accepted.
+            using var settings = JsonDocument.Parse(File.ReadAllText(path),
+                new JsonDocumentOptions { CommentHandling = JsonCommentHandling.Skip, AllowTrailingCommas = true });
+            if (settings.RootElement.ValueKind != JsonValueKind.Object)
+                return (null, path + " must contain a JSON object.");
+            if (!settings.RootElement.TryGetProperty("guestDomain", out var value) || value.ValueKind == JsonValueKind.Null)
+                return (null, null);
+            return value.ValueKind == JsonValueKind.String ? (value.GetString(), null)
+                : (null, "guestDomain in " + path + " must be a string.");
+        }
+        catch (JsonException) { return (null, path + " is not valid JSON."); }
+        catch (Exception e) when (e is FileNotFoundException or DirectoryNotFoundException) { return (null, null); }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+            return (null, path + " could not be read: " + e.Message);
+        }
     }
 
     internal static bool IsGuestAddress(string name) =>
@@ -347,7 +402,9 @@ internal static class VmDiskIo
     {
         if (!IsGuestAddress(vmName))
             throw new InvalidOperationException("This VM does not have a supported guest address.");
-        string domain = GuestDomain();
+        var (domain, problem) = ResolveGuestDomain();
+        if (problem != null)
+            throw new InvalidOperationException(problem);
         if (domain == null)
             throw new InvalidOperationException("Guest sampling needs the VMs' DNS domain. Set the PERFORMANCE_VIEWER_GUEST_DOMAIN environment variable, or guestDomain in " + SettingsPath() + ".");
         string key = Environment.GetEnvironmentVariable("NODES_SSH_KEY");
@@ -370,11 +427,11 @@ internal static class VmDiskIo
         $"Could not connect to the VM {vmName} with the configured cluster SSH identity.";
 
     private static async Task<T> ReadGuest<T>(string vmName, string script, string label, int seconds,
-        string[] command, CancellationToken cancellation, Func<string, T> parse = null) where T : class
+        string[] command, CancellationToken cancellation, Func<string, T> parse) where T : class
     {
         var target = GuestSshArguments(vmName);
 
-        string code = await ReadScript(script, cancellation).ConfigureAwait(false);
+        string code = ReadScript(script);
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
         deadline.CancelAfter(TimeSpan.FromSeconds(seconds));
         CommandResult result;
@@ -393,16 +450,19 @@ internal static class VmDiskIo
                 (result.ExitCode == 255 ? GuestSshUnreachable(vmName)
                     : $"The VM could not run the guest {label} sampler."));
         }
-        return (parse == null ? JsonSerializer.Deserialize<T>(result.Output) : parse(result.Output))
+        return parse(result.Output)
             ?? throw new InvalidOperationException($"The VM returned no guest {label} sample.");
     }
 
-    internal static async Task<string> ReadScript(string script, CancellationToken cancellation)
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, string> Scripts = new();
+
+    /// <summary>An embedded script's text, read from the assembly once per resource name.</summary>
+    internal static string ReadScript(string script) => Scripts.GetOrAdd(script, name =>
     {
-        using var resource = typeof(VmDiskIo).Assembly.GetManifestResourceStream(script);
+        using var resource = typeof(VmDiskIo).Assembly.GetManifestResourceStream(name);
         using var reader = new StreamReader(resource, Encoding.UTF8);
-        return (await reader.ReadToEndAsync(cancellation).ConfigureAwait(false)).Replace("\r\n", "\n");
-    }
+        return reader.ReadToEnd().Replace("\r\n", "\n");
+    });
 
     internal sealed record CommandResult(int ExitCode, string Output, string Error);
 

@@ -128,7 +128,7 @@ internal sealed class CpuProcessDetails : Panel
                 long start = Stopwatch.GetTimestamp();
                 try
                 {
-                    var reading = await CpuProcessSampler.ReadCluster(requested, cancellation);
+                    var reading = await Task.Run(() => CpuProcessSampler.ReadCluster(requested, cancellation), cancellation);
                     cancellation.ThrowIfCancellationRequested();
                     latest = reading;
                     Render();
@@ -169,12 +169,14 @@ internal sealed class CpuProcessDetails : Panel
             .Select(guest => guest.Machine).ToArray();
         if (unavailable.Length > 0)
             status.Text += "  |  Incomplete samples: " + string.Join(", ", unavailable);
-        string guestDomain = VmDiskIo.GuestDomain();
-        status.Text += guestDomain == null ? "  |  Guest domain: not set" : "  |  Guest domain: " + guestDomain;
+        var (guestDomain, domainProblem) = VmDiskIo.ResolveGuestDomain();
+        status.Text += domainProblem != null ? "  |  Guest domain: " + domainProblem
+            : guestDomain == null ? "  |  Guest domain: not set" : "  |  Guest domain: " + guestDomain;
         string help = string.Join("\n", latest.Coverage.Select(guest =>
             $"{guest.Machine}: " + (guest.HostCores is double cores
                 ? $"{100 * guest.AttributedCores / host.LogicalProcessors:0.##}% of host capacity attributed out of {100 * cores / host.LogicalProcessors:0.##}% measured"
-                : "Host CPU budget unavailable") + (guest.SampleAvailable ? "" : guest.Failure is { Length: > 0 } failure ? $" (guest sample unavailable: {failure})" : " (guest sample unavailable)"))
+                : "Host CPU budget unavailable") + (guest.Failure is { Length: > 0 } failure ? $" (guest sample {(guest.SampleAvailable ? "partly " : "")}unavailable: {failure})"
+                : guest.SampleAvailable ? "" : " (guest sample unavailable)"))
             .Prepend("CPU impact % is measured against host capacity. Guest busy % is each process's share of its guest's used CPU."));
         if (coverageHelp.GetToolTip(status) != help)
             coverageHelp.SetToolTip(status, help);
@@ -182,7 +184,7 @@ internal sealed class CpuProcessDetails : Panel
                 100 * row.Cores / host.LogicalProcessors, row.Cores))
             .Concat(latest.Guests.SelectMany(machine => machine.Rows.Select(row => new ProcessRow(machine.Name, row,
                 100 * row.AttributedCores / host.LogicalProcessors, row.AttributedCores)))).ToArray();
-        table.Render(filter.Length == 0 ? rows : rows.Where(row => RowFilter.Matches(filter, row.Process.Process, row.Machine, row.Process.Pid.ToString())),
+        table.Render(RowFilter.Apply(rows, filter, row => new[] { row.Process.Process, row.Machine, row.Process.Pid.ToString() }),
             row => row.Machine, groupByMachine, topRows, NewRow, bandWidth is int width
                 ? (width, row => row.Cores, rows.Sum(row => row.Cores ?? 0) + missing, "CPU") : null,
             (row, key) => key is ProcessIdentity process && process.Machine == row.Machine &&

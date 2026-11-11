@@ -492,6 +492,9 @@ internal sealed class RankedListAccessibility(ListView table) : Control.ControlA
 
 internal static class RowFilter
 {
-    public static bool Matches(string filter, params string[] fields) => filter.Length == 0 ||
-        fields.Any(field => field.Contains(filter, StringComparison.OrdinalIgnoreCase));
+    /// <summary>The rows whose fields contain <paramref name="filter"/>; with no filter, the rows themselves, so the field
+    /// arrays are never built.</summary>
+    public static IEnumerable<T> Apply<T>(IEnumerable<T> rows, string filter, Func<T, string[]> fields) =>
+        filter.Length == 0 ? rows
+            : rows.Where(row => fields(row).Any(field => field.Contains(filter, StringComparison.OrdinalIgnoreCase)));
 }
