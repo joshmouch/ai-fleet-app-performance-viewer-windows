@@ -84,6 +84,7 @@ internal sealed class VolumePathIndex
 
 internal readonly record struct FileIoKey(int Pid, string Process, string Path)
 {
+    public FileIoKey ProcessKey => this with { Path = "" };
     private int LastSeparator => Math.Max(Path.LastIndexOf('\\'), Path.LastIndexOf('/'));
     public string Filename => Path[(LastSeparator + 1)..];
     public string Filepath => Path[..(LastSeparator + 1)];
@@ -564,7 +565,7 @@ internal sealed class VolumeFileIo : IDisposable
                 if (string.IsNullOrEmpty(path) || ((!byPath || virtualDisk != null) && !IsVirtualDisk(path)))
                     continue;
                 path = pathIndex.Resolve(path, entry.Key.Disk) ?? pathIndex.Resolve(path, null) ?? path;
-                var process = entry.Key.File with { Path = "" };
+                var process = entry.Key.File.ProcessKey;
                 if (virtualDisk != null)
                 {
                     if (!string.Equals(virtualDisk, VmDiskIo.Normalize(path), StringComparison.OrdinalIgnoreCase))
@@ -726,7 +727,7 @@ internal sealed class GuestIoWatch : IDisposable
             }
         }
         foreach (var entry in paths)
-            FileIoTotals.AddTo(processes, entry.Key with { Path = "" }, entry.Value);
+            FileIoTotals.AddTo(processes, entry.Key.ProcessKey, entry.Value);
         current = new Snapshot(paths, processes, device, seconds, diskSeconds, diskRead, diskWrite, limited, latest, error);
     }
 
@@ -764,7 +765,7 @@ internal sealed class DiskIoDetails : Panel
     private VolumeFileIo capture;
     private System.Threading.CancellationTokenSource inventoryCancellation;
     private Task<Dictionary<string, VmDiskOwners>> inventory;
-    private readonly Dictionary<VmDisk, GuestIoWatch> guestWatches = new();
+    private readonly Dictionary<VmDisk, (GuestIoWatch Watch, long LastNeeded)> guestWatches = new();
     private HashSet<string> expandedGuests = new(StringComparer.OrdinalIgnoreCase);
     private bool groupByMachine;
     private bool usageBands;
@@ -931,11 +932,7 @@ internal sealed class DiskIoDetails : Panel
     {
         bool newSelection = selectedDisk != diskNumber || !string.Equals(selectedPath, path, StringComparison.OrdinalIgnoreCase);
         if (newSelection)
-        {
             openVirtualGuest = false;
-            SyncGuestWatches(Array.Empty<VmDisk>());
-            ClearGuest();
-        }
         selectedDisk = diskNumber;
         selectedPath = path == null ? null : VmDiskIo.Normalize(path);
         diskName = name;
@@ -943,6 +940,7 @@ internal sealed class DiskIoDetails : Panel
         UpdateCapture();
         if (newSelection)
         {
+            ClearGuest();
             openVirtualGuest = path != null;
             tabs.SelectedTab = processTab;
         }
@@ -990,7 +988,7 @@ internal sealed class DiskIoDetails : Panel
         {
             totals.Visible = false;
             commands.Suspend();
-            SyncGuestWatches(Array.Empty<VmDisk>());
+            StopGuestWatches();
         }
         refreshTimer.Enabled = expanded && detailsOpen;
         LayoutChanged?.Invoke(this, EventArgs.Empty);
@@ -1013,7 +1011,7 @@ internal sealed class DiskIoDetails : Panel
         {
             refreshTimer.Stop();
             commands.Suspend();
-            SyncGuestWatches(Array.Empty<VmDisk>());
+            StopGuestWatches();
             totals.Visible = false;
         }
     }
@@ -1023,7 +1021,6 @@ internal sealed class DiskIoDetails : Panel
         selectedDisk = null;
         selectedPath = null;
         openVirtualGuest = false;
-        SyncGuestWatches(Array.Empty<VmDisk>());
         ClearGuest();
         RefreshRows();
         LayoutChanged?.Invoke(this, EventArgs.Empty);
@@ -1033,7 +1030,7 @@ internal sealed class DiskIoDetails : Panel
     {
         if (disposing)
         {
-            SyncGuestWatches(Array.Empty<VmDisk>());
+            StopGuestWatches();
             inventoryCancellation?.Cancel();
             inventoryCancellation?.Dispose();
             refreshTimer.Dispose();
@@ -1080,7 +1077,7 @@ internal sealed class DiskIoDetails : Panel
             RefreshGuest(guestByPath);
             return;
         }
-        var guestSamples = candidates.Select(group => (Group: group, Sample: guestWatches[group.Key].Read())).ToArray();
+        var guestSamples = candidates.Select(group => (Group: group, Sample: guestWatches[group.Key].Watch.Read())).ToArray();
         var expansions = guestSamples.Where(pair => pair.Sample.Seconds > 0 && pair.Sample.Paths.Count > 0)
             .Select(pair => new DiskIoExpansion(pair.Group.Key.VMName, pair.Group.ToArray(),
                 byPath ? pair.Sample.Paths : pair.Sample.Processes, pair.Sample.Seconds)).ToArray();
@@ -1112,13 +1109,15 @@ internal sealed class DiskIoDetails : Panel
         bool hasGuestRows = rows.Any(row => row.Guest != null);
         if (hasGuestRows)
             notes.Add("Guest I/O impact is estimated from the guest's share of the VHDX traffic.");
-        var missing = guestSamples.Where(candidate => candidate.Sample.Seconds <= 0 || candidate.Sample.Paths.Count == 0).ToArray();
-        int waiting = missing.Count(candidate => candidate.Sample.Error == null);
-        if (waiting > 0)
-            notes.Add($"Waiting for I/O from {waiting} guest {(waiting == 1 ? "disk" : "disks")}.");
-        notes.AddRange(missing.Where(candidate => candidate.Sample.Error != null).Select(candidate =>
-            $"{candidate.Group.Key.VMName} / {System.IO.Path.GetFileName(candidate.Group.First().Key.Path)} — {candidate.Sample.Error}"));
-        var totals = FillTable(byPath ? paths : processes, rows, byPath, guestOnly: false, snapshot.Seconds, owners);
+        var pendingRows = guestSamples.Where(candidate => candidate.Sample.Seconds <= 0 || candidate.Sample.Paths.Count == 0)
+            .SelectMany(candidate => candidate.Group.Select(entry => (Key: byPath ? entry.Key : entry.Key.ProcessKey,
+                Disk: $"{candidate.Group.Key.VMName} / {entry.Key.Filename}", candidate.Sample.Error)))
+            .GroupBy(entry => entry.Key)
+            .ToDictionary(group => group.Key, group => (
+                Label: group.All(entry => entry.Error != null) ? "Retrying…" : "Sampling…",
+                Help: string.Join("\n", group.Select(entry => entry.Error == null
+                    ? $"Collecting guest I/O for {entry.Disk}." : $"{entry.Disk} — {entry.Error}").Distinct())));
+        var totals = FillTable(byPath ? paths : processes, rows, byPath, guestOnly: false, snapshot.Seconds, owners, pendingRows);
         SetStatusHelp(string.Join("\n", notes.Prepend(status.Text)));
         string description = hasGuestRows
             ? "Guest rows divide their VHDX's measured Windows I/O using the guest's file I/O proportions."
@@ -1157,21 +1156,35 @@ internal sealed class DiskIoDetails : Panel
 
     private void SyncGuestWatches(IEnumerable<VmDisk> disks)
     {
+        long now = Stopwatch.GetTimestamp();
         var wanted = disks.Select(WatchKey).ToHashSet();
-        foreach (var disk in guestWatches.Keys.Where(disk => !wanted.Contains(disk)).ToArray())
+        // A disk filter changes which rows are shown. Keep recent samples across
+        // navigation for as long as the host I/O that can use them stays relevant.
+        foreach (var entry in guestWatches.Where(entry => !wanted.Contains(entry.Key) &&
+            (!expandedGuests.Contains(entry.Key.ExpansionTarget) ||
+             Stopwatch.GetElapsedTime(entry.Value.LastNeeded, now).TotalSeconds >= VolumeFileIo.WindowSeconds)).ToArray())
         {
-            guestWatches[disk].Dispose();
-            guestWatches.Remove(disk);
+            entry.Value.Watch.Dispose();
+            guestWatches.Remove(entry.Key);
         }
         foreach (var disk in wanted)
-            if (!guestWatches.ContainsKey(disk))
-                guestWatches.Add(disk, new GuestIoWatch(disk));
+        {
+            var watch = guestWatches.TryGetValue(disk, out var existing) ? existing.Watch : new GuestIoWatch(disk);
+            guestWatches[disk] = (watch, now);
+        }
+    }
+
+    private void StopGuestWatches()
+    {
+        foreach (var entry in guestWatches.Values)
+            entry.Watch.Dispose();
+        guestWatches.Clear();
     }
 
     private void RefreshGuest(bool byPath)
     {
         var table = byPath ? guestPaths : guestProcesses;
-        var sample = guestWatches.GetValueOrDefault(WatchKey(guestDisk))?.Read();
+        var sample = guestWatches.GetValueOrDefault(WatchKey(guestDisk)).Watch?.Read();
         var entries = (byPath ? sample?.Paths : sample?.Processes) ?? EmptyRows;
         string diskRate = sample is { DiskSeconds: > 0 }
             ? $"Disk {(sample.DiskReadBytes + sample.DiskWriteBytes) / BytesPerMiB / sample.DiskSeconds:0.##} MiB/s"
@@ -1227,7 +1240,8 @@ internal sealed class DiskIoDetails : Panel
     }
 
     private FileIoTotals FillTable(RankedTable<DiskIoRow> table, DiskIoRow[] entries, bool byPath, bool guestOnly,
-        double seconds, Dictionary<string, VmDiskOwners> owners)
+        double seconds, Dictionary<string, VmDiskOwners> owners,
+        Dictionary<FileIoKey, (string Label, string Help)> pendingRows = null)
     {
         var matched = entries.Where(row => RowFilter.Matches(filter, row.Key.Process, row.Machine,
             row.Key.Pid.ToString(), row.Key.Path)).ToArray();
@@ -1247,7 +1261,7 @@ internal sealed class DiskIoDetails : Panel
             }
         }
 
-        var ranked = showAttributionGaps ? matched : matched.Where(row => !IsGap(row));
+        var ranked = showAttributionGaps ? matched : matched.Where(row => !IsGap(row) || Pending(row).Label != null);
         table.Render(ranked, row => row.Machine, groupByMachine, topRows, Item, usageBands
             ? (row => row.Totals.TotalBytes, (double)entries.Sum(row => row.Totals.TotalBytes), "I/O") : null, Identity);
         if (byPath)
@@ -1271,11 +1285,15 @@ internal sealed class DiskIoDetails : Panel
 
         static RowSelection Identity(DiskIoRow row) => new(row.Key, row.Machine);
 
+        (string Label, string Help) Pending(DiskIoRow row) =>
+            row.Guest == null && pendingRows != null ? pendingRows.GetValueOrDefault(row.Key) : default;
+
         ListViewItem Item(DiskIoRow row, ListViewGroup group)
         {
             var value = row.Totals;
             string path = row.Key.Path;
             var vm = byPath && row.Guest == null ? owners?.GetValueOrDefault(VmDiskIo.Normalize(path)) : null;
+            var pending = Pending(row);
             var cells = new List<string>();
             if (byPath)
             {
@@ -1288,17 +1306,20 @@ internal sealed class DiskIoDetails : Panel
                 Rate(value.TotalBytes, BytesPerMiB), Rate(value.ReadBytes, BytesPerMiB),
                 Rate(value.WriteBytes, BytesPerMiB), Rate(value.Operations) });
             if (!guestOnly)
-                cells.Add(row.Guest?.Total.ToString("N2") ?? "—");
+                cells.Add(row.Guest?.Total.ToString("N2") ?? pending.Label ?? "—");
             cells.AddRange(new[] { row.Key.Pid > 0 ? row.Key.Pid.ToString() : "—",
                 (value.TotalBytes / BytesPerMiB).ToString("N2"), value.Reads.ToString("N0"), value.Writes.ToString("N0"), value.Operations.ToString("N0") });
             if (!guestOnly)
                 cells.AddRange(new[] { row.Guest?.Read.ToString("N2") ?? "—", row.Guest?.Write.ToString("N2") ?? "—" });
             if (!byPath)
                 cells.Add("");
+            string help = byPath ? path + (vm?.Label != null ? "\nVM: " + vm.Label : "") : "";
+            if (pending.Help != null)
+                help = help.Length == 0 ? pending.Help : help + "\n" + pending.Help;
             return new ListViewItem(cells.ToArray(), group)
             {
                 Tag = Identity(row),
-                ToolTipText = byPath ? path + (vm?.Label != null ? "\nVM: " + vm.Label : "") : ""
+                ToolTipText = help
             };
         }
     }
