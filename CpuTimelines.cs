@@ -372,7 +372,7 @@ internal sealed class Timeline : Form
     public Timeline(CpuCounters counters)
     {
         this.counters = counters;
-        Text = "AI Fleet Cluster Performance Viewer - " + Environment.MachineName;
+        Text = "AI Fleet Cluster Performance Viewer " + Application.ProductVersion + " - " + Environment.MachineName;
         ClientSize = new Size(1160, 880);
         MinimumSize = new Size(660, 500 + OverallPanelHeight);
         StartPosition = FormStartPosition.CenterScreen;
