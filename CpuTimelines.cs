@@ -232,7 +232,14 @@ internal sealed class Timeline : Form
     private readonly Button guestOptions = new() { Text = "Guests", FlatStyle = FlatStyle.Flat };
     private readonly ContextMenuStrip guestMenu = new();
     private readonly CheckBox groupByMachine = new() { Text = "Group by machine", AutoSize = true };
-    private readonly CheckBox usageBands = new() { Text = "10% usage bands", AutoSize = true };
+    private const int DefaultBandWidth = 10;
+    private readonly TextBox bandInput = new()
+    {
+        Text = DefaultBandWidth.ToString(), Width = 140, MaxLength = 3,
+        PlaceholderText = "Empty = off", AccessibleName = "Usage band percentage",
+        AccessibleDescription = "Enter a whole percent from 1 to 100, or clear the field to turn bands off."
+    };
+    private int? bandWidth = DefaultBandWidth;
     private readonly CheckBox diskAttributionGaps = new() { Text = "Show disk attribution gaps", AutoSize = true };
     private readonly NumericUpDown topRows = new() { Minimum = 1, Maximum = 50, Value = 20, AccessibleName = "Number of top rows" };
     private readonly VScrollBar cpuScroll = new() { Visible = false };
@@ -461,14 +468,19 @@ internal sealed class Timeline : Form
         diskRank.Width = 144;
         diskRank.SelectedIndexChanged += DiskFilterChanged;
         AddSetting(settingsMenu, UpdateLabel, updateInterval);
-        usageBands.CheckedChanged += (_, _) =>
+        topRows.Enabled = groupByMachine.Enabled = false;
+        settingsMenu.Closed += (_, _) => ApplyBandInput();
+        bandInput.KeyDown += (_, e) =>
         {
-            topRows.Enabled = !usageBands.Checked;
-            ApplyDetailOptions();
+            if (e.KeyCode != Keys.Enter)
+                return;
+            e.SuppressKeyPress = true;
+            ApplyBandInput();
+            settingsMenu.Close();
         };
         diskAttributionGaps.CheckedChanged += (_, _) => ApplyDetailOptions();
         AddSetting(settingsMenu, "Top rows", topRows);
-        AddSetting(settingsMenu, null, usageBands);
+        AddSetting(settingsMenu, "Usage band %", bandInput);
         AddSetting(settingsMenu, null, groupByMachine);
         AddSetting(diskSettingsMenu, "Rank cards by", diskRank);
         AddSetting(diskSettingsMenu, "Disk scope", diskScope);
@@ -607,8 +619,8 @@ internal sealed class Timeline : Form
         diskCutoff.ForeColor = ForeColor;
         transferCutoff.BackColor = idleTile;
         transferCutoff.ForeColor = ForeColor;
-        guestOptions.BackColor = topRows.BackColor = idleTile;
-        guestOptions.ForeColor = topRows.ForeColor = ForeColor;
+        guestOptions.BackColor = topRows.BackColor = bandInput.BackColor = idleTile;
+        guestOptions.ForeColor = topRows.ForeColor = bandInput.ForeColor = ForeColor;
         foreach (Control control in toolbar.Controls)
         {
             control.BackColor = idleTile;
@@ -809,8 +821,29 @@ internal sealed class Timeline : Form
     {
         var guests = availableGuests.Where(selectedGuests.Contains).ToArray();
         string filter = find.Text.Trim();
-        processDetails.SetOptions(guests, groupByMachine.Checked, (int)topRows.Value, filter, usageBands.Checked);
-        diskIoDetails.SetOptions(guests, groupByMachine.Checked, (int)topRows.Value, filter, usageBands.Checked, diskAttributionGaps.Checked);
+        processDetails.SetOptions(guests, groupByMachine.Checked, (int)topRows.Value, filter, bandWidth);
+        diskIoDetails.SetOptions(guests, groupByMachine.Checked, (int)topRows.Value, filter, bandWidth, diskAttributionGaps.Checked);
+    }
+
+    private void ApplyBandInput()
+    {
+        string text = bandInput.Text.Trim();
+        int? width = null;
+        if (text.Length > 0)
+        {
+            if (!int.TryParse(text, out int value) || value is < 1 or > 100)
+            {
+                bandInput.Text = bandWidth?.ToString() ?? "";
+                return;
+            }
+            width = value;
+        }
+        bandInput.Text = width?.ToString() ?? "";
+        if (bandWidth == width)
+            return;
+        bandWidth = width;
+        topRows.Enabled = groupByMachine.Enabled = !width.HasValue;
+        ApplyDetailOptions();
     }
 
     private void SharedOptionsChanged()
