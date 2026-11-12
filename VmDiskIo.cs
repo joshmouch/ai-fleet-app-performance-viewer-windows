@@ -102,17 +102,215 @@ internal static class VmDiskIo
         return path;
     }
 
-    public static Task<GuestIoSample> Sample(VmDisk disk, CancellationToken cancellation)
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, GuestDiskSession> DiskSessions =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>The next guest I/O sample of one disk. A Hyper-V guest's disks share one long-lived ssh session per VM, in
+    /// which one Python loop runs one bpftrace at a time over every disk being watched (GuestDiskIo.py loop): a sample costs
+    /// no ssh login, sudo or Python start, and the guest runs one bpftrace, not one per disk. Each watched disk used to open
+    /// its own login and bpftrace back to back, about 20 at once on the cluster nodes (2026-11-12), and every login ran the
+    /// guest's whole login message of the day.</summary>
+    public static async Task<GuestIoSample> Sample(VmDisk disk, CancellationToken cancellation)
     {
         if (disk.WslDistro != null)
-            return ReadWslDisk(disk.WslDistro, cancellation);
+            return await ReadWslDisk(disk.WslDistro, cancellation).ConfigureAwait(false);
         if (disk.Controller != "SCSI" || !disk.SingleScsiController)
             throw new InvalidOperationException("Guest disk matching requires a VM with one Hyper-V SCSI controller.");
         if (!IsGuestAddress(disk.VMName) || disk.Location < 0 || disk.Location > 63)
             throw new InvalidOperationException("This VM does not have a supported guest address.");
-        return ReadGuest(disk.VMName, "GuestDiskIo.py", "I/O", 28,
-            new[] { "sudo", "-n", "/usr/bin/python3", "-I", "-", disk.Location.ToString(System.Globalization.CultureInfo.InvariantCulture) }, cancellation,
-            output => ParseGuestIo(output, "The VM returned no guest I/O sample."));
+        var target = GuestSshArguments(disk.VMName);
+        while (true)
+        {
+            var session = DiskSessions.GetOrAdd(disk.VMName, name => new GuestDiskSession(name));
+            try { return await session.Sample(target, disk.Location, cancellation).ConfigureAwait(false); }
+            catch (GuestDiskSession.EndedException)
+            {
+                // Its last disk was released while this one joined: drop that instance and start a fresh session.
+                DiskSessions.TryRemove(new KeyValuePair<string, GuestDiskSession>(disk.VMName, session));
+            }
+        }
+    }
+
+    /// <summary>A disk no longer watched leaves its VM's session; the session runs without it from its next sample, and the
+    /// last disk to leave ends the session and its ssh process tree.</summary>
+    public static void ReleaseDisk(VmDisk disk)
+    {
+        if (disk.WslDistro != null || !DiskSessions.TryGetValue(disk.VMName, out var session))
+            return;
+        if (session.Release(disk.Location))
+            DiskSessions.TryRemove(new KeyValuePair<string, GuestDiskSession>(disk.VMName, session));
+    }
+
+    /// <summary>One run of the guest loop: a sample per disk, or why a disk has none (the others still sample).</summary>
+    private sealed record GuestDiskLine(Dictionary<string, GuestIoSample> Samples, Dictionary<string, string> Errors);
+
+    private sealed class GuestDiskSession(string vmName)
+    {
+        public sealed class EndedException() : Exception("The guest disk session has ended.");
+
+        private const int ErrorTailLines = 5;
+        private readonly object sync = new();
+        private readonly SortedSet<int> wanted = new();
+        private readonly Queue<string> errorTail = new();
+        private int[] running = Array.Empty<int>();
+        private Process process;
+        private TaskCompletionSource<GuestDiskLine> next = NewTick();
+        private bool ended;
+
+        private static TaskCompletionSource<GuestDiskLine> NewTick() =>
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        /// <summary>The next sample of <paramref name="location"/>. The disk joins the session; a session whose loop does not
+        /// cover every wanted disk is restarted with all of them, and its waiters take the restarted loop's first line.</summary>
+        public async Task<GuestIoSample> Sample(string[] target, int location, CancellationToken cancellation)
+        {
+            string key = location.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            // A line from a loop started before this disk joined does not hold it; the restarted loop's next line does.
+            for (int attempt = 0; attempt < 3; attempt++)
+            {
+                Task<GuestDiskLine> tick;
+                lock (sync)
+                {
+                    if (ended) throw new EndedException();
+                    cancellation.ThrowIfCancellationRequested();
+                    wanted.Add(location);
+                    if (process == null || process.HasExited || !running.SequenceEqual(wanted))
+                        Open(target);
+                    tick = next.Task;
+                }
+                GuestDiskLine run;
+                // A run is 6 s of tracing plus bpftrace's start; the guest script bounds one run at 17 s.
+                try { run = await tick.WaitAsync(TimeSpan.FromSeconds(30), cancellation).ConfigureAwait(false); }
+                catch (TimeoutException)
+                {
+                    Restart();
+                    throw new InvalidOperationException("Guest I/O sampling did not finish.");
+                }
+                if (run.Errors != null && run.Errors.TryGetValue(key, out string error))
+                    throw new InvalidOperationException(error);
+                if (run.Samples.TryGetValue(key, out var sample))
+                    return sample;
+            }
+            throw new InvalidOperationException("The VM returned no guest I/O sample for this disk.");
+        }
+
+        /// <summary>Removes a disk; true when it was the last one and the session has ended.</summary>
+        public bool Release(int location)
+        {
+            Process old;
+            TaskCompletionSource<GuestDiskLine> pending;
+            lock (sync)
+            {
+                wanted.Remove(location);
+                if (wanted.Count > 0) return false; // the next sample restarts the loop without it
+                ended = true;
+                old = process; process = null; pending = next;
+            }
+            pending.TrySetException(new EndedException());
+            Stop(old);
+            return true;
+        }
+
+        /// <summary>Ends the current loop after a failed or stalled sample; the next sample opens a new one.</summary>
+        private void Restart()
+        {
+            Process old;
+            lock (sync) { old = process; process = null; }
+            Stop(old);
+        }
+
+        private static void Stop(Process old)
+        {
+            try { if (old != null && !old.HasExited) old.Kill(entireProcessTree: true); }
+            catch (InvalidOperationException) { }
+            catch (System.ComponentModel.Win32Exception) { }
+            old?.Dispose();
+        }
+
+        /// <summary>Starts the loop over every wanted disk. Called under <c>sync</c>.</summary>
+        private void Open(string[] target)
+        {
+            Stop(process);
+            running = wanted.ToArray();
+            var start = new ProcessStartInfo(SshExecutable)
+            {
+                CreateNoWindow = true, UseShellExecute = false, RedirectStandardInput = true, RedirectStandardOutput = true,
+                RedirectStandardError = true, StandardOutputEncoding = Encoding.UTF8, StandardErrorEncoding = Encoding.UTF8
+            };
+            foreach (string argument in target.Concat(new[] { "sudo", "-n", "/usr/bin/python3", "-I", "-", "loop" })
+                .Concat(running.Select(slot => slot.ToString(System.Globalization.CultureInfo.InvariantCulture))))
+                start.ArgumentList.Add(argument);
+            var started = Process.Start(start);
+            process = started;
+            errorTail.Clear();
+            started.ErrorDataReceived += (_, e) =>
+            {
+                if (e.Data == null) return;
+                lock (sync)
+                {
+                    if (!ReferenceEquals(process, started)) return;
+                    errorTail.Enqueue(e.Data);
+                    while (errorTail.Count > ErrorTailLines) errorTail.Dequeue();
+                }
+            };
+            started.BeginErrorReadLine();
+            // Python reads its program from stdin to EOF, then runs it: the script, then a closed stdin.
+            started.StandardInput.Write(ReadScript("GuestDiskIo.py"));
+            started.StandardInput.Close();
+            _ = Task.Run(() => Stream(started));
+        }
+
+        private async Task Stream(Process started)
+        {
+            Exception failure = null;
+            try
+            {
+                while (await started.StandardOutput.ReadLineAsync().ConfigureAwait(false) is { } line)
+                {
+                    GuestDiskLine parsed;
+                    try { parsed = JsonSerializer.Deserialize<GuestDiskLine>(line); }
+                    catch (JsonException) { parsed = null; }
+                    if (parsed?.Samples == null || parsed.Samples.Values.Any(s => s?.Rows == null || Array.IndexOf(s.Rows, null) >= 0))
+                    {
+                        failure = new InvalidOperationException("The VM returned no guest I/O sample.");
+                        break;
+                    }
+                    TaskCompletionSource<GuestDiskLine> done;
+                    lock (sync)
+                    {
+                        if (!ReferenceEquals(process, started)) return; // a replaced loop's late line is not this session's
+                        done = next; next = NewTick();
+                    }
+                    done.TrySetResult(parsed);
+                }
+            }
+            catch (Exception e) when (e is IOException or ObjectDisposedException or InvalidOperationException) { }
+            // Let ssh exit and its stderr drain before the cause is read.
+            try
+            {
+                using var settle = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+                await started.WaitForExitAsync(settle.Token).ConfigureAwait(false);
+            }
+            catch (Exception e) when (e is OperationCanceledException or InvalidOperationException or ObjectDisposedException) { }
+            TaskCompletionSource<GuestDiskLine> pending;
+            lock (sync)
+            {
+                if (!ReferenceEquals(process, started)) return;
+                process = null; pending = next; next = NewTick();
+                if (failure == null)
+                {
+                    string guest = errorTail.FirstOrDefault(line => line.StartsWith("Guest disk I/O: ", StringComparison.Ordinal));
+                    bool unreachable = false;
+                    try { unreachable = started.HasExited && started.ExitCode == 255; }
+                    catch (InvalidOperationException) { }
+                    failure = new InvalidOperationException(guest?.TrimEnd() ?? (unreachable ? GuestSshUnreachable(vmName)
+                        : $"The VM {vmName} closed the guest I/O sampling connection." +
+                          (errorTail.Count > 0 ? " ssh: " + string.Join(" | ", errorTail) : "")));
+                }
+            }
+            pending.TrySetException(failure);
+            Stop(started);
+        }
     }
 
     private static async Task<GuestIoSample> ReadWslDisk(string distro, CancellationToken cancellation)

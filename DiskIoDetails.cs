@@ -666,6 +666,7 @@ internal sealed class GuestIoWatch : IDisposable
     private readonly System.Threading.CancellationTokenSource stop = new();
     private readonly Queue<(long Completed, GuestIoSample Sample)> frames = new();
     private volatile Snapshot current = new(new(), new(), null, 0, 0, 0, 0, false, 0, null);
+    private readonly VmDisk disk;
 
     public sealed record Snapshot(Dictionary<FileIoKey, FileIoTotals> Paths, Dictionary<FileIoKey, FileIoTotals> Processes,
         string Device, int Seconds, double DiskSeconds, long DiskReadBytes, long DiskWriteBytes,
@@ -673,6 +674,7 @@ internal sealed class GuestIoWatch : IDisposable
 
     public GuestIoWatch(VmDisk disk)
     {
+        this.disk = disk;
         var cancellation = stop.Token;
         _ = Task.Run(() => Run(disk, cancellation));
     }
@@ -752,6 +754,7 @@ internal sealed class GuestIoWatch : IDisposable
     {
         stop.Cancel();
         stop.Dispose();
+        VmDiskIo.ReleaseDisk(disk);
     }
 }
 

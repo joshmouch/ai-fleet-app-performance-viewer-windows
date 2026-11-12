@@ -1,4 +1,7 @@
-"""One bounded ext4 I/O sample on a Hyper-V attachment or WSL root disk."""
+"""Bounded ext4 I/O samples of a guest's disks: one sample of the WSL root disk (argument `root`) or of one Hyper-V SCSI
+slot (a slot number), or `loop` and slot numbers: one sample of all those slots after another, one JSON line each, for as
+long as the caller reads them. A loop runs one bpftrace at a time over every listed disk, inside the one ssh login that
+started it, instead of a login, a sudo, a Python start and a bpftrace per disk per sample."""
 
 import hashlib
 import json
@@ -26,6 +29,10 @@ BPFTRACE_ASSETS = {
 def fail(message):
     print("Guest disk I/O: " + message, file=sys.stderr)
     sys.exit(1)
+
+
+class DiskError(Exception):
+    """One disk cannot be sampled. A single sample fails with it; a loop reports it for that disk and keeps the others."""
 
 
 def read_json(args):
@@ -97,7 +104,7 @@ def select_disk(location):
         if driver.read_text().strip() == "storvsc_host":
             matches.append(disk)
     if len(matches) != 1:
-        fail(f"Could not uniquely identify Hyper-V SCSI slot {location} in Linux.")
+        raise DiskError(f"Could not uniquely identify Hyper-V SCSI slot {location} in Linux.")
     disk = matches[0]
     filesystem_mounts = read_json(["findmnt", "-J", "-l", "-o", "MAJ:MIN,TARGET,FSROOT"])["filesystems"]
     roots = {}
@@ -111,7 +118,7 @@ def select_disk(location):
         targets = [m["target"] for m in filesystem_mounts if m["maj:min"] == number and m["fsroot"] == "/"]
         roots[dev] = min(targets, key=lambda path: (len(path), path)) if targets else None
     if not roots:
-        fail(f"No ext4 filesystem found on {disk['path']}.")
+        raise DiskError(f"No ext4 filesystem found on {disk['path']}.")
     return disk["path"], roots
 
 
@@ -127,8 +134,8 @@ kretfunc:ext4_file_DIRECTION_iter
         $d = $file->f_path.dentry;
         $ino = $file->f_inode->i_ino;
         $leaf = (uint64)$d;
-        @total_DIRECTION = stats(retval);
-        @process_DIRECTION[pid] = stats(retval);
+        @total_DIRECTION[$dev] = stats(retval);
+        @process_DIRECTION[pid, $dev] = stats(retval);
         @comm[pid] = ((struct task_struct *)curtask)->group_leader->comm;
 
         $tracked = @tracked_DIRECTION[pid, $leaf, $ino, $dev];
@@ -176,6 +183,7 @@ kretfunc:ext4_file_DIRECTION_iter
 
 
 def report(output, device, roots, name_capacity):
+    """The sample of one disk (`device`, its ext4 filesystems `roots`) from one bpftrace run over one or more disks."""
     # File names are sent on cache misses. The cache can replace entries without
     # losing names already delivered to this sample or preventing new ones.
     maps = {}
@@ -232,29 +240,35 @@ def report(output, device, roots, name_capacity):
             totals[0] += byte_count
             totals[1] += op_count
 
+        # Only this disk's filesystems: one bpftrace run can cover several disks.
         operations = maps.get(f"@ops_{direction}", {})
         for key, byte_count in maps.get(f"@{direction}", {}).items():
             pid, pointer, inode, dev = map(int, key.split(","))
-            add(pid, guest_path(pointer, inode, dev), byte_count, operations.get(key, 0))
+            if dev in roots:
+                add(pid, guest_path(pointer, inode, dev), byte_count, operations.get(key, 0))
         for (pid, pointer, inode, dev), stats in overflow[direction].items():
-            add(pid, guest_path(pointer, inode, dev), *stats)
+            if dev in roots:
+                add(pid, guest_path(pointer, inode, dev), *stats)
 
         # Reconcile detail against independent counters, even if bpftrace could
         # not deliver an overflow record or keep a per-file or per-process key.
         for key, stats in maps.get(f"@process_{direction}", {}).items():
-            pid = int(key)
+            pid, dev = map(int, key.split(","))
+            if dev not in roots:
+                continue
             used_bytes, used_ops = accounted.get(pid, (0, 0))
             missing_bytes = stats["total"] - used_bytes
             missing_ops = stats["count"] - used_ops
             if missing_bytes < 0 or missing_ops < 0:
-                fail("The guest process counters did not reconcile.")
+                raise DiskError("The guest process counters did not reconcile.")
             if missing_bytes or missing_ops:
                 add(pid, "(path unavailable)", missing_bytes, missing_ops)
-        total = maps.get(f"@total_{direction}", {"total": 0, "count": 0})
+        disk_totals = [stats for key, stats in maps.get(f"@total_{direction}", {}).items() if int(key) in roots]
+        total = {"total": sum(stats["total"] for stats in disk_totals), "count": sum(stats["count"] for stats in disk_totals)}
         missing_bytes = total["total"] - sum(stats[0] for stats in accounted.values())
         missing_ops = total["count"] - sum(stats[1] for stats in accounted.values())
         if missing_bytes < 0 or missing_ops < 0:
-            fail("The guest disk counters did not reconcile.")
+            raise DiskError("The guest disk counters did not reconcile.")
         if missing_bytes or missing_ops:
             add(0, "(path unavailable)", missing_bytes, missing_ops)
 
@@ -271,36 +285,86 @@ def block_snapshot(device):
         return None
 
 
+def sample(tracer, devices, name_capacity, wsl):
+    """One bpftrace run over every disk in `devices` ({slot or "root": (device path, roots)}): ({slot: sample},
+    {slot: why that disk has no sample}). A run that cannot start raises DiskError."""
+    roots = {dev: root for _, disk_roots in devices.values() for dev, root in disk_roots.items()}
+    options = dict(os.environ, BPFTRACE_MAX_STRLEN=str(name_capacity), BPFTRACE_MAX_MAP_KEYS=str(MAP_LIMIT),
+                   BPFTRACE_PERF_RB_PAGES="128")
+    command = [tracer, "--no-warnings"] if wsl else [tracer]
+    before = {slot: block_snapshot(device) for slot, (device, _) in devices.items()}
+    result = subprocess.run(command + ["-q", "-f", "json", "-"], input=bpf_program(roots),
+                            text=True, encoding="utf-8", errors="replace", capture_output=True,
+                            timeout=17, env=options)
+    after = {slot: block_snapshot(device) for slot, (device, _) in devices.items()}
+    if result.returncode != 0:
+        lines = result.stderr.strip().splitlines()
+        raise DiskError("Could not attach the ext4 probes." + (" " + lines[0][:140] if lines else ""))
+    samples, errors = {}, {}
+    for slot, (device, disk_roots) in devices.items():
+        try:
+            disk = report(result.stdout, device, disk_roots, name_capacity)
+        except DiskError as error:
+            errors[slot] = str(error)
+            continue
+        start, end = before[slot], after[slot]
+        if start and end and end[0] > start[0] and end[1] >= start[1] and end[2] >= start[2]:
+            disk.update(DiskSeconds=end[0] - start[0], DiskReadBytes=end[1] - start[1], DiskWriteBytes=end[2] - start[2])
+        samples[slot] = disk
+    return samples, errors
+
+
 def main():
-    target = sys.argv[1]
-    wsl = target == "root"
-    device, roots = select_wsl_root() if wsl else select_disk(int(target))
+    loop = sys.argv[1] == "loop"
+    targets = sys.argv[2:] if loop else sys.argv[1:2]
+    wsl = targets == ["root"]
+    devices, unavailable = {}, {}
+    for target in targets:
+        try:
+            devices[target] = select_wsl_root() if wsl else select_disk(int(target))
+        except DiskError as error:
+            if not loop:
+                fail(str(error))
+            unavailable[target] = str(error)
     tracer = wsl_bpftrace() if wsl else shutil.which("bpftrace")
     if tracer is None:
         fail("bpftrace is unavailable in this guest.")
     # The newer compiler cannot load this probe with the larger stack buffer.
     name_capacity = 128 if wsl else 192
-    options = dict(os.environ, BPFTRACE_MAX_STRLEN=str(name_capacity), BPFTRACE_MAX_MAP_KEYS=str(MAP_LIMIT),
-                   BPFTRACE_PERF_RB_PAGES="128")
-    command = [tracer, "--no-warnings"] if wsl else [tracer]
-    before = block_snapshot(device)
-    result = subprocess.run(command + ["-q", "-f", "json", "-"], input=bpf_program(roots),
-                            text=True, encoding="utf-8", errors="replace", capture_output=True,
-                            timeout=17, env=options)
-    after = block_snapshot(device)
-    if result.returncode != 0:
-        lines = result.stderr.strip().splitlines()
-        fail("Could not attach the ext4 probes." + (" " + lines[0][:140] if lines else ""))
-    sample = report(result.stdout, device, roots, name_capacity)
-    if before and after and after[0] > before[0] and after[1] >= before[1] and after[2] >= before[2]:
-        sample.update(DiskSeconds=after[0] - before[0], DiskReadBytes=after[1] - before[1],
-                      DiskWriteBytes=after[2] - before[2])
-    print(json.dumps(sample, separators=(",", ":")))
+    if not loop:
+        try:
+            samples, errors = sample(tracer, devices, name_capacity, wsl)
+        except DiskError as error:
+            fail(str(error))
+        if targets[0] in errors:
+            fail(errors[targets[0]])
+        print(json.dumps(samples[targets[0]], separators=(",", ":")))
+        return
+    # One line per run: {"Samples": {slot: sample}, "Errors": {slot: reason}}. A disk that cannot be sampled is reported on
+    # every line and the others keep sampling. The caller ending the ssh session closes this pipe, and the next write ends
+    # the loop (BrokenPipeError), so no run outlives its reader by more than one sample.
+    while True:
+        errors = dict(unavailable)
+        samples = {}
+        if devices:
+            try:
+                samples, failed = sample(tracer, devices, name_capacity, wsl)
+                errors.update(failed)
+            except DiskError as error:
+                errors.update((slot, str(error)) for slot in devices)
+        if not samples:
+            time.sleep(SECONDS)  # nothing traced this run: pace the loop as a run would
+        line = json.dumps({"Samples": samples, "Errors": {slot: "Guest disk I/O: " + reason for slot, reason in errors.items()}},
+                          separators=(",", ":"))
+        sys.stdout.write(line + "\n")
+        sys.stdout.flush()
 
 
 if __name__ == "__main__":
     try:
         main()
+    except BrokenPipeError:
+        sys.exit(0)
     except subprocess.TimeoutExpired:
         fail("The guest sampler did not finish.")
     except (OSError, ValueError, KeyError, subprocess.CalledProcessError) as error:
