@@ -1179,7 +1179,7 @@ internal sealed class DiskIoDetails : Panel
                 byPath ? pair.Sample.Paths : pair.Sample.Processes, pair.Sample.Seconds)).ToArray();
         string window = snapshot.DiskBytes == 0 ? "No disk I/O in this sample" : $"{snapshot.Seconds:0} s sample";
         if (byPath && selectedPath == null && snapshot.DiskBytes > 0)
-            window += $"  |  {(double)snapshot.NamedBytes / snapshot.DiskBytes:P0} of bytes matched to paths";
+            window += $"  |  {(double)snapshot.NamedBytes / snapshot.DiskBytes:P0} of Windows bytes matched to paths";
         status.Text = snapshot.Status ?? window;
         var notes = new List<string>();
         if (snapshot.OutsideScopeBytes > 0 && snapshot.Seconds > 0)
