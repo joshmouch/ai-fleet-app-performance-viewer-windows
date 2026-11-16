@@ -24,6 +24,7 @@ internal sealed record GuestIoSample(string Device, int Seconds, GuestIoRow[] Ro
 
 internal static class VmDiskIo
 {
+    private static readonly Encoding ScriptEncoding = new UTF8Encoding(false);
     /// <summary>The VM disk inventory. Its WSL registry and process reads are synchronous, so the caller runs it on the
     /// thread pool.</summary>
     public static async Task<Dictionary<string, VmDiskOwners>> ReadInventory(CancellationToken cancellation, VolumePathIndex paths)
@@ -235,7 +236,8 @@ internal static class VmDiskIo
             var start = new ProcessStartInfo(SshExecutable)
             {
                 CreateNoWindow = true, UseShellExecute = false, RedirectStandardInput = true, RedirectStandardOutput = true,
-                RedirectStandardError = true, StandardOutputEncoding = Encoding.UTF8, StandardErrorEncoding = Encoding.UTF8
+                RedirectStandardError = true, StandardInputEncoding = ScriptEncoding,
+                StandardOutputEncoding = Encoding.UTF8, StandardErrorEncoding = Encoding.UTF8
             };
             foreach (string argument in target.Concat(new[] { "sudo", "-n", "/usr/bin/python3", "-I", "-", "loop" })
                 .Concat(running.Select(slot => slot.ToString(System.Globalization.CultureInfo.InvariantCulture))))
@@ -458,7 +460,7 @@ internal static class VmDiskIo
 
         private void Open(string[] target)
         {
-            string encoded = Convert.ToBase64String(new UTF8Encoding(false).GetBytes(ReadScript("GuestCpu.sh")));
+            string encoded = Convert.ToBase64String(ScriptEncoding.GetBytes(ReadScript("GuestCpu.sh")));
             var start = new ProcessStartInfo(SshExecutable)
             {
                 CreateNoWindow = true, UseShellExecute = false, RedirectStandardInput = true, RedirectStandardOutput = true,
@@ -675,7 +677,7 @@ internal static class VmDiskIo
             StandardErrorEncoding = Encoding.UTF8
         };
         if (input != null)
-            start.StandardInputEncoding = new UTF8Encoding(false);
+            start.StandardInputEncoding = ScriptEncoding;
         foreach (string argument in arguments)
             start.ArgumentList.Add(argument);
         using var process = Process.Start(start);
