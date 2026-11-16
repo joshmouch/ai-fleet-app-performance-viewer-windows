@@ -142,12 +142,15 @@ kretfunc:ext4_file_DIRECTION_iter
         if (!$tracked) {
             @tracked_DIRECTION[pid, $leaf, $ino, $dev] = 1;
             $tracked = @tracked_DIRECTION[pid, $leaf, $ino, $dev];
+            if ($tracked) {
+                @leaf_DIRECTION[pid, $leaf, $ino, $dev] = str($d->d_name.name);
+            }
         }
         if ($tracked) {
             @DIRECTION[pid, $leaf, $ino, $dev] = sum(retval);
             @ops_DIRECTION[pid, $leaf, $ino, $dev] = count();
         } else {
-            printf("io|DIRECTION|%d|%llu|%llu|%llu|%llu", pid, $leaf, $ino, (uint64)$dev, (uint64)retval);
+            printf("io|DIRECTION|%d|%llu|%llu|%llu|%llu|%s", pid, $leaf, $ino, (uint64)$dev, (uint64)retval, str($d->d_name.name));
         }
 
         $i = 0;
@@ -175,17 +178,14 @@ kretfunc:ext4_file_DIRECTION_iter
     reported = ["comm"]
     cleared = ["seen"]
     for direction in directions:
-        reported.extend([direction, f"ops_{direction}", f"total_{direction}", f"process_{direction}"])
+        reported.extend([direction, f"ops_{direction}", f"leaf_{direction}", f"total_{direction}", f"process_{direction}"])
         cleared.append(f"tracked_{direction}")
     actions = [f"print(@{name});" for name in reported]
     actions.extend(f"clear(@{name});" for name in reported + cleared)
     return probes + f"interval:s:{SECONDS} {{ exit(); }}\nEND {{ {' '.join(actions)} }}\n"
 
 
-def report(output, device, roots, name_capacity):
-    """The sample of one disk (`device`, its ext4 filesystems `roots`) from one bpftrace run over one or more disks."""
-    # File names are sent on cache misses. The cache can replace entries without
-    # losing names already delivered to this sample or preventing new ones.
+def decode_trace(output):
     maps = {}
     nodes = {}
     overflow = {"read": {}, "write": {}}
@@ -202,26 +202,39 @@ def report(output, device, roots, name_capacity):
                     nodes[int(pointer) & MASK, int(inode) & MASK] = (
                         int(parent) & MASK, int(parent_inode) & MASK, name)
                 elif kind == "io":
-                    direction, pid, pointer, inode, dev, size = data.split("|")
+                    direction, pid, pointer, inode, dev, size, leaf = data.split("|", 6)
                     key = int(pid), int(pointer) & MASK, int(inode) & MASK, int(dev)
-                    stats = overflow[direction].setdefault(key, [0, 0])
+                    stats = overflow[direction].setdefault(key, [0, 0, leaf])
                     stats[0] += int(size)
                     stats[1] += 1
+    return maps, nodes, overflow
+
+
+def report(trace, device, roots, name_capacity):
+    """The sample of one disk (`device`, its ext4 filesystems `roots`) from one bpftrace run over one or more disks."""
+    maps, nodes, overflow = trace
     processes = maps.get("@comm", {})
 
-    def guest_path(pointer, inode, dev):
+    def label(name):
+        return name + ("…" if len(name.encode("utf-8")) >= name_capacity - 1 else "")
+
+    def guest_path(pointer, inode, dev, leaf):
         key = pointer & MASK, inode & MASK
         parts = []
         root = roots[dev]
         for _ in range(DEPTH):
             node = nodes.get(key)
             if node is None:
+                # The read/write counters can arrive without the dentry name event.
+                # Keep the captured filename and mark its folder as unavailable.
+                if not parts and leaf:
+                    parts.append(label(leaf))
                 break
             parent, parent_inode, name = node
             if parent == key[0]:
                 return (root or "(filesystem root)").rstrip("/") + "/" + "/".join(reversed(parts))
             if name:
-                parts.append(name + ("…" if len(name.encode("utf-8")) >= name_capacity - 1 else ""))
+                parts.append(label(name))
             key = parent, parent_inode
         return "…/" + "/".join(reversed(parts)) if parts else "(path unavailable)"
 
@@ -229,26 +242,27 @@ def report(output, device, roots, name_capacity):
     for direction, count, size in (("read", "Reads", "ReadBytes"), ("write", "Writes", "WriteBytes")):
         accounted = {}
 
-        def add(pid, path, byte_count, op_count):
+        def add(pid, dev, path, byte_count, op_count):
             row = rows.setdefault((pid, path), {
                 "Pid": pid, "Process": processes.get(str(pid), "Unknown"), "Path": path,
                 "ReadBytes": 0, "WriteBytes": 0, "Reads": 0, "Writes": 0,
             })
             row[size] += byte_count
             row[count] += op_count
-            totals = accounted.setdefault(pid, [0, 0])
+            totals = accounted.setdefault((pid, dev), [0, 0])
             totals[0] += byte_count
             totals[1] += op_count
 
         # Only this disk's filesystems: one bpftrace run can cover several disks.
         operations = maps.get(f"@ops_{direction}", {})
+        leaves = maps.get(f"@leaf_{direction}", {})
         for key, byte_count in maps.get(f"@{direction}", {}).items():
             pid, pointer, inode, dev = map(int, key.split(","))
             if dev in roots:
-                add(pid, guest_path(pointer, inode, dev), byte_count, operations.get(key, 0))
-        for (pid, pointer, inode, dev), stats in overflow[direction].items():
+                add(pid, dev, guest_path(pointer, inode, dev, leaves.get(key)), byte_count, operations.get(key, 0))
+        for (pid, pointer, inode, dev), (byte_count, op_count, leaf) in overflow[direction].items():
             if dev in roots:
-                add(pid, guest_path(pointer, inode, dev), *stats)
+                add(pid, dev, guest_path(pointer, inode, dev, leaf), byte_count, op_count)
 
         # Reconcile detail against independent counters, even if bpftrace could
         # not deliver an overflow record or keep a per-file or per-process key.
@@ -256,13 +270,13 @@ def report(output, device, roots, name_capacity):
             pid, dev = map(int, key.split(","))
             if dev not in roots:
                 continue
-            used_bytes, used_ops = accounted.get(pid, (0, 0))
+            used_bytes, used_ops = accounted.get((pid, dev), (0, 0))
             missing_bytes = stats["total"] - used_bytes
             missing_ops = stats["count"] - used_ops
             if missing_bytes < 0 or missing_ops < 0:
                 raise DiskError("The guest process counters did not reconcile.")
             if missing_bytes or missing_ops:
-                add(pid, "(path unavailable)", missing_bytes, missing_ops)
+                add(pid, dev, "(path unavailable)", missing_bytes, missing_ops)
         disk_totals = [stats for key, stats in maps.get(f"@total_{direction}", {}).items() if int(key) in roots]
         total = {"total": sum(stats["total"] for stats in disk_totals), "count": sum(stats["count"] for stats in disk_totals)}
         missing_bytes = total["total"] - sum(stats[0] for stats in accounted.values())
@@ -270,7 +284,7 @@ def report(output, device, roots, name_capacity):
         if missing_bytes < 0 or missing_ops < 0:
             raise DiskError("The guest disk counters did not reconcile.")
         if missing_bytes or missing_ops:
-            add(0, "(path unavailable)", missing_bytes, missing_ops)
+            add(0, None, "(path unavailable)", missing_bytes, missing_ops)
 
     limited = any(path == "(path unavailable)" or path.startswith("…/") for _, path in rows)
     return {"Device": device, "Seconds": SECONDS, "Rows": list(rows.values()), "Limited": limited}
@@ -300,10 +314,11 @@ def sample(tracer, devices, name_capacity, wsl):
     if result.returncode != 0:
         lines = result.stderr.strip().splitlines()
         raise DiskError("Could not attach the ext4 probes." + (" " + lines[0][:140] if lines else ""))
+    trace = decode_trace(result.stdout)
     samples, errors = {}, {}
     for slot, (device, disk_roots) in devices.items():
         try:
-            disk = report(result.stdout, device, disk_roots, name_capacity)
+            disk = report(trace, device, disk_roots, name_capacity)
         except DiskError as error:
             errors[slot] = str(error)
             continue
