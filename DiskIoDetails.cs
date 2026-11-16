@@ -130,12 +130,15 @@ internal sealed class VolumeFileIo : IDisposable
     private readonly Queue<Bucket> buckets = new();
     private Bucket currentBucket;
     private readonly Dictionary<int, string> processes = new();
-    private readonly Dictionary<ulong, OpenFile> openFiles = new();
-    private readonly Queue<(ulong Key, OpenFile File)> fileOrder = new();
-    private readonly Dictionary<ulong, OpenFile> virtualFiles = new();
-    private readonly Queue<(ulong Key, OpenFile File)> virtualFileOrder = new();
+    private readonly FileNames observedFiles = new(MaxOpenFiles);
+    private readonly FileNames recentNames = new(MaxOpenFiles);
+    private readonly FileNames virtualFiles = new(MaxVirtualFiles);
     private readonly Dictionary<ulong, DiskRequest> requests = new();
     private double nextRequestTrim;
+    private double nextNameRundown = BucketSeconds * 1000;
+    private bool firstNameRundown = true;
+    private bool nameRundownNeeded = true;
+    private int nameRundownRunning;
     private volatile TraceScope scope;
     private long detailStarted;
     private long virtualStarted;
@@ -154,6 +157,41 @@ internal sealed class VolumeFileIo : IDisposable
     {
         // The rundown can name an already open file after its first captured I/O.
         public volatile string Path = path;
+        public bool RequestedName;
+    }
+
+    private sealed class FileNames(int capacity)
+    {
+        private readonly Dictionary<ulong, OpenFile> files = new();
+        private readonly Queue<(ulong Key, OpenFile File)> order = new();
+
+        public OpenFile Find(ulong key) => files.GetValueOrDefault(key);
+        public void Remove(ulong key) => files.Remove(key);
+
+        public void Remember(ulong key, OpenFile file)
+        {
+            if (order.Count == capacity)
+            {
+                var oldest = order.Dequeue();
+                if (ReferenceEquals(Find(oldest.Key), oldest.File))
+                    files.Remove(oldest.Key);
+            }
+            files[key] = file;
+            order.Enqueue((key, file));
+        }
+
+        public bool MarkUnnamedForRundown()
+        {
+            bool found = false;
+            foreach (var file in files.Values)
+            {
+                if (file.Path != null || file.RequestedName)
+                    continue;
+                file.RequestedName = true;
+                found = true;
+            }
+            return found;
+        }
     }
 
     private readonly record struct DiskRequest(int Pid, int Thread, double Time, string Process);
@@ -269,16 +307,13 @@ internal sealed class VolumeFileIo : IDisposable
             source.Kernel.FileIOFileDelete += e => RememberFile(e.FileKey, e.FileName, 3);
             source.Kernel.DiskIOReadInit += RecordRequest;
             source.Kernel.DiskIOWriteInit += RecordRequest;
-            source.Kernel.DiskIORead += e => RecordDisk(e, false, source);
-            source.Kernel.DiskIOWrite += e => RecordDisk(e, true, source);
+            string rundownOwner = fileInfoAvailable ? owner : null;
+            source.Kernel.DiskIORead += e => RecordDisk(e, false, source, rundownOwner);
+            source.Kernel.DiskIOWrite += e => RecordDisk(e, true, source, rundownOwner);
             System.Threading.Volatile.Write(ref started, Stopwatch.GetTimestamp());
             status = null;
             if (!disposed)
-            {
-                if (fileInfoAvailable)
-                    _ = Task.Run(() => RequestFileNames(owner));
                 source.Process();
-            }
             if (!disposed)
                 status = "Windows ended the file I/O trace. Close and reopen details to restart it.";
         }
@@ -305,6 +340,28 @@ internal sealed class VolumeFileIo : IDisposable
         new(owner + Guid.NewGuid().ToString("N"), TraceEventSessionOptions.NoRestartOnCreate)
         { StopOnDispose = true, BufferSizeMB = 32 };
 
+    private void QueueFileNameRundown(string owner, double time, OpenFile file)
+    {
+        if (owner == null)
+            return;
+        if (file is { Path: null, RequestedName: false })
+            nameRundownNeeded = true;
+        if (!nameRundownNeeded || time < nextNameRundown ||
+            System.Threading.Volatile.Read(ref nameRundownRunning) != 0)
+            return;
+
+        // Give completions time to identify the files worth retaining. A busy box
+        // can emit millions of names per rundown, so coalesce new keys across samples.
+        nameRundownNeeded = false;
+        bool outstanding = observedFiles.MarkUnnamedForRundown();
+        if (!firstNameRundown && !outstanding)
+            return;
+        firstNameRundown = false;
+        nextNameRundown = time + WindowSeconds * 500;
+        System.Threading.Volatile.Write(ref nameRundownRunning, 1);
+        _ = Task.Run(() => RequestFileNames(owner));
+    }
+
     private async Task RequestFileNames(string owner)
     {
         await RundownGate.WaitAsync().ConfigureAwait(false);
@@ -322,6 +379,7 @@ internal sealed class VolumeFileIo : IDisposable
         finally
         {
             RundownGate.Release();
+            System.Threading.Volatile.Write(ref nameRundownRunning, 0);
         }
     }
 
@@ -379,8 +437,7 @@ internal sealed class VolumeFileIo : IDisposable
             {
                 if (!path.IsEmpty)
                     file.Path ??= path.ToString();
-                openFiles.Remove(key);
-                virtualFiles.Remove(key);
+                ForgetFile(key);
             }
             return;
         }
@@ -395,33 +452,32 @@ internal sealed class VolumeFileIo : IDisposable
         if (file == null || (kind == 1 && file.Path != null &&
             !string.Equals(file.Path, name, StringComparison.OrdinalIgnoreCase)))
         {
-            file = new OpenFile(name);
-            SaveOpenFile(key, file, isVirtual);
+            ForgetFile(key);
+            (isVirtual ? virtualFiles : recentNames).Remember(key, new OpenFile(name));
         }
         else
         {
             file.Path ??= name;
-            if (isVirtual && !virtualFiles.ContainsKey(key))
-                SaveOpenFile(key, file, isVirtual: true);
+            if (isVirtual && virtualFiles.Find(key) == null)
+                RememberVirtualFile(key, file);
         }
     }
 
     private OpenFile FindOpenFile(ulong key) =>
-        virtualFiles.GetValueOrDefault(key) ?? openFiles.GetValueOrDefault(key);
+        virtualFiles.Find(key) ?? observedFiles.Find(key) ?? recentNames.Find(key);
 
-    private void SaveOpenFile(ulong key, OpenFile file, bool isVirtual)
+    private void ForgetFile(ulong key)
     {
-        var cache = isVirtual ? virtualFiles : openFiles;
-        var order = isVirtual ? virtualFileOrder : fileOrder;
-        (isVirtual ? openFiles : virtualFiles).Remove(key);
-        if (order.Count == (isVirtual ? MaxVirtualFiles : MaxOpenFiles))
-        {
-            var oldest = order.Dequeue();
-            if (ReferenceEquals(cache.GetValueOrDefault(oldest.Key), oldest.File))
-                cache.Remove(oldest.Key);
-        }
-        cache[key] = file;
-        order.Enqueue((key, file));
+        virtualFiles.Remove(key);
+        observedFiles.Remove(key);
+        recentNames.Remove(key);
+    }
+
+    private void RememberVirtualFile(ulong key, OpenFile file)
+    {
+        observedFiles.Remove(key);
+        recentNames.Remove(key);
+        virtualFiles.Remember(key, file);
     }
 
     private void RecordRequest(DiskIOInitTraceData e)
@@ -444,7 +500,7 @@ internal sealed class VolumeFileIo : IDisposable
         path.EndsWith(".vhdx", StringComparison.OrdinalIgnoreCase) ||
         path.EndsWith(".avhdx", StringComparison.OrdinalIgnoreCase);
 
-    private void RecordDisk(DiskIOTraceData e, bool write, ETWTraceEventSource source)
+    private void RecordDisk(DiskIOTraceData e, bool write, ETWTraceEventSource source, string rundownOwner)
     {
         if (disposed)
             return;
@@ -455,28 +511,37 @@ internal sealed class VolumeFileIo : IDisposable
         if ((!detail && !virtualDisk) || e.TransferSize <= 0)
             return;
 
-        OpenFile file = e.FileKey != 0 ? FindOpenFile(e.FileKey) : null;
+        ulong fileKey = e.FileKey;
+        OpenFile attachment = fileKey != 0 ? virtualFiles.Find(fileKey) : null;
+        OpenFile observed = fileKey != 0 && attachment == null ? observedFiles.Find(fileKey) : null;
+        OpenFile file = attachment ?? observed ?? (fileKey != 0 ? recentNames.Find(fileKey) : null);
         if (file?.Path == null)
         {
             string path = e.FileName;
             if (string.IsNullOrEmpty(path))
                 path = null;
-            if (!detail && (path == null || !IsVirtualDisk(path)))
-                return;
-            if (file == null && (e.FileKey != 0 || path != null))
+            if ((detail && fileKey != 0) || path != null)
             {
-                file = new OpenFile(path);
-                if (e.FileKey != 0)
-                    SaveOpenFile(e.FileKey, file, path != null && IsVirtualDisk(path));
-            }
-            else if (file != null && path != null)
-            {
+                file ??= new OpenFile(null);
                 file.Path = path;
-                if (IsVirtualDisk(path))
-                    SaveOpenFile(e.FileKey, file, isVirtual: true);
             }
         }
-        string virtualPath = virtualDisk && file?.Path is { } named && IsVirtualDisk(named) ? named : null;
+
+        string name = file?.Path;
+        bool isVirtual = attachment != null || name != null && IsVirtualDisk(name);
+        if (fileKey != 0 && file != null && attachment == null)
+        {
+            if (isVirtual)
+                RememberVirtualFile(fileKey, file);
+            else if (detail && observed == null)
+            {
+                // File opens with no completed reads or writes cannot evict these identities.
+                recentNames.Remove(fileKey);
+                observedFiles.Remember(fileKey, file);
+            }
+        }
+        QueueFileNameRundown(rundownOwner, e.TimeStampRelativeMSec, file);
+        string virtualPath = virtualDisk && isVirtual ? name : null;
         if (!detail && virtualPath == null)
             return;
         int pid = e.ProcessID;
