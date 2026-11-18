@@ -1,0 +1,21 @@
+:root { color-scheme: light dark; font: 15px/1.45 "Segoe UI", system-ui, sans-serif; color: CanvasText; background: Canvas; }
+* { box-sizing: border-box; }
+body { margin: 0; }
+main { max-width: 110rem; margin: auto; padding: clamp(.9rem, 3vw, 3rem); }
+h1 { font-size: clamp(1.5rem, 3vw, 2.4rem); letter-spacing: -.035em; margin: 0 0 .65rem; }
+h2 { font-size: 1.25rem; margin: .8rem 0; }
+button, input, select { font: inherit; padding: .35rem .55rem; border-radius: .3rem; border: 1px solid GrayText; background: Canvas; color: CanvasText; }
+button[aria-pressed="true"] { background: Highlight; color: HighlightText; }
+.sources, .toolbar, .summary { display: flex; flex-wrap: wrap; align-items: center; gap: .65rem 1.25rem; }
+.sources { list-style: none; padding: 0; font-size: .85rem; margin: 0 0 1.3rem; }
+.sources span { margin-left: .25rem; }
+.toolbar { border-block: 1px solid color-mix(in srgb, CanvasText 25%, Canvas); padding: .75rem 0; }
+.switch { display: flex; gap: .2rem; }
+.summary { justify-content: space-between; }
+.scroll { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; font-size: .9rem; }
+td, th { text-align: left; padding: .38rem .65rem; border-bottom: 1px solid color-mix(in srgb, CanvasText 15%, Canvas); }
+th { background: color-mix(in srgb, CanvasText 7%, Canvas); white-space: nowrap; font-weight: 600; }
+td.num, th.num { font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; }
+.path { overflow-wrap: anywhere; min-width: 15rem; }
+p { margin: .75rem 0; }

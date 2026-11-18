@@ -1,0 +1,96 @@
+@using Microsoft.AspNetCore.Components
+@using Microsoft.AspNetCore.Components.Web
+<main>
+    <header><h1>Cluster Performance Viewer</h1></header>
+    @if (Sources.Length == 0)
+    {
+        <p>Configure a live collector or replay file in the server’s Sources setting to see activity.</p>
+    }
+    else
+    {
+        <ul class="sources" aria-label="Collection status">
+            @foreach (var source in Sources)
+            {
+                <li><strong>@source.Name</strong> <span>@SourceStatus(source)</span></li>
+            }
+        </ul>
+        <div class="toolbar">
+            <div class="switch" aria-label="Resource">
+                <button aria-pressed="@cpu" @onclick="() => cpu = true">CPU</button>
+                <button aria-pressed="@(!cpu)" @onclick="() => cpu = false">Disk</button>
+            </div>
+            <label>Host <select aria-label="Host" @bind="host"><option value="">All hosts</option>
+                @foreach (var name in Sources.Select(s => s.Frame?.Host).OfType<string>().Distinct().Order())
+                { <option value="@name">@name</option> }
+            </select></label>
+            @if (!cpu)
+            {
+                <label>Group by <select aria-label="Group by" @bind="group"><option>Process</option><option>File</option></select></label>
+                <label>Sort by <select aria-label="Sort by" @bind="sort"><option>Total</option><option>Read</option><option>Write</option></select></label>
+            }
+            <label>Show <select aria-label="Show" @bind="limit"><option>20</option><option>50</option><option>100</option></select></label>
+            <label>Filter <input type="search" @bind="filter" @bind:event="oninput" /></label>
+        </div>
+        @if (cpu)
+        {
+            var rows = Frames.SelectMany(w => w.Cpu.Rows.Select(p => new
+            {
+                w.Host, p.Pid, p.Process, p.Cores, Percent = 100 * p.Cores / w.Cpu.LogicalProcessors
+            })).Where(r => Matches(r.Process)).OrderByDescending(r => r.Percent).Take(limit).ToArray();
+            <section><h2>CPU processes</h2><div class="scroll"><table>
+                <thead><tr><th>Process</th><th>PID</th><th>Host</th><th class="num">Cores</th><th class="num">Host CPU</th></tr></thead>
+                <tbody>@foreach (var row in rows)
+                { <tr><td>@row.Process</td><td>@row.Pid</td><td>@row.Host</td><td class="num">@row.Cores.ToString("N2")</td><td class="num">@row.Percent.ToString("N2")%</td></tr> }
+                </tbody>
+            </table></div>@if (rows.Length == 0) { <p>No matching CPU samples.</p> }</section>
+        }
+        else
+        {
+            var rows = DiskRows().ToArray();
+            <section><div class="summary"><h2>Disk @(group == "File" ? "paths" : "processes")</h2><span>@Rate(rows.Sum(x => x.Read + x.Write)) MiB/s across matching rows</span></div>
+            @foreach (var w in Frames.Where(w => w.DiskPaths.Status != null))
+            { <p role="status">@w.Host · @w.DiskPaths.Status</p> }
+            <div class="scroll"><table><thead><tr>
+                <th>Process</th><th>PID</th><th>Host</th>
+                @if (group == "File") { <th>Filename</th><th>Folder</th> }
+                <th class="num">Read MiB/s</th><th class="num">Write MiB/s</th><th class="num">Total MiB/s</th><th class="num">Read ops</th><th class="num">Write ops</th>
+            </tr></thead><tbody>@foreach (var r in rows.OrderByDescending(r => sort == "Read" ? r.Read : sort == "Write" ? r.Write : r.Read + r.Write).Take(limit))
+            { <tr><td>@r.Key.Process</td><td>@r.Key.Pid</td><td>@r.Host</td>
+                @if (group == "File") { <td>@(r.Key.Path.Length == 0 ? "Unresolved file path" : r.Key.Filename)</td><td class="path">@r.Key.Filepath</td> }
+                <td class="num">@Rate(r.Read)</td><td class="num">@Rate(r.Write)</td><td class="num">@Rate(r.Read + r.Write)</td><td class="num">@r.Totals.Reads.ToString("N0")</td><td class="num">@r.Totals.Writes.ToString("N0")</td>
+            </tr> }</tbody></table></div>@if (rows.Length == 0) { <p>No matching disk samples.</p> }</section>
+        }
+    }
+</main>
+
+@code {
+    [Parameter] public SourceWindow[] Sources { get; set; } = [];
+    private bool cpu = true;
+    private string host = "", filter = "", group = "Process", sort = "Total";
+    private int limit = 20;
+    private IEnumerable<PerformanceWindow> Frames => Sources.Where(s => s.Selected && (host.Length == 0 || host == s.Frame!.Host)).Select(s => s.Frame!);
+    private bool Matches(string value) => value.Contains(filter, StringComparison.OrdinalIgnoreCase);
+    private static string Rate(double value) => (value / 1048576).ToString("N2");
+    private static string SourceStatus(SourceWindow s)
+    {
+        if (s.Frame == null) return s.Status ?? "Waiting";
+        string label = s.Stale ? "Stale" : s.Replay ? "Replay" : "Live";
+        if (!s.Selected && !s.Stale) label = "Alternate source";
+        return $"{s.Frame.Host} · {label} · {s.Frame.CpuEnd:HH:mm:ss} UTC" + (s.Status != null && !s.Replay ? $" · {s.Status}" : "");
+    }
+    private sealed record DiskRow(string Host, FileIoKey Key, FileIoTotals Totals, double Read, double Write);
+    private IEnumerable<DiskRow> DiskRows()
+    {
+        foreach (var w in Frames)
+        {
+            var sample = w.DiskPaths;
+            if (sample.Seconds <= 0) continue;
+            foreach (var g in sample.Files.GroupBy(r => group == "File" ? r.File : r.File.ProcessKey))
+            {
+                if (!Matches(g.Key.Process) && !Matches(g.Key.Path)) continue;
+                var t = DiskIoMerge.Sum(g.Select(r => r.Totals));
+                yield return new DiskRow(w.Host, g.Key, t, t.ReadBytes / sample.Seconds, t.WriteBytes / sample.Seconds);
+            }
+        }
+    }
+}

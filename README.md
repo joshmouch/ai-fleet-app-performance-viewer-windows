@@ -8,6 +8,24 @@ Run the installed executable with `--collect` and redirect standard output to a 
 
 Frames carry the host, boot time when available, capture identity, sequence, separate measurement windows and path coverage. Disk paths use a rolling window and a blank path retains unmatched reads, writes and operation counts. Replace the previous disk frame when refreshing a ranking. The standalone stream currently covers host activity. The desktop also has interactive guest expansion.
 
+### Local web viewer
+
+Run `dotnet run --project Web/PerformanceViewer.Web.csproj` with .NET 10 and open `http://127.0.0.1:5217`. The Blazor server owns one reader per configured source across browser tabs. The CPU and Disk lists rank both Windows hosts together. Disk groups by process or filename, with separate read, write and total rates. Source status identifies old samples and offline collectors. A replay remains selectable after the last frame.
+
+In `Web/appsettings.json`, configure a local command, SSH command or replay file for each source. For example:
+
+```json
+{
+  "Sources": [
+    { "Name": "Local", "Command": "aifleet-performance-viewer.exe", "Arguments": ["--collect", "--disk", "0"] },
+    { "Name": "Remote", "Command": "ssh", "Arguments": ["-o", "BatchMode=yes", "windows-host", "aifleet-performance-viewer --collect --disk 0"] },
+    { "Name": "Recorded", "ReplayFile": "/path/to/windows.ndjson" }
+  ]
+}
+```
+
+The local command can be an absolute path to the published executable. The remote command runs in the configured SSH account and needs the same tracing permissions as a local viewer. If two healthy sources report the same host, their configuration order selects the active one. Stale live sources drop out of the ranking after `StaleAfterSeconds` (default 30).
+
 - **CPU** and **Disk** share a bottom details pane, a search field, guest selection, and ranking options. Details start open and all discovered guests start checked. Search filters the sampled rows before ranking them.
 - CPU and Disk use the same overview layout, with current readings at left and their history at right. Keep formatting changes aligned across both views.
 - **Settings → Usage band %** starts at 10. Enter a whole percent from 1 to 100, or clear it to return to **Top rows** and optional machine grouping. CPU bands use sampled host-equivalent CPU time. Disk bands use captured bytes in the selected scope. Each row stays in the band where its cumulative share starts, so a large row can span several bands. The denominator includes unattributed usage. Band headers sum the displayed rows' numeric metrics, excluding PIDs. Guest busy percentages add the individual guest shares in that band.
