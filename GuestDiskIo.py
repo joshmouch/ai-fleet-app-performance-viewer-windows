@@ -419,7 +419,7 @@ def main():
                 errors.update((slot, str(error)) for slot in devices)
         if not samples:
             time.sleep(SECONDS)  # nothing traced this run: pace the loop as a run would
-        line = json.dumps({"Samples": samples, "Errors": {slot: "Guest disk I/O: " + reason for slot, reason in errors.items()}},
+        line = json.dumps({"End": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "Samples": samples, "Errors": {slot: "Guest disk I/O: " + reason for slot, reason in errors.items()}},
                           separators=(",", ":"))
         sys.stdout.write(line + "\n")
         sys.stdout.flush()

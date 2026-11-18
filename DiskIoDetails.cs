@@ -844,11 +844,7 @@ internal sealed class GuestIoWatch : IDisposable
             diskWrite += sample.DiskWriteBytes;
             limited |= sample.Limited;
             foreach (var row in sample.Rows)
-            {
-                var key = new FileIoKey(row.Pid, row.Process, row.Path);
-                FileIoTotals.AddTo(paths, key, new FileIoTotals { ReadBytes = row.ReadBytes, WriteBytes = row.WriteBytes,
-                    Reads = row.Reads, Writes = row.Writes });
-            }
+                row.AddTo(paths);
         }
         foreach (var entry in paths)
             FileIoTotals.AddTo(processes, entry.Key.ProcessKey, entry.Value);

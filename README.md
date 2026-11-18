@@ -73,3 +73,18 @@ winget install OpenAgency.AIFleet.PerformanceViewer
 ```
 
 Released under the MIT License.
+
+### Linux guest file activity in the web viewer
+
+Add a guest to the web host's existing `Sources` array alongside its Mac or Windows collector. Set `GuestOf` to the host name emitted by that collector, and `Name` to the guest name. For example, for an OrbStack guest:
+
+```json
+{
+  "Name": "kube-worker-3",
+  "GuestOf": "josh-mac",
+  "Command": "orb",
+  "Arguments": ["-m", "kube-worker-3", "-u", "root", "python3", "-", "loop", "root"]
+}
+```
+
+The server sends its bundled Linux sampler to the command over stdin. The same source can run over SSH with a remote Python interpreter that can attach the filesystem probes. In Disk, select **File** and sort by **Guest total**, **Guest read**, or **Guest write**. Host impact and guest file activity have separate totals. A guest using a shared backing device has no individually measured host share, shown as a dash. Deselect the guest to hide its rows.
