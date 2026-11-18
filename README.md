@@ -16,6 +16,10 @@ The exporter preserves each window identity and includes unresolved files in the
 
 ### Local web viewer
 
+The browser and MAUI shell can show CPU and disk timelines from a Prometheus-compatible HTTP API. Set `MetricHistory` on the web server with the server base `Endpoint`, a `CpuRatio` range expression returning busy fractions, and `DiskReadBytesPerSecond` and `DiskWriteBytesPerSecond` expressions returning byte rates. Each result label set has its own series. Process and file rows continue to use their own measured windows.
+
+For example, Fleet's existing recording rules are `fleet:host_cpu_busy:ratio`, `fleet:host_disk_read:bytes_per_second` and `fleet:host_disk_write:bytes_per_second`. Standalone installations can supply their own expressions. The defaults are `RangeSeconds=600` and `StepSeconds=10`. VictoriaMetrics supports an optional `LatencyOffsetSeconds`; omit it for Prometheus. `BearerTokenEnvironment` optionally names a server-side credential. Queries are shared per resource and step across connected clients.
+
 Run `dotnet run --project Web/PerformanceViewer.Web.csproj` with .NET 10 and open `http://127.0.0.1:5217`. The Blazor server owns one reader per configured source across browser tabs. The CPU and Disk lists rank both Windows hosts together. Disk groups by process or filename, with separate read, write and total rates. Source status identifies old samples and offline collectors. A replay remains selectable after the last frame.
 
 In `Web/appsettings.json`, configure a local command, SSH command or replay file for each source. For example:

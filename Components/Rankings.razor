@@ -6,8 +6,7 @@
     {
         <p>Configure a live collector or replay file in the server’s Sources setting to see activity.</p>
     }
-    else
-    {
+    <div>
         <ul class="sources" aria-label="Collection status">
             @foreach (var source in Sources)
             {
@@ -31,6 +30,7 @@
             <label>Show <select aria-label="Show" @bind="limit"><option>20</option><option>50</option><option>100</option></select></label>
             <label>Filter <input type="search" @bind="filter" @bind:event="oninput" /></label>
         </div>
+        <ResourceHistory @key="cpu" Disk="@(!cpu)" />
         @if (Frames.Any(w => w.Guests != null))
         {
             <div class="toolbar" aria-label="Guest expansion">
@@ -93,7 +93,7 @@
                 <td class="num">@Rate(r.Read)</td><td class="num">@Rate(r.Write)</td><td class="num">@Rate(r.Read + r.Write)</td><td class="num">@r.Totals.Reads.ToString("N0")</td><td class="num">@r.Totals.Writes.ToString("N0")</td>
             </tr> }</tbody></table></div>@if (rows.Length == 0) { <p>No matching disk samples.</p> }</section>
         }
-    }
+    </div>
 </main>
 
 @code {
