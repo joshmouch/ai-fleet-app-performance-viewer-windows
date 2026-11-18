@@ -14,6 +14,23 @@ var window = new PerformanceWindow(PerformanceWindow.CurrentSchema, host, time.A
         raw.Select(pair => new MeasuredFile(pair.Key, pair.Value)).ToArray()));
 var encoded = window.Encode();
 var decoded = PerformanceWindow.Decode(encoded);
+var payload = FileWindowExport.Encode(decoded);
+Check(payload.SequenceEqual(FileWindowExport.Encode(decoded)), "a retried window keeps the same OTLP bytes");
+using var envelope = System.Text.Json.JsonDocument.Parse(payload);
+var record = envelope.RootElement.GetProperty("resourceLogs")[0].GetProperty("scopeLogs")[0].GetProperty("logRecords")[0];
+using var exported = System.Text.Json.JsonDocument.Parse(record.GetProperty("body").GetProperty("stringValue").GetString());
+var stored = exported.RootElement;
+var files = stored.GetProperty("rows").EnumerateArray().ToArray();
+Check(stored.GetProperty("scope").GetString() == "disk:2" && stored.GetProperty("capture").GetGuid() == window.Capture, "stored disk identity");
+Check(files.Sum(r => r.GetProperty("readBytes").GetInt64()) == 1054 && files.Sum(r => r.GetProperty("writeBytes").GetInt64()) == 2028 &&
+    files.Sum(r => r.GetProperty("readOps").GetInt64()) == 9 && files.Sum(r => r.GetProperty("writeOps").GetInt64()) == 22,
+    "stored counters preserve the unresolved row");
+try
+{
+    FileWindowExport.Encode(window with { DiskPaths = window.DiskPaths with { CapturedBytes = 3083 } });
+    throw new Exception("Inconsistent coverage was exported.");
+}
+catch (InvalidDataException) { }
 Check(decoded.Encode() == encoded && decoded.DiskPaths.Files.Length == 2, "wire round-trip");
 Check(decoded.Cpu.Rows[0].Started != decoded.Cpu.Rows[1].Started, "process incarnation");
 Check(decoded.DiskPaths.Totals().TotalBytes == decoded.DiskPaths.CapturedBytes, "physical bytes");
