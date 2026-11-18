@@ -67,6 +67,18 @@ try
     throw new Exception("Unsupported window accepted.");
 }
 catch (InvalidDataException) { }
+
+var historical = StoredFileWindow.Decode(stored.GetRawText());
+Check(historical.Encode() == stored.GetRawText(), "file history keeps the original OTLP body on replay");
+Check(historical.DurationSeconds() == 58.5 && historical.Host == host && historical.NamedBytes == 3004 &&
+    DiskIoMerge.Sum(historical.Rows.Select(r => r.ToDiskRow(host).Totals)).Equals(window.DiskPaths.Totals()),
+    "history preserves the measured interval, coverage and four directional counters");
+
+var starting = new DiskPathWindow(time, 0, 2, "Starting Windows file I/O trace...", 0, 0, 0, 0, []);
+Check(FileWindowExport.IsCollectionStatus(starting), "a startup status has no measured disk interval");
+Check(!FileWindowExport.IsCollectionStatus(starting with { Seconds = 5 }), "a measured idle window is exportable");
+Check(!FileWindowExport.IsCollectionStatus(starting with { EventsLost = 1 }), "event losses cannot be skipped as startup");
+Check(!FileWindowExport.IsCollectionStatus(starting with { Files = window.DiskPaths.Files }), "rows cannot be skipped as startup");
 Console.WriteLine("Passed sample replay, process identities, scope and directional guest accounting.");
 
 static void Check(bool condition, string name)

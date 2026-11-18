@@ -1,44 +1,69 @@
-# Optional macOS physical I/O collector
+# macOS host CPU and physical I/O stream
 
-Standalone .NET 10 console project; no Windows collector or service changes. It references
-`../Core/PerformanceWindow.cs` through the Core project and emits one finite JSONL window.
+Build with .NET 10. This standalone console app uses the shared Core window contract.
 
-```
-dotnet run --project MacCollector -- PID 4
-dotnet run --project MacCollector -- --check
-python3 MacCollector/live_check.py
-```
+~~~sh
+dotnet build MacCollector
+dotnet MacCollector/bin/Debug/net10.0/MacCollector.dll --host --interval 2
+dotnet MacCollector/bin/Debug/net10.0/MacCollector.dll --host --interval 2 --duration 14
+dotnet MacCollector/bin/Debug/net10.0/MacCollector.dll --pid 123 --duration 4
+dotnet MacCollector/bin/Debug/net10.0/MacCollector.dll --check
+~~~
 
-Build first before the live check. Run as the observing account with noninteractive sudo
-permission for `/usr/bin/fs_usage`. The collector invokes `sudo -n`: it never prompts or
-changes authorization. Failure returns nonzero. Shell invocations use the environment's
-bounded execution owner (`with-limits`). Capture output may contain private file paths;
-keep real windows private. The committed parser fixtures are synthetic.
+Host mode (also the default) launches exactly one unfiltered
+sudo -n fs_usage -w -f diskio capture. One capture GUID and increasing sequences identify
+nonoverlapping, actual-elapsed windows. No PID or process-name filter is required.
+No duration means stream until SIGINT/SIGTERM. The caller owns supervision.
+Run shell operations through the environment's bounded execution owner. The collector
+never prompts or changes sudo authorization. stdout contains private paths: keep it private.
 
-`fs_usage -w -f diskio -t SECONDS PID` is the physical observation source. Its command
-suffix is a thread ID. `proc_pidinfo(PROC_PIDLISTTHREADIDS=28)` maps observed threads to the
-selected PID; process start time fences PID reuse. Unresolved threads are keyless, not
-guessed from a command name. A process exit/replacement discards attributed rows and
-marks identity loss. Metadata and device-only records are keyless, not file data.
-Preserve path text exactly: fs_usage may omit the leading slash or supply only a
-basename. Never invent its directory. Same-named files can coalesce within one process.
+Configure the existing Web Sources command as dotnet with Arguments pointing to the
+collector DLL, --host, --interval, 2. The same shared file/process rankings consume it,
+replacing each host's preceding window. Do not sum latest rolling Windows windows.
+This collector's windows are disjoint intervals.
 
-The four file counters are physical data bytes and completion records in each direction,
-not application read/write calls. Cache hits create no physical data record. APFS,
-compression, readahead and delayed writeback prevent equality to logical bytes. Kernel
-writeback and short-lived uncensused threads may remain unattributed. Device identifiers
-are parsed but no integer Windows disk index is invented. Boot is unknown; CPU is
-unmeasured (zero placeholder explicitly labeled in status). Each invocation is a new
-capture, sequence 1; use actual elapsed seconds, not a rolling sum.
+Process probe mode requires --pid and emits diskPaths.scope=process:PID. It is excluded
+from the shared viewer's host aggregation and the exporter refuses it. The positional
+form `PID SECONDS` returns one disk window. Host is explicit diskPaths.scope=host; existing producers default
+to that scope for wire compatibility.
 
-Coverage is always partial, even with zero loss notices. `capturedBytes = namedBytes +
-keylessBytes` for parsed records. Unrecognized physical rows flag error. stderr or a
-nonzero trace exit flags error. `eventsLost` counts loss notices, a lower bound;
-the actual lost-event count is unknown, as status states. Empty-path PID-zero rows
-carry unattributed physical counters (including metadata), so rows reconcile with
-coverage and pass the existing file-window exporter. No private traces are fixtures.
+## Ownership, accounting and coverage
 
-The live check uses a temporary random-data file, verifies uncached reads, flushed writes,
-warmed cache reads, process identity and coverage accounting, and prints only aggregates.
-The platform-independent `--check` covers all four counters, spaces in paths, thread/PID
-confusion, identity fencing, metadata, malformed rows, loss and JSON contract roundtrip.
+fs_usage suffixes are kernel thread IDs, not PIDs. A periodic process census reads
+proc_pidinfo(PROC_PIDLISTTHREADIDS=28); flavor 6 returns incompatible user handles.
+Known kernel thread IDs retain their process identity for ten seconds after last census
+visibility to cover delayed completions. Process exit never clears parsed rows.
+Inaccessible, newly born/short-lived or expired thread identities remain PID-zero unknown
+rows. No guessing from command names. Process names come from the census, not trace text.
+
+Every parsed data/metadata completion contributes all four directional counters.
+Unresolved ownership appears as PID zero. Data records retain a supplied filename even
+when ownership is unavailable. Metadata/device-only records use empty paths and retain
+read/write bytes and operations. Data records preserve fs_usage path text
+(including omitted leading slash or basename-only ambiguity). Captured bytes reconcile
+with all rows; named plus keyless equals captured. File rankings show physical data;
+process/unknown totals can include metadata. Completions are not logical application calls.
+
+Coverage is always partial: census permission failures, tracing loss, caches, APFS,
+compression, writeback, and unidentified completions prevent a complete application-I/O
+claim. Cache hits have no physical record. eventsLost is a count of loss notices, not a
+precise event loss estimate. Malformed recognized physical rows flag error. stderr/nonzero
+native exit flags error. Shutdown drains parsed pipe completions. No records are discarded
+because a process exited.
+
+Host CPU rankings use changes in per-process processor time, matched by PID and start time across consecutive samples.
+One core means one second of CPU work per second of elapsed time. The viewer divides by the logical processor count
+to show the percentage of host capacity. Processes that exit between samples can be absent. A PID-scoped disk probe
+emits an empty CPU sample.
+
+## Focused acceptance
+
+Publish Web with `dotnet publish Web -c Release`, then run python3 MacCollector/live_check.py on macOS. It starts the actual
+shared Web viewer with one host collector; two known simultaneous readers/writers plus
+an independent background worker exercise it. It verifies consecutive host windows,
+constant capture identity, all four worker counters, background/unknown coverage,
+row reconciliation, and the browser ranking of a busy worker against its independently measured CPU time. It prints aggregates
+only and keeps real filenames in memory. Synthetic --check cases exercise loss/error,
+PID-vs-thread confusion, accounting retention and process-scope export refusal.
+PR 36 owns stored history; preserve the same host-scope admission when converting frames
+to StoredFileWindow so process probes cannot enter host history.

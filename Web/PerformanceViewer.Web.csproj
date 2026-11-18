@@ -5,6 +5,7 @@
     <Nullable>enable</Nullable>
   </PropertyGroup>
   <ItemGroup>
+    <EmbeddedResource Include="../GuestDiskIo.py" LogicalName="GuestDiskIo.py" />
     <ProjectReference Include="../Components/PerformanceViewer.Components.csproj" />
   </ItemGroup>
 </Project>

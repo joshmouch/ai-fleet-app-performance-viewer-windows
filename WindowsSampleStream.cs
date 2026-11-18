@@ -16,10 +16,16 @@ internal static class WindowsSampleStream
         int interval = 10;
         int? disk = null, count = null;
         bool collectGuests = false;
+        string archiveDirectory = null;
         for (int i = 0; i < args.Length; i++)
         {
             string option = args[i];
             if (option == "--guests") { collectGuests = true; continue; }
+            if (option == "--archive" && i + 1 < args.Length && !string.IsNullOrWhiteSpace(args[i + 1]) && !args[i + 1].StartsWith("--"))
+            {
+                archiveDirectory = args[++i];
+                continue;
+            }
             if (++i >= args.Length || !int.TryParse(args[i], NumberStyles.None,
                 CultureInfo.InvariantCulture, out int value))
                 return Usage();
@@ -37,6 +43,7 @@ internal static class WindowsSampleStream
         Console.CancelKeyPress += cancel;
         try
         {
+            await using var archive = archiveDirectory == null ? null : new FileWindowArchive(archiveDirectory, stop.Token);
             var index = new VolumePathIndex(Array.Empty<DiskVolume>());
             try
             {
@@ -66,13 +73,15 @@ internal static class WindowsSampleStream
                 var frame = new PerformanceWindow(PerformanceWindow.CurrentSchema, Environment.MachineName, boot,
                     captureId, sequence, cpu.End.Value, cpu, pathWindow,
                     guestSamples == null ? null : await guestSamples.Read(paths, duration));
+                archive?.Record(frame);
                 await output.WriteLineAsync(frame.Encode());
                 await output.FlushAsync();
             }
+            if (archive != null) await archive.FinishAsync();
             return 0;
         }
         catch (OperationCanceledException) when (stop.IsCancellationRequested) { return 0; }
-        catch (Exception ex) when (ex is IOException or Win32Exception or UnauthorizedAccessException)
+        catch (Exception ex) when (ex is IOException or Win32Exception or UnauthorizedAccessException or InvalidDataException or FormatException)
         {
             Console.Error.WriteLine(ex.Message);
             return 1;
@@ -97,7 +106,7 @@ internal static class WindowsSampleStream
 
     private static int Usage()
     {
-        Console.Error.WriteLine("Usage: --collect [--guests] [--interval SECONDS] [--disk NUMBER] [--count WINDOWS]");
+        Console.Error.WriteLine("Usage: --collect [--guests] [--archive DIRECTORY] [--interval SECONDS] [--disk NUMBER] [--count WINDOWS]");
         return 2;
     }
 }

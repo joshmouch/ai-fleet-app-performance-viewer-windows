@@ -1,0 +1,79 @@
+@using System.Globalization
+@using Microsoft.AspNetCore.Components
+@using Microsoft.AspNetCore.Components.Web
+@implements IDisposable
+@inject IFileHistory History
+
+@if (sources.Length > 0)
+{
+    <div class="toolbar">
+        <label>Disk source
+            <select aria-label="Disk source" value="@source" @onchange="Choose">
+                <option value="">Live</option>
+                @foreach (var name in sources) { <option value="@name">@name</option> }
+            </select>
+        </label>
+        @if (source.Length > 0)
+        {
+            <label>Window ending at or before (UTC)
+                <input aria-label="Window ending at or before (UTC)" type="datetime-local" step="1" value="@time" @onchange="e => time = e.Value?.ToString()" />
+            </label>
+            <button @onclick="Load">Load window</button>
+        }
+    </div>
+}
+@if (message != null) { <p role="status">@message</p> }
+
+@code {
+    [Parameter] public EventCallback<HistorySelection> Changed { get; set; }
+    private string[] sources = [];
+    private string source = "";
+    private string? time = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss", CultureInfo.InvariantCulture);
+    private string? message;
+    private readonly CancellationTokenSource lifetime = new();
+    private CancellationTokenSource? pending;
+
+    protected override async Task OnInitializedAsync()
+    {
+        try { sources = await History.SourcesAsync(lifetime.Token); }
+        catch (OperationCanceledException) when (lifetime.IsCancellationRequested) { }
+        catch (HttpRequestException) { message = "Disk history sources unavailable."; }
+    }
+
+    private async Task Choose(ChangeEventArgs e)
+    {
+        source = e.Value?.ToString() ?? "";
+        if (source.Length > 0) { await Load(); return; }
+        pending?.Cancel();
+        message = null;
+        await Changed.InvokeAsync(new(false, null));
+    }
+
+    private async Task Load()
+    {
+        pending?.Cancel();
+        using var token = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
+        pending = token;
+        try
+        {
+            await Changed.InvokeAsync(new(true, null));
+            if (!DateTimeOffset.TryParse(time, CultureInfo.InvariantCulture,
+                DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var at))
+            { message = "Enter a valid UTC date and time."; return; }
+            message = "Loading disk history…";
+            var result = await History.ReadAsync(source, at, token.Token);
+            if (token.IsCancellationRequested) return;
+            message = result == null ? "No stored window in the configured lookback period." : null;
+            await Changed.InvokeAsync(new(true, result));
+        }
+        catch (OperationCanceledException) when (token.IsCancellationRequested) { }
+        catch (Exception ex) when (ex is HttpRequestException or IOException or InvalidDataException or FormatException or
+            System.Text.Json.JsonException or OverflowException or KeyNotFoundException or OperationCanceledException or ArgumentException)
+        {
+            if (!token.IsCancellationRequested) message = ex is InvalidDataException ? ex.Message : "Disk history request failed.";
+        }
+        finally { if (pending == token) pending = null; }
+    }
+
+    public void Dispose() { lifetime.Cancel(); lifetime.Dispose(); }
+}
