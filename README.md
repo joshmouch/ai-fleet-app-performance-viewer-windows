@@ -26,6 +26,10 @@ In `Web/appsettings.json`, configure a local command, SSH command or replay file
 
 The local command can be an absolute path to the published executable. The remote command runs in the configured SSH account and needs the same tracing permissions as a local viewer. If two healthy sources report the same host, their configuration order selects the active one. Stale live sources drop out of the ranking after `StaleAfterSeconds` (default 30).
 
+### Optional native desktop window
+
+`Native/PerformanceViewer.Native.csproj` hosts the same Razor rankings in a .NET MAUI BlazorWebView on Windows and macOS. The running local web service owns all sampling. Browser tabs and the native window share its capture identities and keep their own filters. The shell connects to loopback port 5217 or the port specified by the `ViewerPort` environment variable. It reconnects automatically after a service restart. Unchanged snapshots return HTTP 304.
+
 - **CPU** and **Disk** share a bottom details pane, a search field, guest selection, and ranking options. Details start open and all discovered guests start checked. Search filters the sampled rows before ranking them.
 - CPU and Disk use the same overview layout, with current readings at left and their history at right. Keep formatting changes aligned across both views.
 - **Settings → Usage band %** starts at 10. Enter a whole percent from 1 to 100, or clear it to return to **Top rows** and optional machine grouping. CPU bands use sampled host-equivalent CPU time. Disk bands use captured bytes in the selected scope. Each row stays in the band where its cumulative share starts, so a large row can span several bands. The denominator includes unattributed usage. Band headers sum the displayed rows' numeric metrics, excluding PIDs. Guest busy percentages add the individual guest shares in that band.

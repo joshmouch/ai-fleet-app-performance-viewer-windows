@@ -9,7 +9,7 @@
     private readonly CancellationTokenSource stop = new();
     private Task? refresh;
 
-    protected override void OnInitialized() => windows = Sources.Read();
+    protected override void OnInitialized() => windows = Sources.Read().Windows;
 
     protected override void OnAfterRender(bool firstRender)
     {
@@ -24,8 +24,8 @@
             while (await timer.WaitForNextTickAsync(stop.Token))
                 await InvokeAsync(() =>
                 {
-                    var current = Sources.Read();
-                    if (windows.SequenceEqual(current)) return;
+                    var current = Sources.Read().Windows;
+                    if (ReferenceEquals(windows, current)) return;
                     windows = current;
                     StateHasChanged();
                 });

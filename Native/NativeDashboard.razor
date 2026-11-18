@@ -1,0 +1,64 @@
+@using PerformanceViewer.Components
+@using System.Net
+@using System.Net.Http.Headers
+@using System.Text.Json
+@implements IAsyncDisposable
+@inject HttpClient Client
+
+@if (error != null) { <p role="status">@error</p> }
+@if (windows != null) { <Rankings Sources="windows" /> }
+
+@code {
+    private SourceWindow[]? windows;
+    private string? error = "Connecting to the local viewer…";
+    private readonly CancellationTokenSource stop = new();
+    private EntityTagHeaderValue? tag;
+    private Task? reader;
+
+    protected override void OnInitialized() => reader = Read();
+
+    private async Task Read()
+    {
+        using var timer = new PeriodicTimer(TimeSpan.FromSeconds(2));
+        try
+        {
+            do
+            {
+                try
+                {
+                    using var request = new HttpRequestMessage(HttpMethod.Get, "api/windows");
+                    if (tag != null) request.Headers.IfNoneMatch.Add(tag);
+                    using var response = await Client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, stop.Token);
+                    if (response.StatusCode == HttpStatusCode.NotModified) continue;
+                    response.EnsureSuccessStatusCode();
+                    using var content = await response.Content.ReadAsStreamAsync(stop.Token);
+                    windows = await JsonSerializer.DeserializeAsync(content, NativeJson.Default.SourceWindowArray, stop.Token)
+                        ?? throw new JsonException("Empty source response.");
+                    tag = response.Headers.ETag;
+                    error = null;
+                    StateHasChanged();
+                }
+                catch (Exception e) when (e is HttpRequestException or JsonException or IOException ||
+                    e is OperationCanceledException && !stop.IsCancellationRequested)
+                {
+                    string message = $"Waiting for the local viewer service at {Client.BaseAddress} ({e.Message})";
+                    if (error != message)
+                    {
+                        tag = null;
+                        windows = null;
+                        error = message;
+                        StateHasChanged();
+                    }
+                }
+            } while (await timer.WaitForNextTickAsync(stop.Token));
+        }
+        catch (OperationCanceledException) when (stop.IsCancellationRequested) { }
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        stop.Cancel();
+        if (reader != null) await reader;
+        stop.Dispose();
+    }
+}

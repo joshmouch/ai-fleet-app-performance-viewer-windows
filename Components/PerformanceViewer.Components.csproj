@@ -5,7 +5,7 @@
     <Nullable>enable</Nullable>
   </PropertyGroup>
   <ItemGroup>
-    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <PackageReference Include="Microsoft.AspNetCore.Components.Web" Version="10.0.14" />
     <ProjectReference Include="../Core/PerformanceViewer.Core.csproj" />
   </ItemGroup>
 </Project>
