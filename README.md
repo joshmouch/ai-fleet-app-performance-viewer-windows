@@ -16,6 +16,8 @@ The exporter preserves each window identity and includes unresolved files in the
 
 ### Local web viewer
 
+For live UI development, run `dotnet watch --project Web/PerformanceViewer.Web.csproj` in the Development environment. Supported edits to the shared Razor rankings appear in the open browser while the server and its collectors keep running. Edits to startup configuration can require a restart. For the Windows MAUI shell, start its Debug project with the Visual Studio debugger to use .NET Hot Reload for supported edits. Published desktop executables pick up code changes when the new release launches.
+
 Run `dotnet run --project Web/PerformanceViewer.Web.csproj` with .NET 10 and open `http://127.0.0.1:5217`. The Blazor server owns one reader per configured source across browser tabs. The CPU and Disk lists rank both Windows hosts together. Disk groups by process or filename, with separate read, write and total rates. Source status identifies old samples and offline collectors. A replay remains selectable after the last frame.
 
 In `Web/appsettings.json`, configure a local command, SSH command or replay file for each source. For example:

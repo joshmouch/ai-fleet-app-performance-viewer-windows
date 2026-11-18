@@ -6,7 +6,13 @@ builder.WebHost.UseUrls($"http://127.0.0.1:{port}");
 builder.Configuration["AllowedHosts"] = "localhost;127.0.0.1";
 builder.Services.AddRazorComponents().AddInteractiveServerComponents();
 builder.Services.AddSingleton<WindowSources>();
-builder.Services.AddResponseCompression();
+builder.Services.AddResponseCompression(options =>
+{
+    // dotnet watch injects its browser refresh script into the development HTML response.
+    if (builder.Environment.IsDevelopment())
+        options.MimeTypes = Microsoft.AspNetCore.ResponseCompression.ResponseCompressionDefaults.MimeTypes
+            .Where(type => !type.Equals("text/html", StringComparison.OrdinalIgnoreCase));
+});
 builder.Services.AddHostedService(services => services.GetRequiredService<WindowSources>());
 var app = builder.Build();
 app.UseResponseCompression();
