@@ -15,6 +15,11 @@ var window = new PerformanceWindow(PerformanceWindow.CurrentSchema, host, time.A
 var encoded = window.Encode();
 var decoded = PerformanceWindow.Decode(encoded);
 var payload = FileWindowExport.Encode(decoded);
+var starting = new DiskPathWindow(time, 0, 2, "Starting Windows file I/O trace...", 0, 0, 0, 0, []);
+Check(FileWindowExport.IsCollectionStatus(starting), "a startup status has no measured disk interval");
+Check(!FileWindowExport.IsCollectionStatus(starting with { Seconds = 5 }), "a measured idle window is exportable");
+Check(!FileWindowExport.IsCollectionStatus(starting with { EventsLost = 1 }), "event losses cannot be skipped as startup");
+Check(!FileWindowExport.IsCollectionStatus(starting with { Files = window.DiskPaths.Files }), "rows cannot be skipped as startup");
 Check(payload.SequenceEqual(FileWindowExport.Encode(decoded)), "a retried window keeps the same OTLP bytes");
 using var envelope = System.Text.Json.JsonDocument.Parse(payload);
 var record = envelope.RootElement.GetProperty("resourceLogs")[0].GetProperty("scopeLogs")[0].GetProperty("logRecords")[0];

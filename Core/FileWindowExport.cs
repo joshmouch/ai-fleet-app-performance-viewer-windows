@@ -5,6 +5,10 @@ using System.Text.Json;
 
 public static class FileWindowExport
 {
+    public static bool IsCollectionStatus(DiskPathWindow disk) =>
+        disk.Seconds == 0 && !string.IsNullOrWhiteSpace(disk.Status) && disk.Files.Length == 0
+        && disk.CapturedBytes == 0 && disk.NamedBytes == 0 && disk.KeylessBytes == 0 && disk.EventsLost == 0;
+
     public static byte[] Encode(PerformanceWindow window)
     {
         var disk = window.DiskPaths;
@@ -52,8 +56,8 @@ public static class FileWindowExport
 
     public static async Task<int> Run(string[] args)
     {
-        if (args.Length > 1 || !Uri.TryCreate(Environment.GetEnvironmentVariable("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT"), UriKind.Absolute, out var endpoint)
-            || !(endpoint.Scheme == "https" || endpoint.Scheme == "http"))
+        var endpoint = ConfiguredEndpoint();
+        if (args.Length > 1 || endpoint == null)
         {
             Console.Error.WriteLine("Set OTEL_EXPORTER_OTLP_LOGS_ENDPOINT to the HTTP logs URL. Supply one NDJSON file or pipe collector windows to stdin.");
             return 2;
@@ -64,29 +68,19 @@ public static class FileWindowExport
         long lineNumber = 0;
         try
         {
-            using var client = new HttpClient(new HttpClientHandler { AllowAutoRedirect = false });
-            var headers = Environment.GetEnvironmentVariable("OTEL_EXPORTER_OTLP_LOGS_HEADERS")
-                ?? Environment.GetEnvironmentVariable("OTEL_EXPORTER_OTLP_HEADERS") ?? "";
-            foreach (var header in headers.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
-            {
-                var parts = header.Split('=', 2);
-                if (parts.Length != 2) throw new InvalidDataException("Malformed OTLP header setting.");
-                try { client.DefaultRequestHeaders.Add(parts[0], Uri.UnescapeDataString(parts[1])); }
-                catch (Exception e) when (e is FormatException or InvalidOperationException)
-                {
-                    throw new InvalidDataException("Invalid OTLP request header.");
-                }
-            }
+            using var client = OpenReceiver(endpoint);
             using var file = args.Length == 1 ? File.OpenText(args[0]) : null;
             var input = file ?? Console.In;
             while (await input.ReadLineAsync(cancel.Token) is string line)
             {
                 lineNumber++;
-                var bytes = Encode(PerformanceWindow.Decode(line));
-                using var buffer = new MemoryStream();
-                using (var gzip = new GZipStream(buffer, CompressionLevel.Fastest, leaveOpen: true))
-                    gzip.Write(bytes);
-                await Send(client, endpoint, buffer.ToArray(), cancel.Token);
+                var frame = PerformanceWindow.Decode(line);
+                if (IsCollectionStatus(frame.DiskPaths))
+                {
+                    Console.Error.WriteLine(frame.DiskPaths.Status);
+                    continue;
+                }
+                await Send(client, Compress(frame), cancel.Token);
             }
             return 0;
         }
@@ -100,7 +94,42 @@ public static class FileWindowExport
         finally { Console.CancelKeyPress -= onCancel; }
     }
 
-    private static async Task Send(HttpClient client, Uri endpoint, byte[] bytes, CancellationToken stop)
+    private static Uri ConfiguredEndpoint() =>
+        Uri.TryCreate(Environment.GetEnvironmentVariable("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT"), UriKind.Absolute, out var endpoint)
+            && endpoint.Scheme is "http" or "https" ? endpoint : null;
+
+    internal static HttpClient OpenReceiver(Uri endpoint = null)
+    {
+        endpoint ??= ConfiguredEndpoint();
+        if (endpoint == null)
+            throw new InvalidDataException("Set OTEL_EXPORTER_OTLP_LOGS_ENDPOINT to the HTTP logs URL.");
+        var client = new HttpClient(new HttpClientHandler { AllowAutoRedirect = false }) { BaseAddress = endpoint };
+        try
+        {
+            var headers = Environment.GetEnvironmentVariable("OTEL_EXPORTER_OTLP_LOGS_HEADERS")
+                ?? Environment.GetEnvironmentVariable("OTEL_EXPORTER_OTLP_HEADERS") ?? "";
+            foreach (var header in headers.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            {
+                var parts = header.Split('=', 2);
+                if (parts.Length != 2) throw new InvalidDataException("Malformed OTLP header setting.");
+                try { client.DefaultRequestHeaders.Add(parts[0], Uri.UnescapeDataString(parts[1])); }
+                catch (Exception e) when (e is FormatException or InvalidOperationException)
+                { throw new InvalidDataException("Invalid OTLP request header."); }
+            }
+            return client;
+        }
+        catch { client.Dispose(); throw; }
+    }
+
+    internal static byte[] Compress(PerformanceWindow window)
+    {
+        using var buffer = new MemoryStream();
+        using (var gzip = new GZipStream(buffer, CompressionLevel.Fastest, leaveOpen: true))
+            gzip.Write(Encode(window));
+        return buffer.ToArray();
+    }
+
+    internal static async Task Send(HttpClient client, byte[] bytes, CancellationToken stop)
     {
         for (int attempt = 0; ; attempt++)
         {
@@ -110,7 +139,7 @@ public static class FileWindowExport
             content.Headers.ContentEncoding.Add("gzip");
             try
             {
-                using var reply = await client.PostAsync(endpoint, content, stop);
+                using var reply = await client.PostAsync(client.BaseAddress, content, stop);
                 if (reply.IsSuccessStatusCode)
                 {
                     using var json = JsonDocument.Parse(await reply.Content.ReadAsStreamAsync(stop));

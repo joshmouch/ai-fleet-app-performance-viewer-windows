@@ -14,6 +14,10 @@ The Windows executable accepts `--export [windows.ndjson]`. The portable .NET en
 
 The exporter preserves each window identity and includes unresolved files in the read/write byte and operation totals. It checks coverage before sending, compresses requests and retries transient failures. A failed input line is reported on standard error and the command exits unsuccessfully. Replaying the original file sends the same identities. The local viewer runs independently of export.
 
+To archive a running Windows source, add `--archive DIRECTORY` to its `--collect` arguments and set the same OTLP logs endpoint in the collector environment. A browser or desktop client can continue reading the same live stream. Each completed window is written to the local directory before publication. A background sender moves acknowledged compressed OTLP requests from `pending` to `delivered/yyyyMMdd`. Restarting collection with the same directory resumes pending deliveries, preserving their original capture IDs and counts. Use one directory per collector and provision storage for the retained files. A finite `--count` run waits for delivery and reports a failed delivery through its exit status.
+
+During ETW startup the live stream can contain CPU samples and a disk status before the first measured disk interval. Archiving starts with the first measured interval, including an idle interval with zero operations.
+
 ### Local web viewer
 
 Run `dotnet run --project Web/PerformanceViewer.Web.csproj` with .NET 10 and open `http://127.0.0.1:5217`. The Blazor server owns one reader per configured source across browser tabs. The CPU and Disk lists rank both Windows hosts together. Disk groups by process or filename, with separate read, write and total rates. Source status identifies old samples and offline collectors. A replay remains selectable after the last frame.
