@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.ComponentModel;
 using System.Diagnostics;
 using System.Globalization;
 using System.IO;
@@ -337,33 +336,8 @@ internal static class CpuProcessSampler
 
     public static async Task<CpuProcessSample> ReadHost(CancellationToken cancellation, TimeSpan? interval = null)
     {
-        var before = ReadHostTimes();
-        long start = Stopwatch.GetTimestamp();
+        var host = new HostProcessCpu();
         await Task.Delay(interval ?? TimeSpan.FromSeconds(1), cancellation).ConfigureAwait(false);
-        var after = ReadHostTimes();
-        var end = DateTimeOffset.UtcNow;
-        double seconds = Stopwatch.GetElapsedTime(start).TotalSeconds;
-        var rows = after.Where(entry => before.TryGetValue(entry.Key, out var previous) && entry.Value.Time > previous.Time)
-            .Select(entry => new CpuProcessRow(entry.Key.Pid, entry.Value.Name,
-                (entry.Value.Time - before[entry.Key].Time).TotalSeconds / seconds, Started: entry.Key.Started))
-            .ToArray();
-        return new CpuProcessSample(Math.Max(1, (int)GetActiveProcessorCount(ushort.MaxValue)), seconds, rows, End: end);
-    }
-
-    private static Dictionary<(int Pid, long Started), (string Name, TimeSpan Time)> ReadHostTimes()
-    {
-        var result = new Dictionary<(int, long), (string, TimeSpan)>();
-        foreach (var process in Process.GetProcesses())
-            using (process)
-            {
-                try
-                {
-                    if (process.Id != 0)
-                        result[(process.Id, process.StartTime.ToUniversalTime().Ticks)] = (process.ProcessName, process.TotalProcessorTime);
-                }
-                catch (InvalidOperationException) { }
-                catch (Win32Exception) { }
-            }
-        return result;
+        return host.Next((int)GetActiveProcessorCount(ushort.MaxValue));
     }
 }

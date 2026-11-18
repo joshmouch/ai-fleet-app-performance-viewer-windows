@@ -12,6 +12,16 @@ import time
 import urllib.request
 
 base = Path(__file__).resolve().parent.parent
+if sys.argv[1:] == ["--cpu-worker"]:
+    print("ready", flush=True)
+    sys.stdin.readline()
+    start = time.process_time()
+    deadline = time.monotonic() + 6
+    while time.monotonic() < deadline:
+        sum(range(10000))
+    print(time.process_time() - start, flush=True)
+    sys.stdin.readline()  # Keep the identity observable through the final interval.
+    sys.exit(0)
 if len(sys.argv) > 1 and sys.argv[1] == "--worker":
     with tempfile.NamedTemporaryFile(prefix="viewer-io-", suffix=".bin") as stream:
         payload = os.urandom(4 * 1024 * 1024)
@@ -34,6 +44,7 @@ if len(sys.argv) > 1 and sys.argv[1] == "--worker":
 
 # Two known workers plus an independent background worker, all started before the census.
 workers = []
+cpu_worker = None
 viewer = None
 browser = None
 playwright = None
@@ -42,6 +53,9 @@ try:
     playwright = sync_playwright().start()
     browser = playwright.chromium.launch(headless=True, channel=os.environ.get("VIEWER_TEST_BROWSER_CHANNEL"))
     page = browser.new_page()
+    cpu_worker = subprocess.Popen([sys.executable, __file__, "--cpu-worker"], text=True,
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    assert cpu_worker.stdout.readline().strip() == "ready"
     for _ in range(3):
         p = subprocess.Popen([sys.executable, __file__, "--worker"], stdin=subprocess.PIPE,
                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
@@ -80,12 +94,19 @@ try:
                 frame = source["frame"]
                 frames[frame["sequence"]] = frame
                 if not started:
+                    cpu_worker.stdin.write("go\n")
+                    cpu_worker.stdin.flush()
                     for p in workers:
                         p.stdin.write("go\n")
                         p.stdin.flush()
                     started = True
                 if source["selected"] and not rendered:
-                    rendered = page.get_by_text("Unsupported: this collector does not measure CPU", exact=False).count() > 0
+                    cpu_row = page.locator("tbody tr").filter(has=page.get_by_text(str(cpu_worker.pid), exact=True))
+                    if cpu_row.count():
+                        cells = cpu_row.locator("td").all_text_contents()
+                        cores = float(cells[4])
+                        percent = float(cells[5].rstrip("%"))
+                        rendered = cores > 0 and abs(percent - 100 * cores / frame["cpu"]["logicalProcessors"]) < 0.1
                     if rendered:
                         page.get_by_role("button", name="Disk", exact=True).click()
                 if rendered and source["selected"] and not (file_ranking and process_ranking):
@@ -113,10 +134,16 @@ try:
     totals = {p.pid: {k: 0 for k in ("readBytes", "writeBytes", "reads", "writes")} for p in workers}
     unknown = {k: 0 for k in ("readBytes", "writeBytes", "reads", "writes")}
     background = 0
+    worker_cpu_seconds = 0
     named_workers = set()
     for f in ordered:
         d = f["diskPaths"]
-        assert d["scope"] == "host" and not f["cpu"]["rows"] and f["cpuStatus"].startswith("Unsupported")
+        assert d["scope"] == "host"
+        cpu = f["cpu"]
+        for row in cpu["rows"]:
+            if row["pid"] == cpu_worker.pid:
+                assert row["started"] > 0
+                worker_cpu_seconds += row["cores"] * cpu["seconds"]
         assert "error=False" in d["status"] and "malformed=0" in d["status"], d["status"]
         assert sum(r["totals"]["readBytes"] + r["totals"]["writeBytes"] for r in d["files"]) == d["capturedBytes"]
         assert d["capturedBytes"] == d["namedBytes"] + d["keylessBytes"]
@@ -137,6 +164,9 @@ try:
     assert named_workers == set(totals), "controlled file rankings missing"
     assert background > 0 or unknown["readBytes"] + unknown["writeBytes"] > 0, "no background/unknown coverage"
     assert "final=True" in ordered[-1]["diskPaths"]["status"], "stream did not close cleanly"
+    own_cpu_seconds = float(cpu_worker.stdout.readline())
+    assert own_cpu_seconds > 0 and abs(worker_cpu_seconds - own_cpu_seconds) < 0.03 * own_cpu_seconds + 0.03, (
+        worker_cpu_seconds, own_cpu_seconds)
     viewer.terminate()
     viewer.wait()
     collector = ["dotnet", str(base / "MacCollector/bin/Debug/net10.0/MacCollector.dll")]
@@ -156,7 +186,8 @@ try:
     print(json.dumps({"host": "josh-mac", "result": "PASS", "captureCount": 1,
                       "consecutiveWindows": len(ordered), "knownWorkers": list(totals.values())[:2],
                       "backgroundWorker": list(totals.values())[2], "otherBackgroundBytes": background,
-                      "unknown": unknown, "viewerApi": True, "viewerCpuCapability": rendered,
+                      "unknown": unknown, "viewerApi": True, "viewerCpuRanking": rendered,
+                      "workerCpuSeconds": own_cpu_seconds, "collectorCpuSeconds": worker_cpu_seconds,
                       "viewerFileRanking": file_ranking, "viewerProcessRanking": process_ranking,
                       "processExitPreserved": True, "legacyWindows": 1, "terminationSeconds": round(stop_seconds, 3)}))
 finally:
@@ -164,7 +195,7 @@ finally:
         browser.close()
     if playwright:
         playwright.stop()
-    for p in workers:
+    for p in workers + ([cpu_worker] if cpu_worker else []):
         if p.poll() is None:
             p.kill()
             p.wait()

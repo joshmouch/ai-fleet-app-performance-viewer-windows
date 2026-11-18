@@ -28,14 +28,15 @@ sealed class PhysicalWindow(string scope)
         FileIoTotals.AddTo(files, new FileIoKey(identity?.Pid ?? 0, identity?.Name ?? "Unknown process (includes metadata)", path),
             new FileIoTotals { ReadBytes = read ? bytes : 0, WriteBytes = read ? 0 : bytes, Reads = read ? 1 : 0, Writes = read ? 0 : 1 });
     }
-    public PerformanceWindow Frame(double seconds, Guid capture, long sequence, int censusFailures = 0, bool final = false)
+    public PerformanceWindow Frame(double seconds, Guid capture, long sequence, int censusFailures = 0, bool final = false,
+        CpuProcessSample cpu = null, string cpuStatus = null)
     {
         var end = DateTimeOffset.UtcNow;
-        return new(PerformanceWindow.CurrentSchema, Environment.MachineName, null, capture, sequence, end,
-            new CpuProcessSample(Environment.ProcessorCount, seconds, []),
+        return new(PerformanceWindow.CurrentSchema, Environment.MachineName, null, capture, sequence, cpu?.End ?? end,
+            cpu ?? new CpuProcessSample(Environment.ProcessorCount, seconds, []),
             new DiskPathWindow(end, seconds, null,
                 $"mac fs_usage diskio; scope={scope}; named rows=data; empty paths include metadata/unresolved; coverage partial; censusUnavailable={censusFailures}; lossNotices={lossNotices} (lost event count unknown); malformed={malformed}; error={Error}; final={final}",
                 lossNotices, captured, named, keyless, files.Select(x => new MeasuredFile(x.Key, x.Value)).ToArray(), scope),
-            CpuStatus: "Unsupported: this collector does not measure CPU");
+            CpuStatus: cpu == null ? "CPU is unavailable in this disk sample." : cpuStatus);
     }
 }

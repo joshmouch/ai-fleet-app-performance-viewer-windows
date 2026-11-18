@@ -36,6 +36,7 @@ static class Capture
     {
         var ownership = new ThreadOwners(pid);
         ownership.Refresh();
+        var cpu = pid.HasValue ? null : new HostProcessCpu();
         var scope = pid is int p ? "process:" + p : "host";
         var gate = new object();
         var window = new PhysicalWindow(scope);
@@ -59,15 +60,20 @@ static class Capture
         });
         void Emit(bool final = false)
         {
+            // Take the process snapshot outside the disk lock so trace lines keep draining.
+            var cpuSample = cpu?.Next(Environment.ProcessorCount);
+            var cpuStatus = cpu?.Unavailable > 0 ? $"CPU times unavailable for {cpu.Unavailable} processes." : null;
+            PerformanceWindow frame;
             lock (gate)
             {
                 var now = elapsed.Elapsed.TotalSeconds;
                 // Round only a sub-millisecond tail up to storage precision; never discard its completions.
-                var frame = window.Frame(Math.Max(.001, now - previous), capture, ++sequence, ownership.Failures, final);
+                frame = window.Frame(Math.Max(.001, now - previous), capture, ++sequence, ownership.Failures, final,
+                    cpuSample, cpuStatus);
                 window = new PhysicalWindow(scope);
                 previous = now;
-                Console.WriteLine(frame.Encode());
             }
+            Console.WriteLine(frame.Encode());
         }
         var emit = Task.Run(async () => {
             using var timer = new PeriodicTimer(TimeSpan.FromSeconds(interval));

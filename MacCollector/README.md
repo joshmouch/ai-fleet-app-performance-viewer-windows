@@ -1,4 +1,4 @@
-# Optional macOS host physical I/O stream
+# macOS host CPU and physical I/O stream
 
 Build with .NET 10. This standalone console app uses the shared Core window contract.
 
@@ -23,8 +23,8 @@ replacing each host's preceding window. Do not sum latest rolling Windows window
 This collector's windows are disjoint intervals.
 
 Process probe mode requires --pid and emits diskPaths.scope=process:PID. It is excluded
-from the shared viewer's host aggregation and the exporter refuses it. Old positional
-PID syntax is removed. Host is explicit diskPaths.scope=host; existing producers default
+from the shared viewer's host aggregation and the exporter refuses it. The positional
+form `PID SECONDS` returns one disk window. Host is explicit diskPaths.scope=host; existing producers default
 to that scope for wire compatibility.
 
 ## Ownership, accounting and coverage
@@ -49,8 +49,12 @@ compression, writeback, and unidentified completions prevent a complete applicat
 claim. Cache hits have no physical record. eventsLost is a count of loss notices, not a
 precise event loss estimate. Malformed recognized physical rows flag error. stderr/nonzero
 native exit flags error. Shutdown drains parsed pipe completions. No records are discarded
-because a process exited. CPU rows are empty with an explicit unsupported CpuStatus,
-rendered by the shared viewer; zero CPU utilization is not claimed.
+because a process exited.
+
+Host CPU rankings use changes in per-process processor time, matched by PID and start time across consecutive samples.
+One core means one second of CPU work per second of elapsed time. The viewer divides by the logical processor count
+to show the percentage of host capacity. Processes that exit between samples can be absent. A PID-scoped disk probe
+emits an empty CPU sample.
 
 ## Focused acceptance
 
@@ -58,7 +62,7 @@ Publish Web with `dotnet publish Web -c Release`, then run python3 MacCollector/
 shared Web viewer with one host collector; two known simultaneous readers/writers plus
 an independent background worker exercise it. It verifies consecutive host windows,
 constant capture identity, all four worker counters, background/unknown coverage,
-row reconciliation, and the prerendered unsupported-CPU message. It prints aggregates
+row reconciliation, and the browser ranking of a busy worker against its independently measured CPU time. It prints aggregates
 only and keeps real filenames in memory. Synthetic --check cases exercise loss/error,
 PID-vs-thread confusion, accounting retention and process-scope export refusal.
 PR 36 owns stored history; preserve the same host-scope admission when converting frames

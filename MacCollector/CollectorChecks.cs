@@ -11,13 +11,15 @@ static class CollectorChecks
         Accept("WrData", "3000", "not-attributed", 123);
         Accept("RdData", "1000", "not-attributed", 124);
         var capture = Guid.NewGuid();
-        var f = PerformanceWindow.Decode(w.Frame(1, capture, 1).Encode());
+        var cpu = new CpuProcessSample(8, 1, [new(123, "public-worker", 1.5, Started: 42)], ProcessCores: 1.5);
+        var f = PerformanceWindow.Decode(w.Frame(1, capture, 1, cpu: cpu).Encode());
         var known = f.DiskPaths.Files.Single(x => x.File.Pid == 123 && x.File.Path != "").Totals;
         var unknown = f.DiskPaths.Files.Single(x => x.File.Pid == 0 && x.File.Path == "not-attributed").Totals;
         if (known.ReadBytes != 4096 || known.WriteBytes != 8192 || known.Reads != 1 || known.Writes != 1 ||
             unknown.WriteBytes != 12288 || unknown.Writes != 1 || unknown.ReadBytes != 4096 || unknown.Reads != 1 ||
             f.DiskPaths.CapturedBytes != 32768 || f.DiskPaths.KeylessBytes != 4096 ||
-            f.Cpu.Rows.Length != 0 || f.CpuStatus == null) throw new Exception("accounting/capability");
+            f.Cpu.Rows.Single() != cpu.Rows.Single() || f.CpuStatus != null ||
+            GuestProjection.CpuRows(f, _ => false).Single().HostPercent != 18.75) throw new Exception("accounting/capability");
         _ = FileWindowExport.Encode(f);
         if (w.Frame(1, capture, 2).DiskPaths.CapturedBytes != f.DiskPaths.CapturedBytes) throw new Exception("exit accounting");
         w.Accept("lost events", Owner); w.Accept("WrData malformed", Owner);
@@ -25,6 +27,6 @@ static class CollectorChecks
         var scoped = f with { DiskPaths = f.DiskPaths with { Scope = "process:123" } };
         try { _ = FileWindowExport.Encode(scoped); throw new Exception("process exported as host"); }
         catch (InvalidDataException) { }
-        Console.WriteLine("PASS: host/process scope, known and unknown four counters, exit retention, CPU unsupported, loss/error, exporter");
+        Console.WriteLine("PASS: host/process scope, directional counters, exit retention, CPU host share, loss/error, exporter");
     }
 }
