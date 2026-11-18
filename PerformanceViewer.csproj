@@ -25,7 +25,9 @@
     <Compile Include="CpuTimelines.cs" />
     <Compile Include="HyperVHostCounters.cs" />
     <Compile Include="DiskIoDetails.cs" />
-    <Compile Include="DiskIoMerge.cs" />
+    <Compile Include="WindowsSampleStream.cs" />
+    <Compile Include="WindowsDiskInventory.cs" />
+    <ProjectReference Include="Core/PerformanceViewer.Core.csproj" />
     <Compile Include="VmDiskIo.cs" />
     <Compile Include="CpuProcessDetails.cs" />
     <Compile Include="RankedTable.cs" />

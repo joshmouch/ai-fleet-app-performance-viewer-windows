@@ -82,36 +82,7 @@ internal sealed class VolumePathIndex
     }
 }
 
-internal readonly record struct FileIoKey(int Pid, string Process, string Path)
-{
-    public FileIoKey ProcessKey => this with { Path = "" };
-    private int LastSeparator => Math.Max(Path.LastIndexOf('\\'), Path.LastIndexOf('/'));
-    public string Filename => Path[(LastSeparator + 1)..];
-    public string Filepath => Path[..(LastSeparator + 1)];
-}
 internal sealed record VirtualDiskIo(int DiskNumber, string Path, FileIoTotals Totals);
-
-internal struct FileIoTotals
-{
-    public long ReadBytes, WriteBytes, Reads, Writes;
-    public long TotalBytes => ReadBytes + WriteBytes;
-    public long Operations => Reads + Writes;
-
-    public void Add(FileIoTotals value)
-    {
-        ReadBytes += value.ReadBytes;
-        WriteBytes += value.WriteBytes;
-        Reads += value.Reads;
-        Writes += value.Writes;
-    }
-
-    public static void AddTo<TKey>(Dictionary<TKey, FileIoTotals> target, TKey key, FileIoTotals value)
-    {
-        // One hash and probe per update: the slot is updated in place, starting at default for a new key.
-        ref var slot = ref CollectionsMarshal.GetValueRefOrAddDefault(target, key, out _);
-        slot.Add(value);
-    }
-}
 
 internal sealed class VolumeFileIo : IDisposable
 {
@@ -212,7 +183,7 @@ internal sealed class VolumeFileIo : IDisposable
     public sealed record Snapshot(Dictionary<FileIoKey, FileIoTotals> Entries,
         long DiskBytes, long NamedBytes, double Seconds, string Status, int EventsLost,
         long KeylessBytes, long OutsideScopeBytes,
-        Dictionary<FileIoKey, FileIoTotals> VirtualPaths = null);
+        DateTimeOffset End, Dictionary<FileIoKey, FileIoTotals> VirtualPaths = null);
     public sealed record VirtualSnapshot(VirtualDiskIo[] Entries, double Seconds, string Status, int EventsLost);
 
     public VolumeFileIo(bool details, int[] virtualDisks, VolumePathIndex index)
@@ -675,11 +646,13 @@ internal sealed class VolumeFileIo : IDisposable
         long keyless = 0, outsideScope = 0;
         bool Includes(int number) => disk.HasValue ? number == disk.Value : diskScope == null || diskScope.Contains(number);
         double seconds;
+        DateTimeOffset end;
         VolumePathIndex pathIndex;
         lock (samples)
         {
             pathIndex = scope.Paths;
             long timestamp = Stopwatch.GetTimestamp();
+            end = DateTimeOffset.UtcNow;
             long now = timestamp / Stopwatch.Frequency;
             long traceStart = System.Threading.Volatile.Read(ref started);
             long start = traceStart == 0 ? 0 : Math.Max(traceStart, detailStarted);
@@ -748,7 +721,7 @@ internal sealed class VolumeFileIo : IDisposable
                 entries.Add(entry.Key, missing);
         }
         return new Snapshot(byPath ? entries : processTotals, diskBytes, namedBytes, seconds, status,
-            eventsLost, keyless, outsideScope, virtualPaths);
+            eventsLost, keyless, outsideScope, end, virtualPaths);
     }
 
     private string VirtualPath(string path) => VmDiskIo.Normalize(scope.Paths.Resolve(path, null) ?? path);
@@ -1268,7 +1241,7 @@ internal sealed class DiskIoDetails : Panel
             notes.Add(inventory.Exception.GetBaseException().Message);
         if (byPath && owners != null && entries.Keys.Any(key => owners.TryGetValue(VmDiskIo.Normalize(key.Path), out var match) && match.Attachment != null))
             notes.Add("Double-click a VHDX to see guest I/O.");
-        var rows = DiskIoMerge.Expand(entries, expansions, byPath);
+        var rows = DiskIoMerge.Expand(Environment.MachineName, entries, expansions, byPath);
         bool hasGuestRows = rows.Any(row => row.Guest != null);
         if (hasGuestRows)
             notes.Add("Guest I/O impact is estimated from the guest's share of the VHDX traffic.");

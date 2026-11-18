@@ -2,19 +2,19 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 
-internal sealed record DiskIoRow(FileIoKey Key, string Machine, FileIoTotals Totals, DiskGuestRate? Guest = null);
+public sealed record DiskIoRow(FileIoKey Key, string Machine, FileIoTotals Totals, DiskGuestRate? Guest = null);
 
-internal readonly record struct DiskGuestRate(double Read, double Write)
+public readonly record struct DiskGuestRate(double Read, double Write)
 {
     public double Total => Read + Write;
 }
 
-internal sealed record DiskIoExpansion(string Machine, KeyValuePair<FileIoKey, FileIoTotals>[] HostPaths,
+public sealed record DiskIoExpansion(string Machine, KeyValuePair<FileIoKey, FileIoTotals>[] HostPaths,
     Dictionary<FileIoKey, FileIoTotals> GuestRows, double GuestSeconds);
 
-internal static class DiskIoMerge
+public static class DiskIoMerge
 {
-    public static DiskIoRow[] Expand(Dictionary<FileIoKey, FileIoTotals> entries,
+    public static DiskIoRow[] Expand(string hostName, Dictionary<FileIoKey, FileIoTotals> entries,
         DiskIoExpansion[] expansions, bool byPath)
     {
         var host = new Dictionary<FileIoKey, FileIoTotals>(entries);
@@ -62,7 +62,7 @@ internal static class DiskIoMerge
             }
         }
         return host.Where(entry => entry.Value.TotalBytes != 0 || entry.Value.Operations != 0)
-            .Select(entry => new DiskIoRow(entry.Key, Environment.MachineName, entry.Value))
+            .Select(entry => new DiskIoRow(entry.Key, hostName, entry.Value))
             .Concat(guests
                 .Select(entry => new DiskIoRow(entry.Key.Key, entry.Key.Machine, entry.Value.Host, new DiskGuestRate(entry.Value.ReadRate, entry.Value.WriteRate))))
             .ToArray();
