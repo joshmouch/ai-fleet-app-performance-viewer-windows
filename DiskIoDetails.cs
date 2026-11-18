@@ -106,6 +106,8 @@ internal sealed class VolumeFileIo : IDisposable
     private readonly Dictionary<int, string> processes = new();
     // Kernel-File creates name an individual open. A later filesystem event gives that
     // open's stream key, which Kernel-Disk reports in its FileObject field.
+    private readonly WindowsDiskFileNames fileNameQueries = new();
+    private volatile bool queryOpenFiles;
     private readonly FileNames manifestOpens = new(MaxOpenFiles);
     private readonly FileNames observedFiles = new(MaxOpenFiles);
     private readonly FileNames recentNames = new(MaxOpenFiles);
@@ -302,6 +304,7 @@ internal sealed class VolumeFileIo : IDisposable
             source.Kernel.DiskIOReadInit += RecordRequest;
             source.Kernel.DiskIOWriteInit += RecordRequest;
             string rundownOwner = fileInfoAvailable && !manifestDisk ? owner : null;
+            queryOpenFiles = manifestDisk;
             if (manifestDisk)
                 source.Dynamic.All += e => RecordManifestEvent(e, source);
             else
@@ -701,12 +704,18 @@ internal sealed class VolumeFileIo : IDisposable
                     keyless += bucket.KeylessBytes.Where(entry => Includes(entry.Key)).Sum(entry => entry.Value);
             }
         }
+        var pending = queryOpenFiles && readPaths ? new Dictionary<int, long>() : null;
         foreach (var bucket in pathBuckets)
             foreach (var entry in bucket)
             {
                 if (!Includes(entry.Key.Disk))
                     continue;
                 string path = entry.Key.PendingName?.Path ?? entry.Key.File.Path;
+                if (pending != null && entry.Key.PendingName != null && string.IsNullOrEmpty(path))
+                {
+                    int pid = entry.Key.File.Pid;
+                    pending[pid] = pending.GetValueOrDefault(pid) + entry.Value.TotalBytes;
+                }
                 if (string.IsNullOrEmpty(path) || ((!byPath || virtualDisk != null) && !IsVirtualDisk(path)))
                     continue;
                 path = pathIndex.Resolve(path, entry.Key.Disk) ?? pathIndex.Resolve(path, null) ?? path;
@@ -743,6 +752,7 @@ internal sealed class VolumeFileIo : IDisposable
             if (missing.Operations > 0)
                 entries.Add(entry.Key, missing);
         }
+        if (pending != null) fileNameQueries.Resolve(pending);
         return new Snapshot(byPath ? entries : processTotals, diskBytes, namedBytes, seconds, status,
             eventsLost, keyless, outsideScope, end, virtualPaths);
     }
@@ -786,6 +796,7 @@ internal sealed class VolumeFileIo : IDisposable
             disposed = true;
             session?.Stop();
         }
+        fileNameQueries.Dispose();
     }
 }
 

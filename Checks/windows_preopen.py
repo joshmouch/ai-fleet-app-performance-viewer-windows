@@ -33,6 +33,11 @@ free = api("VirtualFree", wt.BOOL, wt.LPVOID, c.c_size_t, wt.DWORD)
 def check(ok):
     if not ok: raise c.WinError(c.get_last_error())
 
+def stop_collector(proc):
+    if proc.poll() is None:
+        proc.kill()
+    proc.wait(timeout=5)
+
 def exercise(stable, candidate):
     block = 65536
     with tempfile.TemporaryDirectory() as folder, ExitStack() as cleanup:
@@ -50,7 +55,9 @@ def exercise(stable, candidate):
             for _ in range(blocks):
                 check(op(handle, buf, block, c.byref(n), None))
                 assert n.value == block
-        paths = [Path(folder)/f"viewer-held-{i}.dat" for i in range(2)]
+        directories = [Path(folder)/name for name in ("first", "second")]
+        for d in directories: d.mkdir()
+        paths = [d/"viewer-held.dat" for d in directories]
         handles = [open_file(p, 0xc0000000, 1, 0xa0000080) for p in paths]
         counts = [24, 12]
         for h, count in zip(handles, counts): io(h, write, count)
@@ -69,63 +76,60 @@ def exercise(stable, candidate):
                     def collect(subset):
                         return [sum(r["totals"][key] for r in subset) for key in t]
                     q.put(dict(unknown=collect([r for r in own if not r["file"]["path"]]),
-                        target=collect([r for r in own if r["file"]["path"].endswith(paths[0].name)]),
-                        control=collect([r for r in own if r["file"]["path"].endswith(paths[1].name)]),
+                        target=collect([r for r in own if r["file"]["path"].endswith(str(paths[0].relative_to(folder)))]),
+                        control=collect([r for r in own if r["file"]["path"].endswith(str(paths[1].relative_to(folder)))]),
                         captured=sums, seconds=d["seconds"]))
             except Exception as e: q.put(e)
             finally: q.put(None)
-        for exe in (stable, candidate):
-            p = subprocess.Popen([exe, "--collect","--interval","2","--count","13"],
+        for label, exe in (("baseline", stable), ("candidate", candidate)):
+            p = subprocess.Popen([exe, "--collect","--interval","2","--count","8"],
                                  stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True,encoding="utf-8")
-            cleanup.callback(lambda proc=p: proc.wait(35))
+            cleanup.callback(stop_collector, p)
             q = queue.Queue()
             threading.Thread(target=read_lines,args=(p,q),daemon=True).start()
-            streams.append((p,q))
-        def next_frame(q):
-            v = q.get(timeout=45)
+            streams.append((label,p,q))
+        def next_frame(label, q):
+            try:
+                v = q.get(timeout=12)
+            except queue.Empty:
+                raise AssertionError(f"{label} produced no disk frame within 12 seconds") from None
             if isinstance(v,Exception): raise v
-            assert v is not None, "collector ended"
+            assert v is not None, f"{label} ended"
             return v
-        for _,q in streams: next_frame(q)
-        sessions=subprocess.check_output(["logman","query","-ets"],text=True,errors="replace")
-        manifests=[]
-        for p,_ in streams:
-            logger=next(line.split()[0] for line in sessions.splitlines() if f"CpuTimelines-FileIo-{p.pid}-" in line)
-            providers=subprocess.check_output(["logman","query",logger,"-ets"],text=True,errors="replace").lower()
-            manifests.append("microsoft-windows-kernel-disk" in providers or "c7bde69a-e1e0-4177-b6ef-283ad1525271" in providers)
-        assert all(manifests),manifests
+        for label,_,q in streams:
+            next_frame(label, q)
+            print(f"{label}: disk capture ready", file=sys.stderr, flush=True)
         for h, count in zip(handles,counts):
             io(h, read, count)
             io(h, write, count)
+        print("controlled transfers complete", file=sys.stderr, flush=True)
+        # Keep both original handles open. The workload never opens an alias.
         before = []
-        for _,q in streams:
-            f = next_frame(q)
-            while f["unknown"][0]<sum(counts)*block or f["unknown"][1]<sum(counts)*block:
-                f=next_frame(q)
-            assert f["target"] == f["control"] == [0]*4
+        for label,_,q in streams:
+            f = next_frame(label, q)
+            while any(sum(f[k][i] for k in ("target","control","unknown")) < sum(counts)*block for i in (0,1)):
+                f=next_frame(label, q)
+            print(f"{label}: captured controlled totals at {f['seconds']:.1f}s", file=sys.stderr, flush=True)
             before.append(f)
-        alias = open_file(paths[0], 0x80, 3, 0x80)
-        length = c.c_longlong()
-        check(size(alias,c.byref(length)))
-        assert length.value == block*counts[0]
         after = []
-        for _,q in streams:
-            last = next_frame(q)
+        for label,proc,q in streams:
+            last = next_frame(label, q)
             while True:
-                item=q.get(timeout=45)
+                item=q.get(timeout=12)
                 if item is None: break
                 if isinstance(item,Exception): raise item
                 last=item
+            assert proc.wait(timeout=5) == 0, f"{label} collector failed"
             after.append(last)
-        result=dict(host=os.environ["COMPUTERNAME"],manifest=manifests,before=before,after=after,
+        result=dict(host=os.environ["COMPUTERNAME"],before=before,after=after,
                     bytesPerDirection=[n*block for n in counts])
         print(json.dumps(result),flush=True)
-        assert after[0]["target"] == [0]*4
-        assert after[1]["target"][0:2] == [counts[0]*block]*2
-        assert all(v>0 for v in after[1]["target"][2:])
-        assert after[1]["control"] == [0]*4
-        assert [a+b for a,b in zip(after[1]["unknown"],after[1]["target"])] == after[0]["unknown"]
-        assert all(v>=counts[1]*block for v in after[1]["unknown"][:2])
+        assert after[0]["target"] == after[0]["control"] == [0]*4
+        for key, count in zip(("target","control"), counts):
+            assert after[1][key][:2] == [count*block]*2
+            assert all(v>0 for v in after[1][key][2:])
+        assert [sum(after[1][key][i] for key in ("unknown","target","control"))
+                for i in range(4)] == after[0]["unknown"]
 
 if __name__ == "__main__":
     exercise(*sys.argv[1:])
