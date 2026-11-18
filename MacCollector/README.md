@@ -33,8 +33,10 @@ capture, sequence 1; use actual elapsed seconds, not a rolling sum.
 
 Coverage is always partial, even with zero loss notices. `capturedBytes = namedBytes +
 keylessBytes` for parsed records. Unrecognized physical rows flag error. stderr or a
-nonzero trace exit flags error. Loss notices set `eventsLost=-1` (unknown count), never
-an invented precise loss count. No inferred events or private traces are fixtures.
+nonzero trace exit flags error. `eventsLost` counts loss notices, a lower bound;
+the actual lost-event count is unknown, as status states. Empty-path PID-zero rows
+carry unattributed physical counters (including metadata), so rows reconcile with
+coverage and pass the existing file-window exporter. No private traces are fixtures.
 
 The live check uses a temporary random-data file, verifies uncached reads, flushed writes,
 warmed cache reads, process identity and coverage accounting, and prints only aggregates.

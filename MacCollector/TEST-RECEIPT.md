@@ -13,6 +13,7 @@ contains aggregates and synthetic fixture descriptions only, not user paths or t
 | Three warmed-cache reads | Zero physical bytes/operations |
 | Live identity | Attributed rows use controlled worker PID, nonzero process start time |
 | Live accounting | Captured bytes equal named plus keyless bytes; no reported loss/error |
+| Existing exporter | `FileWindowExport.Encode` accepts keyless, loss-notice and identity-fenced windows |
 
 Commands: `dotnet build MacCollector`,
 `dotnet MacCollector/bin/Debug/net10.0/MacCollector.dll --check`,
@@ -27,3 +28,8 @@ Diagnosis established two macOS boundaries: thread handles from
 `PROC_PIDLISTTHREADIDS=28` supplies matching IDs. fs_usage may omit a path's leading
 slash. The collector preserves the rendered path; tests recognize the controlled
 file's canonical spelling without changing public path semantics.
+
+Review fixes retain valid filenames containing loss-diagnostic words, terminate/reap
+the trace on exceptional exits, refresh thread census only for unknown suffixes,
+and reconcile unattributed counters through empty-path PID-zero rows. The final
+source passed the macOS build, focused checks and all three live cases again.
