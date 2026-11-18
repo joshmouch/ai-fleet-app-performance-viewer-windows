@@ -29,7 +29,7 @@ internal sealed class WindowSources : BackgroundService
     {
         var configured = configuration.GetSection("Sources").Get<SourceConfig[]>();
         if (configured == null && OperatingSystem.IsWindows())
-            configured = [new() { Name = "Local Windows", Command = "aifleet-performance-viewer.exe", Arguments = ["--collect"] }];
+            configured = [new() { Name = "Local Windows", Command = "aifleet-performance-viewer.exe", Arguments = ["--collect", "--guests"] }];
         sources = (configured ?? []).Select(c =>
         {
             if (string.IsNullOrWhiteSpace(c.Name) || c.StaleAfterSeconds < 1 ||

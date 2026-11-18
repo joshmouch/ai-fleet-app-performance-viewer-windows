@@ -15,12 +15,15 @@ internal static class WindowsSampleStream
     {
         int interval = 10;
         int? disk = null, count = null;
-        for (int i = 0; i < args.Length; i += 2)
+        bool collectGuests = false;
+        for (int i = 0; i < args.Length; i++)
         {
-            if (i + 1 >= args.Length || !int.TryParse(args[i + 1], NumberStyles.None,
+            string option = args[i];
+            if (option == "--guests") { collectGuests = true; continue; }
+            if (++i >= args.Length || !int.TryParse(args[i], NumberStyles.None,
                 CultureInfo.InvariantCulture, out int value))
                 return Usage();
-            switch (args[i])
+            switch (option)
             {
                 case "--interval" when value is >= 1 and <= 3600: interval = value; break;
                 case "--count" when value > 0: count = value; break;
@@ -47,18 +50,22 @@ internal static class WindowsSampleStream
 
             var captureId = Guid.NewGuid();
             DateTimeOffset? boot = ReadBoot();
+            await using var guestSamples = collectGuests ? new WindowsGuestSamples(index) : null;
             using var capture = new VolumeFileIo(true, Array.Empty<int>(), index);
             using var output = new StreamWriter(Console.OpenStandardOutput(), new UTF8Encoding(false));
             for (long sequence = 1; !count.HasValue || sequence <= count; sequence++)
             {
-                var cpu = await CpuProcessSampler.ReadHost(stop.Token, TimeSpan.FromSeconds(interval));
-                var cpuEnd = DateTimeOffset.UtcNow;
+                var duration = TimeSpan.FromSeconds(interval);
+                var host = CpuProcessSampler.ReadHost(stop.Token, duration);
+                if (guestSamples != null) await guestSamples.Begin(host, duration);
+                var cpu = await host;
                 var paths = capture.Read(true, disk, null, false);
                 var pathWindow = new DiskPathWindow(paths.End, paths.Seconds, disk, paths.Status, paths.EventsLost,
                     paths.DiskBytes, paths.NamedBytes, paths.KeylessBytes,
                     paths.Entries.Select(pair => new MeasuredFile(pair.Key, pair.Value)).ToArray());
                 var frame = new PerformanceWindow(PerformanceWindow.CurrentSchema, Environment.MachineName, boot,
-                    captureId, sequence, cpuEnd, cpu, pathWindow);
+                    captureId, sequence, cpu.End.Value, cpu, pathWindow,
+                    guestSamples == null ? null : await guestSamples.Read(paths, duration));
                 await output.WriteLineAsync(frame.Encode());
                 await output.FlushAsync();
             }
@@ -90,7 +97,7 @@ internal static class WindowsSampleStream
 
     private static int Usage()
     {
-        Console.Error.WriteLine("Usage: --collect [--interval SECONDS] [--disk NUMBER] [--count WINDOWS]");
+        Console.Error.WriteLine("Usage: --collect [--guests] [--interval SECONDS] [--disk NUMBER] [--count WINDOWS]");
         return 2;
     }
 }

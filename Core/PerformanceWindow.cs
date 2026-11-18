@@ -11,7 +11,7 @@ public sealed record DiskPathWindow(DateTimeOffset End, double Seconds, int? Dis
 // Disk paths use the native sampler's rolling window. CPU covers the interval between
 // process snapshots. Consumers replace the previous frame rather than summing rolling windows.
 public sealed record PerformanceWindow(string Schema, string Host, DateTimeOffset? Boot,
-    Guid Capture, long Sequence, DateTimeOffset CpuEnd, CpuProcessSample Cpu, DiskPathWindow DiskPaths)
+    Guid Capture, long Sequence, DateTimeOffset CpuEnd, CpuProcessSample Cpu, DiskPathWindow DiskPaths, GuestWindow Guests = null)
 {
     public const string CurrentSchema = "performance-viewer/window/v1";
     private static readonly JsonSerializerOptions Options = new(JsonSerializerDefaults.Web)

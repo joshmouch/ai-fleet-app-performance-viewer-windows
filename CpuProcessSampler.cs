@@ -101,8 +101,11 @@ internal static class CpuProcessSampler
 
     /// <summary>One cluster CPU sample. Its process starts, registry and WMI reads are synchronous, so the caller runs it on
     /// the thread pool.</summary>
-    public static async Task<ClusterCpuSample> ReadCluster(CpuExpansionTarget[] targets, CancellationToken cancellation)
+    public static async Task<ClusterCpuSample> ReadCluster(CpuExpansionTarget[] targets, CancellationToken cancellation,
+        Task<CpuProcessSample> hostSample = null, TimeSpan? interval = null)
     {
+        var hostTask = hostSample ?? Task.Run(() => ReadHost(cancellation), cancellation);
+        var hypervisorTask = Task.Run(() => ReadGuestBudgets(targets, interval ?? TimeSpan.FromSeconds(1), cancellation), cancellation);
         var selected = targets.Where(target => !target.IsWsl).Select(target => target.Name)
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
         bool expandWsl = targets.Any(target => target.IsWsl);
@@ -120,8 +123,6 @@ internal static class CpuProcessSampler
         }
         var (distrosToSample, listFailure) = await wslNames.ConfigureAwait(false);
         cancellation.ThrowIfCancellationRequested();
-        var hostTask = Task.Run(() => ReadHost(cancellation), cancellation);
-        var hypervisorTask = Task.Run(() => ReadGuestBudgets(targets, cancellation), cancellation);
         var guestTasks = targets.Where(target => !target.IsWsl)
             .Select(async target => (Target: target, Read: await ReadGuest(target.Name, cancellation).ConfigureAwait(false)))
             .ToArray();
@@ -140,7 +141,7 @@ internal static class CpuProcessSampler
             var wrappers = host.Rows.Where(row => owner?.AccountingPids.Contains(row.Pid) == true).ToArray();
             double? budget = budgets.GetValueOrDefault(target) ?? (wrappers.Length > 0 ? wrappers.Sum(row => row.Cores) : null);
             var rows = sample == null ? Array.Empty<CpuProcessRow>() : Scale(sample, sample.TotalCores, budget);
-            coverage.Add(new GuestCpuCoverage(target.Name, budget, AssignedCores(rows), sample != null, failure));
+            coverage.Add(new GuestCpuCoverage(target.Name, budget, AssignedCores(rows), sample != null, failure, budget.HasValue ? wrappers : []));
             if (rows.Length > 0)
                 expanded.Add(new CpuMachineProcesses(target.Name, rows));
             if (budget.HasValue)
@@ -160,12 +161,12 @@ internal static class CpuProcessSampler
                 double busy = Math.Max(distros.Max(distro => distro.Sample.TotalCores),
                     distros.Sum(distro => distro.Sample.ProcessCores));
                 distroRows = distros.Select(distro => new CpuMachineProcesses(
-                    "WSL / " + distro.Name, Scale(distro.Sample, busy, budget))).ToArray();
+                    "WSL / " + distro.Name, Scale(distro.Sample, busy, budget), wsl.Name)).ToArray();
                 expanded.AddRange(distroRows);
             }
             coverage.Add(new GuestCpuCoverage(wsl.Name, budget,
                 AssignedCores(distroRows.SelectMany(distro => distro.Rows)), distros.Length > 0,
-                listFailure ?? (distroFailures.Length > 0 ? distroFailures : null)));
+                listFailure ?? (distroFailures.Length > 0 ? distroFailures : null), budget.HasValue && wrapper != null ? [wrapper] : []));
             if (budget.HasValue && wrapper != null)
                 replacedPids.Add(wrapper.Pid);
         }
@@ -174,7 +175,7 @@ internal static class CpuProcessSampler
     }
 
     private static async Task<Dictionary<CpuExpansionTarget, double?>> ReadGuestBudgets(
-        CpuExpansionTarget[] targets, CancellationToken cancellation)
+        CpuExpansionTarget[] targets, TimeSpan interval, CancellationToken cancellation)
     {
         var result = new Dictionary<CpuExpansionTarget, double?>();
         if (!targets.Any(target => target.CounterPrefix != null))
@@ -182,7 +183,7 @@ internal static class CpuProcessSampler
         try
         {
             using var query = new PdhQuery(@"\Hyper-V Hypervisor Virtual Processor(*)\% Guest Run Time");
-            await Task.Delay(1000, cancellation).ConfigureAwait(false);
+            await Task.Delay(interval, cancellation).ConfigureAwait(false);
             query.Collect();
             var values = query.Read(0);
             foreach (var target in targets.Where(target => target.CounterPrefix != null))
@@ -340,12 +341,13 @@ internal static class CpuProcessSampler
         long start = Stopwatch.GetTimestamp();
         await Task.Delay(interval ?? TimeSpan.FromSeconds(1), cancellation).ConfigureAwait(false);
         var after = ReadHostTimes();
+        var end = DateTimeOffset.UtcNow;
         double seconds = Stopwatch.GetElapsedTime(start).TotalSeconds;
         var rows = after.Where(entry => before.TryGetValue(entry.Key, out var previous) && entry.Value.Time > previous.Time)
             .Select(entry => new CpuProcessRow(entry.Key.Pid, entry.Value.Name,
                 (entry.Value.Time - before[entry.Key].Time).TotalSeconds / seconds, Started: entry.Key.Started))
             .ToArray();
-        return new CpuProcessSample(Math.Max(1, (int)GetActiveProcessorCount(ushort.MaxValue)), seconds, rows);
+        return new CpuProcessSample(Math.Max(1, (int)GetActiveProcessorCount(ushort.MaxValue)), seconds, rows, End: end);
     }
 
     private static Dictionary<(int Pid, long Started), (string Name, TimeSpan Time)> ReadHostTimes()

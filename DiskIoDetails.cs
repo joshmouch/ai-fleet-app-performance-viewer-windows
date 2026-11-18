@@ -863,6 +863,53 @@ internal sealed class GuestIoWatch : IDisposable
     }
 }
 
+internal sealed class GuestDiskWatches : IDisposable
+{
+    private readonly Dictionary<VmDisk, (GuestIoWatch Watch, long LastNeeded)> guestWatches = new();
+
+    internal GuestIoWatch.Snapshot Read(VmDisk disk) => guestWatches.GetValueOrDefault(WatchKey(disk)).Watch?.Read();
+
+    internal static IGrouping<VmDisk, KeyValuePair<FileIoKey, FileIoTotals>>[] Candidates(
+        IEnumerable<KeyValuePair<FileIoKey, FileIoTotals>> virtualPaths, Dictionary<string, VmDiskOwners> owners, HashSet<string> expandedGuests)
+    {
+        return expandedGuests.Count == 0 || owners == null || virtualPaths == null
+            ? Array.Empty<IGrouping<VmDisk, KeyValuePair<FileIoKey, FileIoTotals>>>()
+            : virtualPaths.Select(entry => (Entry: entry,
+                    Disk: owners.GetValueOrDefault(VmDiskIo.Normalize(entry.Key.Path))?.Attachment))
+                .Where(pair => pair.Disk != null && expandedGuests.Contains(pair.Disk.ExpansionTarget))
+                .GroupBy(pair => WatchKey(pair.Disk), pair => pair.Entry).ToArray();
+    }
+
+    internal static VmDisk WatchKey(VmDisk disk) => disk with { Path = "" };
+
+    internal void Track(IEnumerable<VmDisk> disks, HashSet<string> expandedGuests)
+    {
+        long now = Stopwatch.GetTimestamp();
+        var wanted = disks.Select(WatchKey).ToHashSet();
+        // A disk filter changes which rows are shown. Keep recent samples across
+        // navigation for as long as the host I/O that can use them stays relevant.
+        foreach (var entry in guestWatches.Where(entry => !wanted.Contains(entry.Key) &&
+            (!expandedGuests.Contains(entry.Key.ExpansionTarget) ||
+             Stopwatch.GetElapsedTime(entry.Value.LastNeeded, now).TotalSeconds >= VolumeFileIo.WindowSeconds)).ToArray())
+        {
+            entry.Value.Watch.Dispose();
+            guestWatches.Remove(entry.Key);
+        }
+        foreach (var disk in wanted)
+        {
+            var watch = guestWatches.TryGetValue(disk, out var existing) ? existing.Watch : new GuestIoWatch(disk);
+            guestWatches[disk] = (watch, now);
+        }
+    }
+
+    public void Dispose()
+    {
+        foreach (var entry in guestWatches.Values)
+            entry.Watch.Dispose();
+        guestWatches.Clear();
+    }
+}
+
 internal sealed class DiskIoDetails : Panel
 {
     private const double BytesPerMiB = 1024 * 1024;
@@ -891,7 +938,7 @@ internal sealed class DiskIoDetails : Panel
     private System.Threading.CancellationTokenSource inventoryCancellation;
     private Task<Dictionary<string, VmDiskOwners>> inventory;
     private VolumePathIndex inventoryPathIndex;
-    private readonly Dictionary<VmDisk, (GuestIoWatch Watch, long LastNeeded)> guestWatches = new();
+    private readonly GuestDiskWatches guestWatches = new();
     private HashSet<string> expandedGuests = new(StringComparer.OrdinalIgnoreCase);
     private bool groupByMachine;
     private int? bandWidth;
@@ -1124,7 +1171,7 @@ internal sealed class DiskIoDetails : Panel
         {
             totals.Visible = false;
             commands.Suspend();
-            StopGuestWatches();
+            guestWatches.Dispose();
         }
         refreshTimer.Enabled = expanded && detailsOpen;
         LayoutChanged?.Invoke(this, EventArgs.Empty);
@@ -1147,7 +1194,7 @@ internal sealed class DiskIoDetails : Panel
         {
             refreshTimer.Stop();
             commands.Suspend();
-            StopGuestWatches();
+            guestWatches.Dispose();
             totals.Visible = false;
         }
     }
@@ -1166,7 +1213,7 @@ internal sealed class DiskIoDetails : Panel
     {
         if (disposing)
         {
-            StopGuestWatches();
+            guestWatches.Dispose();
             inventoryCancellation?.Cancel();
             inventoryCancellation?.Dispose();
             refreshTimer.Dispose();
@@ -1200,20 +1247,15 @@ internal sealed class DiskIoDetails : Panel
         var entries = snapshot.Entries;
         var owners = VirtualDiskOwners;
         IEnumerable<KeyValuePair<FileIoKey, FileIoTotals>> virtualPaths = byPath ? entries : snapshot.VirtualPaths;
-        var candidates = expandedGuests.Count == 0 || owners == null || virtualPaths == null
-            ? Array.Empty<IGrouping<VmDisk, KeyValuePair<FileIoKey, FileIoTotals>>>()
-            : virtualPaths.Select(entry => (Entry: entry,
-                    Disk: owners.GetValueOrDefault(VmDiskIo.Normalize(entry.Key.Path))?.Attachment))
-                .Where(pair => pair.Disk != null && expandedGuests.Contains(pair.Disk.ExpansionTarget))
-                .GroupBy(pair => WatchKey(pair.Disk), pair => pair.Entry).ToArray();
-        SyncGuestWatches(guestDisk == null ? candidates.Select(group => group.Key) :
-            candidates.Select(group => group.Key).Append(guestDisk));
+        var candidates = GuestDiskWatches.Candidates(virtualPaths, owners, expandedGuests);
+        guestWatches.Track(guestDisk == null ? candidates.Select(group => group.Key) :
+            candidates.Select(group => group.Key).Append(guestDisk), expandedGuests);
         if (inGuest)
         {
             RefreshGuest(guestByPath);
             return;
         }
-        var guestSamples = candidates.Select(group => (Group: group, Sample: guestWatches[group.Key].Watch.Read())).ToArray();
+        var guestSamples = candidates.Select(group => (Group: group, Sample: guestWatches.Read(group.Key))).ToArray();
         var expansions = guestSamples.Where(pair => pair.Sample.Seconds > 0 && pair.Sample.Paths.Count > 0)
             .Select(pair => new DiskIoExpansion(pair.Group.Key.VMName, pair.Group.ToArray(),
                 byPath ? pair.Sample.Paths : pair.Sample.Processes, pair.Sample.Seconds)).ToArray();
@@ -1288,39 +1330,10 @@ internal sealed class DiskIoDetails : Panel
         guestProcesses.ClearRows();
     }
 
-    private static VmDisk WatchKey(VmDisk disk) => disk with { Path = "" };
-
-    private void SyncGuestWatches(IEnumerable<VmDisk> disks)
-    {
-        long now = Stopwatch.GetTimestamp();
-        var wanted = disks.Select(WatchKey).ToHashSet();
-        // A disk filter changes which rows are shown. Keep recent samples across
-        // navigation for as long as the host I/O that can use them stays relevant.
-        foreach (var entry in guestWatches.Where(entry => !wanted.Contains(entry.Key) &&
-            (!expandedGuests.Contains(entry.Key.ExpansionTarget) ||
-             Stopwatch.GetElapsedTime(entry.Value.LastNeeded, now).TotalSeconds >= VolumeFileIo.WindowSeconds)).ToArray())
-        {
-            entry.Value.Watch.Dispose();
-            guestWatches.Remove(entry.Key);
-        }
-        foreach (var disk in wanted)
-        {
-            var watch = guestWatches.TryGetValue(disk, out var existing) ? existing.Watch : new GuestIoWatch(disk);
-            guestWatches[disk] = (watch, now);
-        }
-    }
-
-    private void StopGuestWatches()
-    {
-        foreach (var entry in guestWatches.Values)
-            entry.Watch.Dispose();
-        guestWatches.Clear();
-    }
-
     private void RefreshGuest(bool byPath)
     {
         var table = byPath ? guestPaths : guestProcesses;
-        var sample = guestWatches.GetValueOrDefault(WatchKey(guestDisk)).Watch?.Read();
+        var sample = guestWatches.Read(guestDisk);
         var entries = (byPath ? sample?.Paths : sample?.Processes) ?? EmptyRows;
         string diskRate = sample is { DiskSeconds: > 0 }
             ? $"Disk {(sample.DiskReadBytes + sample.DiskWriteBytes) / BytesPerMiB / sample.DiskSeconds:0.##} MiB/s"
