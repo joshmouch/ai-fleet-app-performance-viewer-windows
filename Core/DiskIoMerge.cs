@@ -4,9 +4,14 @@ using System.Linq;
 
 public sealed record DiskIoRow(FileIoKey Key, string Machine, FileIoTotals Totals, DiskGuestRate? Guest = null);
 
-public readonly record struct DiskGuestRate(double Read, double Write)
+public readonly record struct DiskGuestRate(double Read, double Write, long Reads = 0, long Writes = 0)
 {
     public double Total => Read + Write;
+    public static DiskGuestRate From(FileIoTotals totals, double seconds) =>
+        new(totals.ReadBytes / (1048576 * seconds), totals.WriteBytes / (1048576 * seconds), totals.Reads, totals.Writes);
+
+    public static DiskGuestRate operator +(DiskGuestRate left, DiskGuestRate right) =>
+        new(left.Read + right.Read, left.Write + right.Write, left.Reads + right.Reads, left.Writes + right.Writes);
 }
 
 public sealed record DiskIoExpansion(string Machine, KeyValuePair<FileIoKey, FileIoTotals>[] HostPaths,
@@ -18,7 +23,7 @@ public static class DiskIoMerge
         DiskIoExpansion[] expansions, bool byPath)
     {
         var host = new Dictionary<FileIoKey, FileIoTotals>(entries);
-        var guests = new Dictionary<(string Machine, FileIoKey Key), (FileIoTotals Host, double ReadRate, double WriteRate)>();
+        var guests = new Dictionary<(string Machine, FileIoKey Key), (FileIoTotals Host, DiskGuestRate Guest)>();
         foreach (var expansion in expansions)
         {
             var budget = Sum(expansion.HostPaths.Select(entry => entry.Value));
@@ -54,9 +59,7 @@ public static class DiskIoMerge
                     Reads = cumulative.Reads - assigned.Reads,
                     Writes = cumulative.Writes - assigned.Writes
                 });
-                double divisor = 1048576.0 * expansion.GuestSeconds;
-                row.ReadRate += entry.Value.ReadBytes / divisor;
-                row.WriteRate += entry.Value.WriteBytes / divisor;
+                row.Guest += DiskGuestRate.From(entry.Value, expansion.GuestSeconds);
                 guests[key] = row;
                 assigned = cumulative;
             }
@@ -64,7 +67,7 @@ public static class DiskIoMerge
         return host.Where(entry => entry.Value.TotalBytes != 0 || entry.Value.Operations != 0)
             .Select(entry => new DiskIoRow(entry.Key, hostName, entry.Value))
             .Concat(guests
-                .Select(entry => new DiskIoRow(entry.Key.Key, entry.Key.Machine, entry.Value.Host, new DiskGuestRate(entry.Value.ReadRate, entry.Value.WriteRate))))
+                .Select(entry => new DiskIoRow(entry.Key.Key, entry.Key.Machine, entry.Value.Host, entry.Value.Guest)))
             .ToArray();
     }
 

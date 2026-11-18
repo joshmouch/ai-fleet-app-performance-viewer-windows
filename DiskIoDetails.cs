@@ -104,6 +104,11 @@ internal sealed class VolumeFileIo : IDisposable
     private readonly Queue<Bucket> buckets = new();
     private Bucket currentBucket;
     private readonly Dictionary<int, string> processes = new();
+    // Kernel-File creates name an individual open. A later filesystem event gives that
+    // open's stream key, which Kernel-Disk reports in its FileObject field.
+    private readonly WindowsDiskFileNames fileNameQueries = new();
+    private volatile bool queryOpenFiles;
+    private readonly FileNames manifestOpens = new(MaxOpenFiles);
     private readonly FileNames observedFiles = new(MaxOpenFiles);
     private readonly FileNames recentNames = new(MaxOpenFiles);
     private readonly FileNames virtualFiles = new(MaxVirtualFiles);
@@ -252,8 +257,8 @@ internal sealed class VolumeFileIo : IDisposable
                     opened.Dispose();
                     opened = OpenSession(owner);
                     opened.EnableProvider(DiskProvider);
-                    opened.EnableProvider(FileProvider, TraceEventLevel.Verbose, 0x3B0,
-                        new TraceEventProviderOptions { EventIDsToEnable = new[] { 10, 11, 12, 14, 15, 16 } });
+                    opened.EnableProvider(FileProvider, TraceEventLevel.Verbose, 0x13B0,
+                        new TraceEventProviderOptions { EventIDsToEnable = new[] { 10, 11, 12, 13, 14, 15, 16, 22, 30 } });
                     opened.EnableProvider(ProcessProvider, TraceEventLevel.Informational, 0x10);
                     manifestDisk = true;
                 }
@@ -299,6 +304,7 @@ internal sealed class VolumeFileIo : IDisposable
             source.Kernel.DiskIOReadInit += RecordRequest;
             source.Kernel.DiskIOWriteInit += RecordRequest;
             string rundownOwner = fileInfoAvailable && !manifestDisk ? owner : null;
+            queryOpenFiles = manifestDisk;
             if (manifestDisk)
                 source.Dynamic.All += e => RecordManifestEvent(e, source);
             else
@@ -514,16 +520,36 @@ internal sealed class VolumeFileIo : IDisposable
         }
         else if (e.ProviderGuid == FileProvider)
         {
+            if (id is 10 or 11)
+            {
+                var key = Convert.ToUInt64(e.PayloadByName("FileKey"));
+                RememberFile(key, (e.PayloadByName("FileName") as string).AsSpan(), id == 11 ? 3 : 1);
+                return;
+            }
+            var fileObject = Convert.ToUInt64(e.PayloadByName("FileObject"));
+            if (id is 12 or 30)
+            {
+                if (fileObject == 0) return;
+                manifestOpens.Remove(fileObject);
+                if (e.PayloadByName("FileName") is string { Length: > 0 } name && (scope.Details || IsVirtualDisk(name)))
+                    manifestOpens.Remember(fileObject, new OpenFile(name));
+                return;
+            }
             if (id is 15 or 16)
                 RecordRequest(e, Convert.ToUInt64(e.PayloadByName("Irp")));
-            else if (id is 10 or 11 or 12 or 14)
+            var opened = manifestOpens.Find(fileObject);
+            if (opened == null) return;
+            ulong streamKey = Convert.ToUInt64(e.PayloadByName("FileKey"));
+            if (streamKey != 0)
             {
-                ulong key = Convert.ToUInt64(e.PayloadByName(id is 10 or 11 ? "FileKey" : "FileObject"));
-                if (id == 14)
-                    ForgetFile(key);
-                else
-                    RememberFile(key, (e.PayloadByName("FileName") as string).AsSpan(), id == 11 ? 3 : 1);
+                // An alias can name bytes already captured on another open of the same stream.
+                // A name observed directly for the stream takes precedence.
+                if (FindOpenFile(streamKey)?.Path == null)
+                    RememberFile(streamKey, opened.Path, 0);
+                manifestOpens.Remove(fileObject);
             }
+            else if (id == 14)
+                manifestOpens.Remove(fileObject);
         }
         else if (e.ProviderGuid == ProcessProvider && id is 1 or 2)
         {
@@ -678,12 +704,18 @@ internal sealed class VolumeFileIo : IDisposable
                     keyless += bucket.KeylessBytes.Where(entry => Includes(entry.Key)).Sum(entry => entry.Value);
             }
         }
+        var pending = queryOpenFiles && readPaths ? new Dictionary<int, long>() : null;
         foreach (var bucket in pathBuckets)
             foreach (var entry in bucket)
             {
                 if (!Includes(entry.Key.Disk))
                     continue;
                 string path = entry.Key.PendingName?.Path ?? entry.Key.File.Path;
+                if (pending != null && entry.Key.PendingName != null && string.IsNullOrEmpty(path))
+                {
+                    int pid = entry.Key.File.Pid;
+                    pending[pid] = pending.GetValueOrDefault(pid) + entry.Value.TotalBytes;
+                }
                 if (string.IsNullOrEmpty(path) || ((!byPath || virtualDisk != null) && !IsVirtualDisk(path)))
                     continue;
                 path = pathIndex.Resolve(path, entry.Key.Disk) ?? pathIndex.Resolve(path, null) ?? path;
@@ -720,6 +752,7 @@ internal sealed class VolumeFileIo : IDisposable
             if (missing.Operations > 0)
                 entries.Add(entry.Key, missing);
         }
+        if (pending != null) fileNameQueries.Resolve(pending);
         return new Snapshot(byPath ? entries : processTotals, diskBytes, namedBytes, seconds, status,
             eventsLost, keyless, outsideScope, end, virtualPaths);
     }
@@ -763,6 +796,7 @@ internal sealed class VolumeFileIo : IDisposable
             disposed = true;
             session?.Stop();
         }
+        fileNameQueries.Dispose();
     }
 }
 
@@ -844,11 +878,7 @@ internal sealed class GuestIoWatch : IDisposable
             diskWrite += sample.DiskWriteBytes;
             limited |= sample.Limited;
             foreach (var row in sample.Rows)
-            {
-                var key = new FileIoKey(row.Pid, row.Process, row.Path);
-                FileIoTotals.AddTo(paths, key, new FileIoTotals { ReadBytes = row.ReadBytes, WriteBytes = row.WriteBytes,
-                    Reads = row.Reads, Writes = row.Writes });
-            }
+                row.AddTo(paths);
         }
         foreach (var entry in paths)
             FileIoTotals.AddTo(processes, entry.Key.ProcessKey, entry.Value);

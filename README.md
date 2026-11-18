@@ -14,7 +14,21 @@ The Windows executable accepts `--export [windows.ndjson]`. The portable .NET en
 
 The exporter preserves each window identity and includes unresolved files in the read/write byte and operation totals. It checks coverage before sending, compresses requests and retries transient failures. A failed input line is reported on standard error and the command exits unsuccessfully. Replaying the original file sends the same identities. The local viewer runs independently of export.
 
+To archive a running Windows source, add `--archive DIRECTORY` to its `--collect` arguments and set the same OTLP logs endpoint in the collector environment. A browser or desktop client can continue reading the same live stream. Each completed window is written to the local directory before publication. A background sender moves acknowledged compressed OTLP requests from `pending` to `delivered/yyyyMMdd`. Restarting collection with the same directory resumes pending deliveries, preserving their original capture IDs and counts. Use one directory per collector and provision storage for the retained files. A finite `--count` run waits for delivery and reports a failed delivery through its exit status.
+
+During ETW startup the live stream can contain CPU samples and a disk status before the first measured disk interval. Archiving starts with the first measured interval, including an idle interval with zero operations.
+
 ### Local web viewer
+
+For live UI development, run `dotnet watch --project Web/PerformanceViewer.Web.csproj` in the Development environment. Supported edits to the shared Razor rankings appear in the open browser while the server and its collectors keep running. Edits to startup configuration can require a restart. For the Windows MAUI shell, start its Debug project with the Visual Studio debugger to use .NET Hot Reload for supported edits. Published desktop executables pick up code changes when the new release launches.
+
+The Disk source selector can also read archived physical or guest-logical intervals from a ClickHouse HTTP endpoint. Configure a `FileHistory` array on the web server. For example, one entry can be `{"Name":"Workstation history","Endpoint":"http://127.0.0.1:8123/","Host":"WORKSTATION","Scope":"host","Layer":"physical","LookbackHours":24}`. For authenticated endpoints set `User` and `PasswordEnvironment` on the entry. The latter names an environment variable on the server. Use HTTPS for credentials sent to a remote endpoint.
+
+Choose a source on Disk and enter the UTC end time. The app reads the latest measured window ending at or before it within the lookback. Its rates use that sample’s own duration. The browser and native window use the same rankings, including unresolved operations. Selecting Live returns to the running collectors. This source expects the `otel.performance_file_window_latest` view over exported file windows.
+
+The browser and MAUI shell can show CPU and disk timelines from a Prometheus-compatible HTTP API. Set `MetricHistory` on the web server with the server base `Endpoint`, a `CpuRatio` range expression returning busy fractions, and `DiskReadBytesPerSecond` and `DiskWriteBytesPerSecond` expressions returning byte rates. Each result label set has its own series. Process and file rows continue to use their own measured windows.
+
+For example, Fleet's existing recording rules are `fleet:host_cpu_busy:ratio`, `fleet:host_disk_read:bytes_per_second` and `fleet:host_disk_write:bytes_per_second`. Standalone installations can supply their own expressions. The defaults are `RangeSeconds=600` and `StepSeconds=10`. VictoriaMetrics supports an optional `LatencyOffsetSeconds`; omit it for Prometheus. `BearerTokenEnvironment` optionally names a server-side credential. Queries are shared per resource and step across connected clients.
 
 Run `dotnet run --project Web/PerformanceViewer.Web.csproj` with .NET 10 and open `http://127.0.0.1:5217`. The Blazor server owns one reader per configured source across browser tabs. The CPU and Disk lists rank both Windows hosts together. Disk groups by process or filename, with separate read, write and total rates. Source status identifies old samples and offline collectors. A replay remains selectable after the last frame.
 
@@ -52,9 +66,11 @@ Publish with the .NET 10 SDK on Windows.
 dotnet publish PerformanceViewer.csproj -c Release
 ```
 
-The Windows x64 executable is under `bin/Release/net10.0-windows/win-x64/publish/` and uses the .NET 10 Desktop Runtime. Run elevated for Windows file I/O tracing and Hyper-V inventory. Hyper-V guests use Windows OpenSSH and the configured AI Fleet cluster SSH identity. Linux CPU sampling uses a POSIX shell, `awk`, and `getconf`. Guest disk attribution requires an ext4 filesystem, Python 3, bpftrace, and Linux tracing access. Hyper-V samples use noninteractive sudo and the guest's installed bpftrace. WSL disk attribution targets the root VHDX of a running distro. On its first sample, the viewer verifies and caches a pinned bpftrace release as the distro root user. If Python 3 is missing, it installs it automatically on distros with apt-get.
+The Windows x64 executable is under `bin/Release/net10.0-windows/win-x64/publish/` and uses the .NET 10 Desktop Runtime. Run elevated for Windows file I/O tracing and Hyper-V inventory. Hyper-V guests use Windows OpenSSH and the configured AI Fleet cluster SSH identity. Linux CPU sampling uses a POSIX shell, `awk`, and `getconf`. Guest disk attribution uses Python 3, bpftrace and Linux tracing access. Hyper-V SCSI slots support ext4. The guest root sampler supports ext4 and Btrfs. Hyper-V samples use noninteractive sudo and the guest's installed bpftrace. WSL disk attribution targets the root VHDX of a running distro. On its first sample, the viewer verifies and caches a pinned bpftrace release as the distro root user. If Python 3 is missing, it installs it automatically on distros with apt-get.
 
 ## Configuration
+
+On a Linux guest with a Btrfs root, run `python3 GuestDiskIo.py root` with tracing privileges for one six-second sample. `python3 GuestDiskIo.py loop root` streams successive samples. On OrbStack the same entry point can run through `orb -m <machine> -u root python3 - root < GuestDiskIo.py` on the Mac. It resolves the guest-visible path under the root subvolume and reports logical read/write bytes and completed operations per guest PID. These include cache hits. Shared virtual block-device traffic can span several guests and is excluded from this sample.
 
 Guest sampling connects to each VM as `fleet@<vm-name>.<domain>`. The domain has no default. Set it with the `PERFORMANCE_VIEWER_GUEST_DOMAIN` environment variable, or with `guestDomain` in `%LOCALAPPDATA%\AIFleetPerformanceViewer\settings.json`:
 
@@ -71,3 +87,18 @@ winget install OpenAgency.AIFleet.PerformanceViewer
 ```
 
 Released under the MIT License.
+
+### Linux guest file activity in the web viewer
+
+Add a guest to the web host's existing `Sources` array alongside its Mac or Windows collector. Set `GuestOf` to the host name emitted by that collector, and `Name` to the guest name. For example, for an OrbStack guest:
+
+```json
+{
+  "Name": "kube-worker-3",
+  "GuestOf": "josh-mac",
+  "Command": "orb",
+  "Arguments": ["-m", "kube-worker-3", "-u", "root", "python3", "-", "loop", "root"]
+}
+```
+
+The server sends its bundled Linux sampler to the command over stdin. The same source can run over SSH with a remote Python interpreter that can attach the filesystem probes. In Disk, select **File** and sort by **Guest total**, **Guest read**, or **Guest write**. Host impact and guest file activity have separate totals. A guest using a shared backing device has no individually measured host share, shown as a dash. Deselect the guest to hide its rows.

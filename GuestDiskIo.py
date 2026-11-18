@@ -1,9 +1,12 @@
-"""Bounded ext4 I/O samples of a guest's disks: one sample of the WSL root disk (argument `root`) or of one Hyper-V SCSI
+"""Bounded I/O samples of a guest's disks: one sample of an ext4/Btrfs guest root (argument `root`) or of one Hyper-V SCSI
 slot (a slot number), or `loop` and slot numbers: one sample of all those slots after another, one JSON line each, for as
 long as the caller reads them. A loop runs one bpftrace at a time over every listed disk, inside the one ssh login that
 started it, instead of a login, a sudo, a Python start and a bpftrace per disk per sample."""
 
 import hashlib
+import struct
+import uuid
+from dataclasses import dataclass
 import json
 import os
 import platform
@@ -39,15 +42,37 @@ def read_json(args):
     return json.loads(subprocess.check_output(args, text=True, timeout=4))
 
 
-def select_wsl_root():
-    mount, = read_json(["findmnt", "-J", "-l", "-M", "/", "-o", "SOURCE,FSTYPE,FSROOT,MAJ:MIN"])["filesystems"]
+@dataclass(frozen=True)
+class BtrfsRoot:
+    filesystem: uuid.UUID
+    tree: int
+    inode: int
+
+
+def select_guest_root():
+    mount, = read_json(["findmnt", "-J", "-l", "-M", "/", "-o", "SOURCE,FSTYPE,FSROOT,MAJ:MIN,UUID"])["filesystems"]
+    if mount["fstype"] == "btrfs":
+        import fcntl
+        if not mount.get("uuid"):
+            raise DiskError("Could not identify the Btrfs filesystem UUID for the guest root.")
+        # BTRFS_IOC_INO_LOOKUP with treeid zero and FIRST_FREE_OBJECTID
+        # returns the containing subvolume, including for a bind-mounted directory.
+        args = bytearray(4096)
+        struct.pack_into("=QQ", args, 0, 0, 256)
+        fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            fcntl.ioctl(fd, 0xD0009412, args, True)
+            root = BtrfsRoot(uuid.UUID(mount["uuid"]), struct.unpack_from("=Q", args)[0], os.fstat(fd).st_ino)
+        finally:
+            os.close(fd)
+        return mount["source"], {root.tree: "/"}, root
     if mount["fstype"] != "ext4" or mount["fsroot"] != "/" or not mount["source"].startswith("/dev/"):
-        fail("The WSL root filesystem could not be matched to an ext4 block device.")
+        fail("Guest root sampling requires ext4 or a Btrfs root subvolume.")
     major, minor = map(int, mount["maj:min"].split(":"))
-    return mount["source"], {(major << 20) | minor: "/"}
+    return mount["source"], {(major << 20) | minor: "/"}, None
 
 
-def wsl_bpftrace():
+def guest_bpftrace():
     # Older distro packages cannot read the BTF emitted by current WSL kernels.
     # Keep the pinned upstream tool in the root user's cache, outside the package database.
     arch = platform.machine()
@@ -89,7 +114,7 @@ def wsl_bpftrace():
                 if not os.access(executable, os.X_OK):
                     raise
     except (OSError, subprocess.SubprocessError) as error:
-        fail(f"Could not set up bpftrace in WSL ({type(error).__name__}).")
+        fail(f"Could not set up guest bpftrace: {error}")
     return str(executable)
 
 
@@ -122,14 +147,23 @@ def select_disk(location):
     return disk["path"], roots
 
 
-def bpf_program(devices):
+def bpf_program(devices, btrfs=None):
     condition = " || ".join(f"$dev == {dev}" for dev in devices)
+    scope = "$dev = $file->f_inode->i_sb->s_dev;"
+    filesystem = "ext4"
+    if btrfs:
+        filesystem = "btrfs"
+        scope = ("$inode = (struct btrfs_inode *)((uint64)$file->f_inode - offsetof(struct btrfs_inode, vfs_inode)); "
+                 "$dev = $inode->root->root_key.objectid;")
+        same_filesystem = " && ".join(f"(uint8)$file->f_inode->i_sb->s_uuid.b[{i}] == {b}"
+                                      for i, b in enumerate(btrfs.filesystem.bytes))
+        condition = f"pid(curr_ns) > 0 && $dev == {btrfs.tree} && {same_filesystem}"
     probe = r"""
-kretfunc:ext4_file_DIRECTION_iter
+kretfunc:FILESYSTEM_file_DIRECTION_iter
 /retval > 0/
 {
     $file = args.iocb->ki_filp;
-    $dev = $file->f_inode->i_sb->s_dev;
+    SCOPE
     if (CONDITION) {
         $d = $file->f_path.dentry;
         $ino = $file->f_inode->i_ino;
@@ -173,6 +207,7 @@ kretfunc:ext4_file_DIRECTION_iter
 """
     directions = ("read", "write")
     probes = "".join(probe.replace("DIRECTION", direction).replace("CONDITION", condition)
+                     .replace("FILESYSTEM", filesystem).replace("SCOPE", scope)
                      .replace("DEPTH_LIMIT", str(DEPTH)).replace("CACHE_SLOTS", str(MAP_LIMIT))
                      for direction in directions)
     reported = ["comm"]
@@ -210,7 +245,7 @@ def decode_trace(output):
     return maps, nodes, overflow
 
 
-def report(trace, device, roots, name_capacity):
+def report(trace, device, roots, name_capacity, btrfs=None):
     """The sample of one disk (`device`, its ext4 filesystems `roots`) from one bpftrace run over one or more disks."""
     maps, nodes, overflow = trace
     processes = maps.get("@comm", {})
@@ -223,6 +258,10 @@ def report(trace, device, roots, name_capacity):
         parts = []
         root = roots[dev]
         for _ in range(DEPTH):
+            if btrfs and key[1] == btrfs.inode:
+                return "/" + "/".join(reversed(parts))
+            if btrfs and key[1] == 256:  # Top of this subvolume. A sibling bind root has no guest path here.
+                return "(path unavailable)"
             node = nodes.get(key)
             if node is None:
                 # The read/write counters can arrive without the dentry name event.
@@ -232,10 +271,14 @@ def report(trace, device, roots, name_capacity):
                 break
             parent, parent_inode, name = node
             if parent == key[0]:
+                if btrfs:
+                    return "(path unavailable)"
                 return (root or "(filesystem root)").rstrip("/") + "/" + "/".join(reversed(parts))
             if name:
                 parts.append(label(name))
             key = parent, parent_inode
+        if btrfs:
+            return "(path unavailable)"
         return "…/" + "/".join(reversed(parts)) if parts else "(path unavailable)"
 
     rows = {}
@@ -299,30 +342,32 @@ def block_snapshot(device):
         return None
 
 
-def sample(tracer, devices, name_capacity, wsl):
+def sample(tracer, devices, name_capacity, root_mode, btrfs=None):
     """One bpftrace run over every disk in `devices` ({slot or "root": (device path, roots)}): ({slot: sample},
     {slot: why that disk has no sample}). A run that cannot start raises DiskError."""
     roots = {dev: root for _, disk_roots in devices.values() for dev, root in disk_roots.items()}
     options = dict(os.environ, BPFTRACE_MAX_STRLEN=str(name_capacity), BPFTRACE_MAX_MAP_KEYS=str(MAP_LIMIT),
                    BPFTRACE_PERF_RB_PAGES="128")
-    command = [tracer, "--no-warnings"] if wsl else [tracer]
-    before = {slot: block_snapshot(device) for slot, (device, _) in devices.items()}
-    result = subprocess.run(command + ["-q", "-f", "json", "-"], input=bpf_program(roots),
+    command = [tracer, "--no-warnings"] if root_mode else [tracer]
+    # A Btrfs block device can serve several independent guests.
+    block_devices = {} if btrfs else devices
+    before = {slot: block_snapshot(device) for slot, (device, _) in block_devices.items()}
+    result = subprocess.run(command + ["-q", "-f", "json", "-"], input=bpf_program(roots, btrfs),
                             text=True, encoding="utf-8", errors="replace", capture_output=True,
                             timeout=17, env=options)
-    after = {slot: block_snapshot(device) for slot, (device, _) in devices.items()}
+    after = {slot: block_snapshot(device) for slot, (device, _) in block_devices.items()}
     if result.returncode != 0:
         lines = result.stderr.strip().splitlines()
-        raise DiskError("Could not attach the ext4 probes." + (" " + lines[0][:140] if lines else ""))
+        raise DiskError("Could not attach the guest filesystem probes." + (" " + lines[0][:240] if lines else ""))
     trace = decode_trace(result.stdout)
     samples, errors = {}, {}
     for slot, (device, disk_roots) in devices.items():
         try:
-            disk = report(trace, device, disk_roots, name_capacity)
+            disk = report(trace, device, disk_roots, name_capacity, btrfs)
         except DiskError as error:
             errors[slot] = str(error)
             continue
-        start, end = before[slot], after[slot]
+        start, end = before.get(slot), after.get(slot)
         if start and end and end[0] > start[0] and end[1] >= start[1] and end[2] >= start[2]:
             disk.update(DiskSeconds=end[0] - start[0], DiskReadBytes=end[1] - start[1], DiskWriteBytes=end[2] - start[2])
         samples[slot] = disk
@@ -332,23 +377,28 @@ def sample(tracer, devices, name_capacity, wsl):
 def main():
     loop = sys.argv[1] == "loop"
     targets = sys.argv[2:] if loop else sys.argv[1:2]
-    wsl = targets == ["root"]
+    root_mode = targets == ["root"]
+    btrfs = None
     devices, unavailable = {}, {}
     for target in targets:
         try:
-            devices[target] = select_wsl_root() if wsl else select_disk(int(target))
+            if root_mode:
+                device, roots, btrfs = select_guest_root()
+                devices[target] = device, roots
+            else:
+                devices[target] = select_disk(int(target))
         except DiskError as error:
             if not loop:
                 fail(str(error))
             unavailable[target] = str(error)
-    tracer = wsl_bpftrace() if wsl else shutil.which("bpftrace")
+    tracer = guest_bpftrace() if root_mode else shutil.which("bpftrace")
     if tracer is None:
         fail("bpftrace is unavailable in this guest.")
     # The newer compiler cannot load this probe with the larger stack buffer.
-    name_capacity = 128 if wsl else 192
+    name_capacity = 128 if root_mode else 192
     if not loop:
         try:
-            samples, errors = sample(tracer, devices, name_capacity, wsl)
+            samples, errors = sample(tracer, devices, name_capacity, root_mode, btrfs)
         except DiskError as error:
             fail(str(error))
         if targets[0] in errors:
@@ -363,13 +413,13 @@ def main():
         samples = {}
         if devices:
             try:
-                samples, failed = sample(tracer, devices, name_capacity, wsl)
+                samples, failed = sample(tracer, devices, name_capacity, root_mode, btrfs)
                 errors.update(failed)
             except DiskError as error:
                 errors.update((slot, str(error)) for slot in devices)
         if not samples:
             time.sleep(SECONDS)  # nothing traced this run: pace the loop as a run would
-        line = json.dumps({"Samples": samples, "Errors": {slot: "Guest disk I/O: " + reason for slot, reason in errors.items()}},
+        line = json.dumps({"End": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "Samples": samples, "Errors": {slot: "Guest disk I/O: " + reason for slot, reason in errors.items()}},
                           separators=(",", ":"))
         sys.stdout.write(line + "\n")
         sys.stdout.flush()

@@ -1668,12 +1668,17 @@ internal sealed class Timeline : Form
     [STAThread]
     private static void Main(string[] args)
     {
-            if (args.Length > 0 && args[0] == "--export")
-            {
-                Environment.ExitCode = FileWindowExport.Run(args[1..]).GetAwaiter().GetResult();
-                return;
-            }
-            if (args.Length > 0 && args[0] == "--collect")
+        if (args.Length > 0 && args[0] == "--resolve-disk-files")
+        {
+            Environment.ExitCode = WindowsDiskFileNames.Query(args[1..]);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--export")
+        {
+            Environment.ExitCode = FileWindowExport.Run(args[1..]).GetAwaiter().GetResult();
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--collect")
         {
             Environment.ExitCode = WindowsSampleStream.Run(args[1..]).GetAwaiter().GetResult();
             return;

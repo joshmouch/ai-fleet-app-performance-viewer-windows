@@ -17,11 +17,6 @@ internal sealed record VmDisk(string VMName, string Path, string Controller, int
 
 internal sealed record VmDiskOwners(string Label, VmDisk Attachment);
 
-internal sealed record GuestIoRow(int Pid, string Process, string Path, long ReadBytes, long WriteBytes, long Reads, long Writes);
-
-internal sealed record GuestIoSample(string Device, int Seconds, GuestIoRow[] Rows, bool Limited,
-    double DiskSeconds, long DiskReadBytes, long DiskWriteBytes);
-
 internal static class VmDiskIo
 {
     private static readonly Encoding ScriptEncoding = new UTF8Encoding(false);
@@ -143,7 +138,6 @@ internal static class VmDiskIo
     }
 
     /// <summary>One run of the guest loop: a sample per disk, or why a disk has none (the others still sample).</summary>
-    private sealed record GuestDiskLine(Dictionary<string, GuestIoSample> Samples, Dictionary<string, string> Errors);
 
     private sealed class GuestDiskSession(string vmName)
     {

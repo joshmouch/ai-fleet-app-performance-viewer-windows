@@ -7,6 +7,7 @@ namespace PerformanceViewer.Web;
 internal sealed class SourceConfig
 {
     public string Name { get; set; } = "";
+    public string? GuestOf { get; set; }
     public string? Command { get; set; }
     public string[] Arguments { get; set; } = [];
     public string? ReplayFile { get; set; }
@@ -19,14 +20,18 @@ internal sealed class WindowSources : BackgroundService
     {
         public SourceConfig Config { get; } = config;
         public PerformanceWindow? Frame;
+        public GuestDiskWindow? Guest;
+        public DateTimeOffset? GuestEnd;
         public string? Status = "Waiting for first sample";
     }
 
     private readonly Source[] sources;
     private readonly object gate = new();
+    private readonly IHostApplicationLifetime lifetime;
 
-    public WindowSources(IConfiguration configuration)
+    public WindowSources(IConfiguration configuration, IHostApplicationLifetime lifetime)
     {
+        this.lifetime = lifetime;
         var configured = configuration.GetSection("Sources").Get<SourceConfig[]>();
         if (configured == null && OperatingSystem.IsWindows())
             configured = [new() { Name = "Local Windows", Command = "aifleet-performance-viewer.exe", Arguments = ["--collect", "--guests"] }];
@@ -53,10 +58,13 @@ internal sealed class WindowSources : BackgroundService
             var windows = sources.Select(s =>
             {
                 bool replay = s.Config.ReplayFile != null;
-                bool stale = !replay && s.Frame != null && (s.Status != null ||
-                    now - s.Frame.CpuEnd > TimeSpan.FromSeconds(s.Config.StaleAfterSeconds));
-                bool selected = !stale && s.Frame != null && claimed.Add(s.Frame.Host);
-                return new SourceWindow(s.Config.Name, s.Frame, s.Status, replay, stale, selected);
+                var end = s.Frame?.CpuEnd ?? s.GuestEnd;
+                bool stale = !replay && end.HasValue && (s.Status != null ||
+                    now - end.Value > TimeSpan.FromSeconds(s.Config.StaleAfterSeconds));
+                bool scoped = s.Frame != null && s.Frame.DiskPaths.Scope != "host";
+                bool selected = !scoped && !stale && (s.Guest != null || (s.Frame != null && claimed.Add(s.Frame.Host)));
+                return new SourceWindow(s.Config.Name, s.Frame, scoped ? "Process-scoped capture; excluded from host aggregate" : s.Status,
+                    replay, stale, selected, s.Config.GuestOf, s.Guest, s.GuestEnd);
             }).ToArray();
             if (last == null || !last.Windows.SequenceEqual(windows))
                 last = new(windows, $"\"{Guid.NewGuid():N}\"");
@@ -64,8 +72,14 @@ internal sealed class WindowSources : BackgroundService
         }
     }
 
-    protected override Task ExecuteAsync(CancellationToken stop) =>
-        Task.WhenAll(sources.Select(source => Run(source, stop)));
+    protected override async Task ExecuteAsync(CancellationToken stop)
+    {
+        // Only the host that successfully binds the viewer port owns its collectors.
+        var listening = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using (lifetime.ApplicationStarted.Register(() => listening.TrySetResult()))
+            await listening.Task.WaitAsync(stop);
+        await Task.WhenAll(sources.Select(source => Run(source, stop)));
+    }
 
     private async Task Run(Source source, CancellationToken stop)
     {
@@ -77,18 +91,25 @@ internal sealed class WindowSources : BackgroundService
                 {
                     using var reader = File.OpenText(path);
                     await ReadFrames(source, reader, stop);
-                    lock (gate) source.Status = source.Frame == null ? "Empty replay" : "Replay complete";
+                    lock (gate) source.Status = source.Frame == null && source.Guest == null ? source.Status ?? "Empty replay" : "Replay complete";
                     return;
                 }
 
                 var start = new ProcessStartInfo(source.Config.Command!)
                 {
-                    UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true
+                    UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true,
+                    RedirectStandardInput = source.Config.GuestOf != null
                 };
                 foreach (var arg in source.Config.Arguments) start.ArgumentList.Add(arg);
                 using var process = Process.Start(start) ?? throw new IOException("Collector could not start.");
                 try
                 {
+                    if (start.RedirectStandardInput)
+                    {
+                        using var sampler = typeof(WindowSources).Assembly.GetManifestResourceStream("GuestDiskIo.py")!;
+                        await sampler.CopyToAsync(process.StandardInput.BaseStream, stop);
+                        process.StandardInput.Close();
+                    }
                     await ReadFrames(source, process.StandardOutput, stop);
                     await process.WaitForExitAsync(stop);
                     lock (gate) source.Status = $"Collector exited ({process.ExitCode})";
@@ -97,8 +118,17 @@ internal sealed class WindowSources : BackgroundService
                 {
                     if (!process.HasExited)
                     {
-                        process.Kill(entireProcessTree: true);
-                        await process.WaitForExitAsync();
+                        CollectorProcess.RequestStop(process);
+                        // A collector emits its last measured window during termination.
+                        // Keep reading so a full stdout pipe cannot hold the child open.
+                        var drain = process.StandardOutput.BaseStream.CopyToAsync(Stream.Null);
+                        try { await process.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(5)); }
+                        catch (TimeoutException)
+                        {
+                            if (!process.HasExited) process.Kill(entireProcessTree: true);
+                            await process.WaitForExitAsync();
+                        }
+                        await drain;
                     }
                 }
             }
@@ -117,6 +147,36 @@ internal sealed class WindowSources : BackgroundService
     {
         while (await reader.ReadLineAsync(stop) is string line)
         {
+            if (source.Config.GuestOf != null)
+            {
+                var sample = System.Text.Json.JsonSerializer.Deserialize<GuestDiskLine>(line);
+                if (sample?.Samples == null || sample.Errors == null)
+                    throw new InvalidDataException("Expected a guest disk sample.");
+                if (sample.Errors.TryGetValue("root", out var error))
+                {
+                    lock (gate) { source.Guest = null; source.GuestEnd = null; source.Status = error; }
+                    continue;
+                }
+                if (!sample.Samples.TryGetValue("root", out var root) || root?.Rows == null || root.Seconds <= 0)
+                    throw new InvalidDataException("Missing root filesystem sample or duration.");
+                var files = new Dictionary<FileIoKey, FileIoTotals>();
+                foreach (var row in root.Rows)
+                {
+                    if (row == null || row.Process == null || row.Path == null || row.ReadBytes < 0 ||
+                        row.WriteBytes < 0 || row.Reads < 0 || row.Writes < 0)
+                        throw new InvalidDataException("Invalid guest file counters.");
+                    row.AddTo(files);
+                }
+                var guest = new GuestDiskWindow(source.Config.Name, source.Config.Name, root.Device, [], root.Seconds,
+                    files.Select(f => new MeasuredFile(f.Key, f.Value)).ToArray(), root.Limited, null);
+                lock (gate)
+                {
+                    source.Guest = guest;
+                    source.GuestEnd = sample.End ?? DateTimeOffset.UtcNow;
+                    source.Status = null;
+                }
+                continue;
+            }
             var frame = PerformanceWindow.Decode(line);
             lock (gate)
             {

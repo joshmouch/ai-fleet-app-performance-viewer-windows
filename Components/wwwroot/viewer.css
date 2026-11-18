@@ -18,4 +18,7 @@ td, th { text-align: left; padding: .38rem .65rem; border-bottom: 1px solid colo
 th { background: color-mix(in srgb, CanvasText 7%, Canvas); white-space: nowrap; font-weight: 600; }
 td.num, th.num { font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; }
 .path { overflow-wrap: anywhere; min-width: 15rem; }
+.metric-series { display: grid; grid-template-columns: minmax(9rem, 1fr) minmax(6rem, 3fr) minmax(6rem, auto); align-items: center; gap: .75rem; margin-block: .25rem; }
+.metric-series svg { width: 100%; height: 2.25rem; color: Highlight; background: color-mix(in srgb, CanvasText 6%, Canvas); }
+.metric-series .num { text-align: right; font-variant-numeric: tabular-nums; }
 p { margin: .75rem 0; }
