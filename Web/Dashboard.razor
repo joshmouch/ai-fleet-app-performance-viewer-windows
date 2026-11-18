@@ -1,0 +1,42 @@
+@using PerformanceViewer.Components
+@implements IAsyncDisposable
+@inject WindowSources Sources
+
+<Rankings Sources="windows" />
+
+@code {
+    private SourceWindow[] windows = [];
+    private readonly CancellationTokenSource stop = new();
+    private Task? refresh;
+
+    protected override void OnInitialized() => windows = Sources.Read();
+
+    protected override void OnAfterRender(bool firstRender)
+    {
+        if (firstRender) refresh = Refresh();
+    }
+
+    private async Task Refresh()
+    {
+        using var timer = new PeriodicTimer(TimeSpan.FromSeconds(1));
+        try
+        {
+            while (await timer.WaitForNextTickAsync(stop.Token))
+                await InvokeAsync(() =>
+                {
+                    var current = Sources.Read();
+                    if (windows.SequenceEqual(current)) return;
+                    windows = current;
+                    StateHasChanged();
+                });
+        }
+        catch (OperationCanceledException) when (stop.IsCancellationRequested) { }
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        stop.Cancel();
+        if (refresh != null) await refresh;
+        stop.Dispose();
+    }
+}
