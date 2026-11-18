@@ -117,6 +117,9 @@ internal sealed class VolumeFileIo : IDisposable
 {
     private const string SessionPrefix = "CpuTimelines-FileIo-";
     private static readonly Guid FileInfoProvider = new("a319d300-015c-48be-acdb-47746e154751");
+    private static readonly Guid DiskProvider = new("c7bde69a-e1e0-4177-b6ef-283ad1525271");
+    private static readonly Guid FileProvider = new("edd08927-9cc4-4e65-b970-c2560fb5c289");
+    private static readonly Guid ProcessProvider = new("22fb2cd6-0e7b-422b-a0c7-2fad1fd0e716");
     // FileInfo minifilter: file name create (1), rundown (2), delete (3).
     private const ulong FileNameEvents = 0x00010000 | 0x00020000 | 0x00040000;
     private const int BucketSeconds = 5;
@@ -261,11 +264,28 @@ internal sealed class VolumeFileIo : IDisposable
             // published only after it is enabled; a Dispose that won the race is handled by the check under the lock.
             ReapAbandonedSessions();
             var opened = OpenSession(owner);
+            bool manifestDisk = false;
             try
             {
-                opened.EnableKernelProvider(KernelTraceEventParser.Keywords.DiskIO |
-                    KernelTraceEventParser.Keywords.DiskIOInit | KernelTraceEventParser.Keywords.DiskFileIO |
-                    KernelTraceEventParser.Keywords.Process | KernelTraceEventParser.Keywords.Thread);
+                try
+                {
+                    opened.EnableKernelProvider(KernelTraceEventParser.Keywords.DiskIO |
+                        KernelTraceEventParser.Keywords.DiskIOInit | KernelTraceEventParser.Keywords.DiskFileIO |
+                        KernelTraceEventParser.Keywords.Process | KernelTraceEventParser.Keywords.Thread);
+                }
+                catch (Exception ex) when (ex.HResult == unchecked((int)0x800705AA) ||
+                    ex.HResult == unchecked((int)0xC000009A) || ex is Win32Exception { NativeErrorCode: 1450 })
+                {
+                    // Windows allows eight system loggers. These manifest providers also
+                    // report disk completions and can run together in an ordinary session.
+                    opened.Dispose();
+                    opened = OpenSession(owner);
+                    opened.EnableProvider(DiskProvider);
+                    opened.EnableProvider(FileProvider, TraceEventLevel.Verbose, 0x3B0,
+                        new TraceEventProviderOptions { EventIDsToEnable = new[] { 10, 11, 12, 14, 15, 16 } });
+                    opened.EnableProvider(ProcessProvider, TraceEventLevel.Informational, 0x10);
+                    manifestDisk = true;
+                }
                 try
                 {
                     opened.EnableProvider(FileInfoProvider, TraceEventLevel.Verbose, FileNameEvents);
@@ -307,9 +327,14 @@ internal sealed class VolumeFileIo : IDisposable
             source.Kernel.FileIOFileDelete += e => RememberFile(e.FileKey, e.FileName, 3);
             source.Kernel.DiskIOReadInit += RecordRequest;
             source.Kernel.DiskIOWriteInit += RecordRequest;
-            string rundownOwner = fileInfoAvailable ? owner : null;
-            source.Kernel.DiskIORead += e => RecordDisk(e, false, source, rundownOwner);
-            source.Kernel.DiskIOWrite += e => RecordDisk(e, true, source, rundownOwner);
+            string rundownOwner = fileInfoAvailable && !manifestDisk ? owner : null;
+            if (manifestDisk)
+                source.Dynamic.All += e => RecordManifestEvent(e, source);
+            else
+            {
+                source.Kernel.DiskIORead += e => RecordKernelDisk(e, false, source, rundownOwner);
+                source.Kernel.DiskIOWrite += e => RecordKernelDisk(e, true, source, rundownOwner);
+            }
             System.Threading.Volatile.Write(ref started, Stopwatch.GetTimestamp());
             status = null;
             if (!disposed)
@@ -482,7 +507,12 @@ internal sealed class VolumeFileIo : IDisposable
 
     private void RecordRequest(DiskIOInitTraceData e)
     {
-        if (disposed || e.Irp == 0 || e.ProcessID <= 0)
+        RecordRequest(e, e.Irp);
+    }
+
+    private void RecordRequest(TraceEvent e, ulong irp)
+    {
+        if (disposed || irp == 0 || e.ProcessID <= 0)
             return;
         double time = e.TimeStampRelativeMSec;
         if (requests.Count >= MaxRequests && time >= nextRequestTrim)
@@ -492,32 +522,69 @@ internal sealed class VolumeFileIo : IDisposable
                 .Select(pair => pair.Key).ToArray())
                 requests.Remove(key);
         }
-        if (requests.Count < MaxRequests || requests.ContainsKey(e.Irp))
-            requests[e.Irp] = new DiskRequest(e.ProcessID, e.ThreadID, time, processes.GetValueOrDefault(e.ProcessID));
+        if (requests.Count < MaxRequests || requests.ContainsKey(irp))
+            requests[irp] = new DiskRequest(e.ProcessID, e.ThreadID, time, processes.GetValueOrDefault(e.ProcessID));
     }
 
     private static bool IsVirtualDisk(ReadOnlySpan<char> path) =>
         path.EndsWith(".vhdx", StringComparison.OrdinalIgnoreCase) ||
         path.EndsWith(".avhdx", StringComparison.OrdinalIgnoreCase);
 
-    private void RecordDisk(DiskIOTraceData e, bool write, ETWTraceEventSource source, string rundownOwner)
+    private void RecordManifestEvent(TraceEvent e, ETWTraceEventSource source)
+    {
+        int id = (int)e.ID;
+        if (e.ProviderGuid == DiskProvider && id is 10 or 11)
+        {
+            long bytes = Convert.ToUInt32(e.PayloadByName("TransferSize"));
+            int disk = Convert.ToInt32(e.PayloadByName("DiskNumber"));
+            double elapsed = Convert.ToUInt64(e.PayloadByName("HighResResponseTime")) * 1000.0 / Stopwatch.Frequency;
+            RecordDisk(e, id == 11, source, null, disk, bytes,
+                Convert.ToUInt64(e.PayloadByName("FileObject")), Convert.ToUInt64(e.PayloadByName("IORequestPacket")), elapsed);
+        }
+        else if (e.ProviderGuid == FileProvider)
+        {
+            if (id is 15 or 16)
+                RecordRequest(e, Convert.ToUInt64(e.PayloadByName("Irp")));
+            else if (id is 10 or 11 or 12 or 14)
+            {
+                ulong key = Convert.ToUInt64(e.PayloadByName(id is 10 or 11 ? "FileKey" : "FileObject"));
+                if (id == 14)
+                    ForgetFile(key);
+                else
+                    RememberFile(key, (e.PayloadByName("FileName") as string).AsSpan(), id == 11 ? 3 : 1);
+            }
+        }
+        else if (e.ProviderGuid == ProcessProvider && id is 1 or 2)
+        {
+            int pid = Convert.ToInt32(e.PayloadByName("ProcessID"));
+            if (id == 2)
+                processes.Remove(pid);
+            else if (e.PayloadByName("ImageName") is string image)
+                processes[pid] = System.IO.Path.GetFileName(image);
+        }
+    }
+
+    private void RecordKernelDisk(DiskIOTraceData e, bool write, ETWTraceEventSource source, string rundownOwner) =>
+        RecordDisk(e, write, source, rundownOwner, e.DiskNumber, e.TransferSize, e.FileKey, e.Irp, e.ElapsedTimeMSec);
+
+    private void RecordDisk(TraceEvent e, bool write, ETWTraceEventSource source, string rundownOwner,
+        int disk, long bytes, ulong fileKey, ulong irp, double elapsed)
     {
         if (disposed)
             return;
-        bool hasRequest = requests.Remove(e.Irp, out var request);
+        bool hasRequest = requests.Remove(irp, out var request);
         var selection = scope;
         bool detail = selection.Details;
-        bool virtualDisk = Array.IndexOf(selection.VirtualDisks, e.DiskNumber) >= 0;
-        if ((!detail && !virtualDisk) || e.TransferSize <= 0)
+        bool virtualDisk = Array.IndexOf(selection.VirtualDisks, disk) >= 0;
+        if ((!detail && !virtualDisk) || bytes <= 0)
             return;
 
-        ulong fileKey = e.FileKey;
         OpenFile attachment = fileKey != 0 ? virtualFiles.Find(fileKey) : null;
         OpenFile observed = fileKey != 0 && attachment == null ? observedFiles.Find(fileKey) : null;
         OpenFile file = attachment ?? observed ?? (fileKey != 0 ? recentNames.Find(fileKey) : null);
         if (file?.Path == null)
         {
-            string path = e.FileName;
+            string path = (e as DiskIOTraceData)?.FileName;
             if (string.IsNullOrEmpty(path))
                 path = null;
             if ((detail && fileKey != 0) || path != null)
@@ -547,15 +614,15 @@ internal sealed class VolumeFileIo : IDisposable
         int pid = e.ProcessID;
         string process = processes.GetValueOrDefault(pid) ?? e.ProcessName;
         if (pid <= 0 && hasRequest && (e.ThreadID <= 0 || request.Thread <= 0 || e.ThreadID == request.Thread) &&
-            Math.Abs(e.TimeStampRelativeMSec - e.ElapsedTimeMSec - request.Time) < 2)
+            Math.Abs(e.TimeStampRelativeMSec - elapsed - request.Time) < 2)
         {
             pid = request.Pid;
             process = request.Process ?? processes.GetValueOrDefault(pid);
         }
         if (string.IsNullOrWhiteSpace(process))
             process = pid == 4 ? "System" : "Unknown";
-        var count = write ? new FileIoTotals { WriteBytes = e.TransferSize, Writes = 1 }
-            : new FileIoTotals { ReadBytes = e.TransferSize, Reads = 1 };
+        var count = write ? new FileIoTotals { WriteBytes = bytes, Writes = 1 }
+            : new FileIoTotals { ReadBytes = bytes, Reads = 1 };
         long now = Stopwatch.GetTimestamp() / Stopwatch.Frequency;
         long second = now / BucketSeconds * BucketSeconds;
         lock (samples)
@@ -571,21 +638,21 @@ internal sealed class VolumeFileIo : IDisposable
             }
             var bucket = currentBucket;
             if (virtualPath != null)
-                FileIoTotals.AddTo(bucket.VirtualDisks, (e.DiskNumber, virtualPath), count);
+                FileIoTotals.AddTo(bucket.VirtualDisks, (disk, virtualPath), count);
             if (!detail)
                 return;
             var key = new FileIoKey(pid, process, "");
-            FileIoTotals.AddTo(bucket.Processes, (e.DiskNumber, key), count);
+            FileIoTotals.AddTo(bucket.Processes, (disk, key), count);
             if (file == null)
             {
-                bucket.KeylessBytes[e.DiskNumber] = bucket.KeylessBytes.GetValueOrDefault(e.DiskNumber) + count.TotalBytes;
+                bucket.KeylessBytes[disk] = bucket.KeylessBytes.GetValueOrDefault(disk) + count.TotalBytes;
                 return;
             }
             // Aggregate known paths across opens, while keeping the identity of files
             // that can still receive a name from a later trace event.
             string path = file.Path;
-            var pathKey = path == null ? new DiskPathKey(e.DiskNumber, key, file)
-                : new DiskPathKey(e.DiskNumber, key with { Path = path }, null);
+            var pathKey = path == null ? new DiskPathKey(disk, key, file)
+                : new DiskPathKey(disk, key with { Path = path }, null);
             FileIoTotals.AddTo(bucket.Paths, pathKey, count);
         }
     }
