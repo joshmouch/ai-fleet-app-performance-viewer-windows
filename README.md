@@ -52,9 +52,11 @@ Publish with the .NET 10 SDK on Windows.
 dotnet publish PerformanceViewer.csproj -c Release
 ```
 
-The Windows x64 executable is under `bin/Release/net10.0-windows/win-x64/publish/` and uses the .NET 10 Desktop Runtime. Run elevated for Windows file I/O tracing and Hyper-V inventory. Hyper-V guests use Windows OpenSSH and the configured AI Fleet cluster SSH identity. Linux CPU sampling uses a POSIX shell, `awk`, and `getconf`. Guest disk attribution requires an ext4 filesystem, Python 3, bpftrace, and Linux tracing access. Hyper-V samples use noninteractive sudo and the guest's installed bpftrace. WSL disk attribution targets the root VHDX of a running distro. On its first sample, the viewer verifies and caches a pinned bpftrace release as the distro root user. If Python 3 is missing, it installs it automatically on distros with apt-get.
+The Windows x64 executable is under `bin/Release/net10.0-windows/win-x64/publish/` and uses the .NET 10 Desktop Runtime. Run elevated for Windows file I/O tracing and Hyper-V inventory. Hyper-V guests use Windows OpenSSH and the configured AI Fleet cluster SSH identity. Linux CPU sampling uses a POSIX shell, `awk`, and `getconf`. Guest disk attribution uses Python 3, bpftrace and Linux tracing access. Hyper-V SCSI slots support ext4. The guest root sampler supports ext4 and Btrfs. Hyper-V samples use noninteractive sudo and the guest's installed bpftrace. WSL disk attribution targets the root VHDX of a running distro. On its first sample, the viewer verifies and caches a pinned bpftrace release as the distro root user. If Python 3 is missing, it installs it automatically on distros with apt-get.
 
 ## Configuration
+
+On a Linux guest with a Btrfs root, run `python3 GuestDiskIo.py root` with tracing privileges for one six-second sample. `python3 GuestDiskIo.py loop root` streams successive samples. On OrbStack the same entry point can run through `orb -m <machine> -u root python3 - root < GuestDiskIo.py` on the Mac. It resolves the guest-visible path under the root subvolume and reports logical read/write bytes and completed operations per guest PID. These include cache hits. Shared virtual block-device traffic can span several guests and is excluded from this sample.
 
 Guest sampling connects to each VM as `fleet@<vm-name>.<domain>`. The domain has no default. Set it with the `PERFORMANCE_VIEWER_GUEST_DOMAIN` environment variable, or with `guestDomain` in `%LOCALAPPDATA%\AIFleetPerformanceViewer\settings.json`:
 
