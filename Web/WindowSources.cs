@@ -24,9 +24,11 @@ internal sealed class WindowSources : BackgroundService
 
     private readonly Source[] sources;
     private readonly object gate = new();
+    private readonly IHostApplicationLifetime lifetime;
 
-    public WindowSources(IConfiguration configuration)
+    public WindowSources(IConfiguration configuration, IHostApplicationLifetime lifetime)
     {
+        this.lifetime = lifetime;
         var configured = configuration.GetSection("Sources").Get<SourceConfig[]>();
         if (configured == null && OperatingSystem.IsWindows())
             configured = [new() { Name = "Local Windows", Command = "aifleet-performance-viewer.exe", Arguments = ["--collect", "--guests"] }];
@@ -64,8 +66,14 @@ internal sealed class WindowSources : BackgroundService
         }
     }
 
-    protected override Task ExecuteAsync(CancellationToken stop) =>
-        Task.WhenAll(sources.Select(source => Run(source, stop)));
+    protected override async Task ExecuteAsync(CancellationToken stop)
+    {
+        // Only the host that successfully binds the viewer port owns its collectors.
+        var listening = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using (lifetime.ApplicationStarted.Register(() => listening.TrySetResult()))
+            await listening.Task.WaitAsync(stop);
+        await Task.WhenAll(sources.Select(source => Run(source, stop)));
+    }
 
     private async Task Run(Source source, CancellationToken stop)
     {

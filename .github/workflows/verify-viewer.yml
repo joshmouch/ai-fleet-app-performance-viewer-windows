@@ -18,5 +18,6 @@ jobs:
       - run: dotnet run --project Checks/PerformanceViewer.Checks.csproj -c Release
       - run: dotnet publish PerformanceViewer.csproj -c Release
       - run: dotnet publish Web/PerformanceViewer.Web.csproj -c Release
+      - run: python Checks/web_shared_collector.py Web/bin/Release/net10.0/publish/PerformanceViewer.Web.exe
       - run: dotnet workload install maui-windows
       - run: dotnet build Native/PerformanceViewer.Native.csproj -c Release
