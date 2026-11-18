@@ -26,6 +26,7 @@
     <Compile Include="HyperVHostCounters.cs" />
     <Compile Include="DiskIoDetails.cs" />
     <Compile Include="WindowsSampleStream.cs" />
+    <Compile Include="WindowsGuestSamples.cs" />
     <Compile Include="WindowsDiskInventory.cs" />
     <ProjectReference Include="Core/PerformanceViewer.Core.csproj" />
     <Compile Include="VmDiskIo.cs" />

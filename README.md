@@ -6,7 +6,7 @@ A Windows desktop viewer for finding the processes behind CPU and disk activity 
 
 Run the installed executable with `--collect` and redirect standard output to a file or pipe. Each UTF-8 JSON line contains a host CPU process sample and a physical disk path sample from the same collectors used by the desktop. The default interval is ten seconds. Use `--interval 5 --count 3 --disk 0` for three five-second CPU samples with Disk 0 path detail. Omitting `--disk` includes every observed device layer, including potentially overlapping Storage Spaces layers. Windows tracing permissions still apply. The disk status field carries any trace error.
 
-Frames carry the host, boot time when available, capture identity, sequence, separate measurement windows and path coverage. Disk paths use a rolling window and a blank path retains unmatched reads, writes and operation counts. Replace the previous disk frame when refreshing a ranking. The standalone stream currently covers host activity. The desktop also has interactive guest expansion.
+Frames carry the host, boot time when available, capture identity, sequence, separate measurement windows and path coverage. Disk paths use a rolling window and a blank path retains unmatched reads, writes and operation counts. Replace the previous disk frame when refreshing a ranking. Add `--guests` to include running Hyper-V and WSL CPU samples and guest files behind active VHDX paths. Each client can independently expand a guest for both resources. CPU shares apply to the measured host budget. Missing samples retain the host rows. Disk totals conserve each direction and operation count, including backing-file traffic without a guest weight. Windows samples continue while guest discovery or tracing is pending.
 
 ### Local web viewer
 
@@ -17,8 +17,8 @@ In `Web/appsettings.json`, configure a local command, SSH command or replay file
 ```json
 {
   "Sources": [
-    { "Name": "Local", "Command": "aifleet-performance-viewer.exe", "Arguments": ["--collect", "--disk", "0"] },
-    { "Name": "Remote", "Command": "ssh", "Arguments": ["-o", "BatchMode=yes", "windows-host", "aifleet-performance-viewer --collect --disk 0"] },
+    { "Name": "Local", "Command": "aifleet-performance-viewer.exe", "Arguments": ["--collect", "--guests", "--disk", "0"] },
+    { "Name": "Remote", "Command": "ssh", "Arguments": ["-o", "BatchMode=yes", "windows-host", "aifleet-performance-viewer --collect --guests --disk 0"] },
     { "Name": "Recorded", "ReplayFile": "/path/to/windows.ndjson" }
   ]
 }

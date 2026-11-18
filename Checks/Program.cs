@@ -28,6 +28,22 @@ Check(DiskIoMerge.Sum(expanded.Select(row => row.Totals)).Equals(decoded.DiskPat
 Check(expanded.Single(row => row.Key == backing).Totals.ReadBytes == 1001, "uncovered direction");
 Check(expanded.Single(row => row.Key == unknown).Machine == host, "source machine on replay");
 Check(expanded.Where(row => row.Guest != null).Sum(row => row.Totals.WriteBytes) == 2003, "one backing budget");
+var wrapper = new CpuProcessRow(222, "vmmem", .8);
+var guestCpu = new ClusterCpuSample(window.Cpu,
+    [new("WSL / distro", [new(3, "git", 1, .10, .08)], "WSL")],
+    [new("WSL", .8, .08, true, ReplacedRows: [wrapper])]);
+var layered = window with {
+    Cpu = window.Cpu with { Rows = [..window.Cpu.Rows, wrapper] },
+    Guests = new(new(time, guestCpu), [new("WSL / distro", "WSL", "/dev/sda", [backing.Path], 4,
+        guests.Select(p => new MeasuredFile(p.Key, p.Value)).ToArray(), false, null)], null)
+};
+layered = PerformanceWindow.Decode(layered.Encode());
+var projected = GuestProjection.CpuRows(layered, _ => true).ToArray();
+Check(projected.All(r => r.Row.Pid != 222) && projected.Single(r => r.Machine == "WSL / distro").HostPercent == 1, "10% of 10% host CPU");
+Check(GuestProjection.CpuRows(layered, _ => false).Any(r => r.Row.Pid == 222), "toggle restores wrapper");
+var layeredDisk = GuestProjection.DiskRows(layered, _ => true);
+Check(layeredDisk.Any(r => r.Key.Path == "/repo/a") && DiskIoMerge.Sum(layeredDisk.Select(r => r.Totals)).Equals(window.DiskPaths.Totals()), "guest path replay conserves four totals");
+Check(GuestProjection.DiskRows(layered, _ => false).Single(r => r.Key == backing).Totals.Equals(raw[backing]), "toggle restores backing file");
 try
 {
     PerformanceWindow.Decode(encoded.Replace(PerformanceWindow.CurrentSchema, "incompatible"));
