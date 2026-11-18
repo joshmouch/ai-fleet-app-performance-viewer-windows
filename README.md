@@ -16,6 +16,10 @@ The exporter preserves each window identity and includes unresolved files in the
 
 ### Local web viewer
 
+The Disk source selector can also read archived physical or guest-logical intervals from a ClickHouse HTTP endpoint. Configure a `FileHistory` array on the web server. For example, one entry can be `{"Name":"Workstation history","Endpoint":"http://127.0.0.1:8123/","Host":"WORKSTATION","Scope":"host","Layer":"physical","LookbackHours":24}`. For authenticated endpoints set `User` and `PasswordEnvironment` on the entry. The latter names an environment variable on the server. Use HTTPS for credentials sent to a remote endpoint.
+
+Choose a source on Disk and enter the UTC end time. The app reads the latest measured window ending at or before it within the lookback. Its rates use that sample’s own duration. The browser and native window use the same rankings, including unresolved operations. Selecting Live returns to the running collectors. This source expects the `otel.performance_file_window_latest` view over exported file windows.
+
 Run `dotnet run --project Web/PerformanceViewer.Web.csproj` with .NET 10 and open `http://127.0.0.1:5217`. The Blazor server owns one reader per configured source across browser tabs. The CPU and Disk lists rank both Windows hosts together. Disk groups by process or filename, with separate read, write and total rates. Source status identifies old samples and offline collectors. A replay remains selectable after the last frame.
 
 In `Web/appsettings.json`, configure a local command, SSH command or replay file for each source. For example:

@@ -5,5 +5,7 @@ namespace PerformanceViewer.Native;
 
 [JsonSourceGenerationOptions(PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase)]
 [JsonSerializable(typeof(SourceWindow[]))]
+[JsonSerializable(typeof(string[]))]
+[JsonSerializable(typeof(StoredFileWindow))]
 internal partial class NativeJson : JsonSerializerContext { }
 

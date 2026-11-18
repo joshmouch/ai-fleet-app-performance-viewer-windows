@@ -8,6 +8,7 @@ public static class MauiProgram
     {
         var builder = MauiApp.CreateBuilder().UseMauiApp<ViewerApp>();
         builder.Services.AddMauiBlazorWebView();
+        builder.Services.AddSingleton<PerformanceViewer.Components.IFileHistory, LoopbackFileHistory>();
         builder.Services.AddSingleton(_ => new HttpClient(new HttpClientHandler {
             AutomaticDecompression = System.Net.DecompressionMethods.All,
             AllowAutoRedirect = false

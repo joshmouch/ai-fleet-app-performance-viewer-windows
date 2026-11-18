@@ -6,8 +6,7 @@
     {
         <p>Configure a live collector or replay file in the server’s Sources setting to see activity.</p>
     }
-    else
-    {
+    <div>
         <ul class="sources" aria-label="Collection status">
             @foreach (var source in Sources)
             {
@@ -16,13 +15,16 @@
         </ul>
         <div class="toolbar">
             <div class="switch" aria-label="Resource">
-                <button aria-pressed="@cpu" @onclick="() => cpu = true">CPU</button>
+                <button aria-pressed="@cpu" @onclick="ShowCpu">CPU</button>
                 <button aria-pressed="@(!cpu)" @onclick="() => cpu = false">Disk</button>
             </div>
+            @if (cpu || !history.Active)
+            {
             <label>Host <select aria-label="Host" @bind="host"><option value="">All hosts</option>
                 @foreach (var name in Sources.Select(s => s.Frame?.Host).OfType<string>().Distinct().Order())
                 { <option value="@name">@name</option> }
             </select></label>
+            }
             @if (!cpu)
             {
                 <label>Group by <select aria-label="Group by" @bind="group"><option>Process</option><option>File</option></select></label>
@@ -31,7 +33,8 @@
             <label>Show <select aria-label="Show" @bind="limit"><option>20</option><option>50</option><option>100</option></select></label>
             <label>Filter <input type="search" @bind="filter" @bind:event="oninput" /></label>
         </div>
-        @if (Frames.Any(w => w.Guests != null))
+        @if (!cpu) { <HistoryPicker Changed="HistoryChanged" /> }
+        @if (!history.Active && Frames.Any(w => w.Guests != null))
         {
             <div class="toolbar" aria-label="Guest expansion">
             @foreach (var w in Frames.Where(w => w.Guests != null))
@@ -81,7 +84,12 @@
         {
             var rows = DiskRows().ToArray();
             <section><div class="summary"><h2>Disk @(group == "File" ? "paths" : "processes")</h2><span>@Rate(rows.Sum(x => x.Read + x.Write)) MiB/s across matching rows</span></div>
-            @foreach (var w in Frames.Where(w => w.DiskPaths.Status != null))
+            @if (history.Window is {} stored)
+            {
+                <p>@stored.Host · @stored.Scope · @stored.Layer · @stored.Start to @stored.End · @stored.NamedBytes.ToString("N0") of @stored.CapturedBytes.ToString("N0") bytes named · @stored.EventsLost events lost</p>
+                @if (stored.Status != "running") { <p role="status">@stored.Status</p> }
+            }
+            @foreach (var w in Frames.Where(w => !history.Active && w.DiskPaths.Status != null))
             { <p role="status">@w.Host · @w.DiskPaths.Status</p> }
             <div class="scroll"><table><thead><tr>
                 <th>Process</th><th>PID</th><th>Host</th><th>Environment</th>
@@ -93,12 +101,15 @@
                 <td class="num">@Rate(r.Read)</td><td class="num">@Rate(r.Write)</td><td class="num">@Rate(r.Read + r.Write)</td><td class="num">@r.Totals.Reads.ToString("N0")</td><td class="num">@r.Totals.Writes.ToString("N0")</td>
             </tr> }</tbody></table></div>@if (rows.Length == 0) { <p>No matching disk samples.</p> }</section>
         }
-    }
+    </div>
 </main>
 
 @code {
     [Parameter] public SourceWindow[] Sources { get; set; } = [];
     private bool cpu = true, guestCpuSort;
+    private HistorySelection history = new(false, null);
+    private void ShowCpu() { cpu = true; history = new(false, null); }
+    private void HistoryChanged(HistorySelection selection) => history = selection;
     private readonly HashSet<(string Host, string Target)> hiddenGuests = new();
     private bool Selected(string hostName, string target) => !hiddenGuests.Contains((hostName, target));
     private void SetGuest(string hostName, string target, bool enabled)
@@ -122,17 +133,29 @@
     private sealed record DiskRow(string Host, string Machine, FileIoKey Key, FileIoTotals Totals, double Read, double Write);
     private IEnumerable<DiskRow> DiskRows()
     {
-        foreach (var w in Frames)
+        if (history.Active)
         {
-            var sample = w.DiskPaths;
-            if (sample.Seconds <= 0) continue;
-            var expanded = GuestProjection.DiskRows(w, target => Selected(w.Host, target));
-            foreach (var g in expanded.GroupBy(r => (r.Machine, File: group == "File" ? r.Key : r.Key.ProcessKey)))
+            if (history.Window is {} stored)
             {
-                if (!Matches(g.Key.File.Process) && !Matches(g.Key.File.Path)) continue;
-                var t = DiskIoMerge.Sum(g.Select(r => r.Totals));
-                yield return new DiskRow(w.Host, g.Key.Machine, g.Key.File, t, t.ReadBytes / sample.Seconds, t.WriteBytes / sample.Seconds);
+                var machine = stored.Layer == "physical" ? stored.Host : stored.Scope;
+                foreach (var row in GroupRows(stored.Host, stored.DurationSeconds(), stored.Rows.Select(r => r.ToDiskRow(machine))))
+                    yield return row;
             }
+            yield break;
+        }
+        foreach (var w in Frames)
+            foreach (var row in GroupRows(w.Host, w.DiskPaths.Seconds, GuestProjection.DiskRows(w, target => Selected(w.Host, target))))
+                yield return row;
+    }
+
+    private IEnumerable<DiskRow> GroupRows(string hostName, double seconds, IEnumerable<DiskIoRow> measured)
+    {
+        if (seconds <= 0) yield break;
+        foreach (var g in measured.GroupBy(r => (r.Machine, File: group == "File" ? r.Key : r.Key.ProcessKey)))
+        {
+            if (!Matches(g.Key.File.Process) && !Matches(g.Key.File.Path)) continue;
+            var t = DiskIoMerge.Sum(g.Select(r => r.Totals));
+            yield return new DiskRow(hostName, g.Key.Machine, g.Key.File, t, t.ReadBytes / seconds, t.WriteBytes / seconds);
         }
     }
 }

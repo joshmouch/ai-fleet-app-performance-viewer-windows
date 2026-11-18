@@ -8,37 +8,7 @@ public static class FileWindowExport
     public static byte[] Encode(PerformanceWindow window)
     {
         var disk = window.DiskPaths;
-        if (!double.IsFinite(disk.Seconds) || disk.Seconds <= 0 || disk.EventsLost < 0 ||
-            disk.NamedBytes < 0 || disk.KeylessBytes < 0 || disk.KeylessBytes > disk.CapturedBytes)
-            throw new InvalidDataException("Invalid disk interval or coverage.");
-        var seen = new HashSet<FileIoKey>();
-        long captured = 0, named = 0;
-        var rows = disk.Files.Select(entry =>
-        {
-            var file = entry.File with { Path = entry.File.Path ?? "" };
-            var count = entry.Totals;
-            if (!seen.Add(file) || count.ReadBytes < 0 || count.WriteBytes < 0 || count.Reads < 0 || count.Writes < 0)
-                throw new InvalidDataException("Duplicate file identity or negative counter.");
-            checked
-            {
-                captured += count.ReadBytes + count.WriteBytes;
-                if (!string.IsNullOrEmpty(file.Path)) named += count.ReadBytes + count.WriteBytes;
-            }
-            return new { pid = file.Pid, process = file.Process, path = file.Path,
-                readBytes = count.ReadBytes, writeBytes = count.WriteBytes, readOps = count.Reads, writeOps = count.Writes };
-        }).ToArray();
-        if (captured != disk.CapturedBytes || named != disk.NamedBytes)
-            throw new InvalidDataException("File rows do not reconcile to the collector's capture and named bytes.");
-        var start = disk.End - TimeSpan.FromSeconds(disk.Seconds);
-        if (start.ToUnixTimeMilliseconds() >= disk.End.ToUnixTimeMilliseconds())
-            throw new InvalidDataException("Disk interval is shorter than the storage timestamp precision.");
-        static string Utc(DateTimeOffset time) => time.UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'", CultureInfo.InvariantCulture);
-        var body = JsonSerializer.Serialize(new {
-            schema = "performance-viewer/file-window/v1", host = window.Host, capture = window.Capture, sequence = window.Sequence,
-            scope = disk.Disk is int d ? "disk:" + d.ToString(CultureInfo.InvariantCulture) : "host", layer = "physical",
-            start = Utc(start), end = Utc(disk.End), status = disk.Status ?? "running", eventsLost = disk.EventsLost,
-            capturedBytes = captured, namedBytes = named, keylessBytes = disk.KeylessBytes, rows
-        });
+        var body = StoredFileWindow.From(window).Encode();
         static object Attribute(string key, string value) => new { key, value = new { stringValue = value } };
         var record = new {
             timeUnixNano = checked(disk.End.ToUnixTimeMilliseconds() * 1_000_000L).ToString(CultureInfo.InvariantCulture),

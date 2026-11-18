@@ -20,6 +20,11 @@ using var envelope = System.Text.Json.JsonDocument.Parse(payload);
 var record = envelope.RootElement.GetProperty("resourceLogs")[0].GetProperty("scopeLogs")[0].GetProperty("logRecords")[0];
 using var exported = System.Text.Json.JsonDocument.Parse(record.GetProperty("body").GetProperty("stringValue").GetString());
 var stored = exported.RootElement;
+var historical = StoredFileWindow.Decode(stored.GetRawText());
+Check(historical.Encode() == stored.GetRawText(), "file history keeps the original OTLP body on replay");
+Check(historical.DurationSeconds() == 58.5 && historical.Host == host && historical.NamedBytes == 3004 &&
+    DiskIoMerge.Sum(historical.Rows.Select(r => r.ToDiskRow(host).Totals)).Equals(window.DiskPaths.Totals()),
+    "history preserves the measured interval, coverage and four directional counters");
 var files = stored.GetProperty("rows").EnumerateArray().ToArray();
 Check(stored.GetProperty("scope").GetString() == "disk:2" && stored.GetProperty("capture").GetGuid() == window.Capture, "stored disk identity");
 Check(files.Sum(r => r.GetProperty("readBytes").GetInt64()) == 1054 && files.Sum(r => r.GetProperty("writeBytes").GetInt64()) == 2028 &&
