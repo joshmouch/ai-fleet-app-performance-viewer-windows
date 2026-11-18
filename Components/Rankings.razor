@@ -43,21 +43,21 @@
                     <label><input type="checkbox" checked="@Selected(w.Host, target)"
                         @onchange="e => SetGuest(w.Host, target, (bool)e.Value!)" /> @w.Host / @target</label>
                 }
-                @if (cpu && w.Guests.CpuStatus != null) { <span>@w.Host · @w.Guests.CpuStatus</span> }
-                @if (!cpu && w.Guests.DiskInventoryStatus != null) { <span>@w.Host · @w.Guests.DiskInventoryStatus</span> }
+                @if (cpu && w.Guests.CpuStatus != null) { <span>@w.Host Â· @w.Guests.CpuStatus</span> }
+                @if (!cpu && w.Guests.DiskInventoryStatus != null) { <span>@w.Host Â· @w.Guests.DiskInventoryStatus</span> }
                 @if (!cpu)
                 {
                     @foreach (var disk in w.Guests.Disks.Where(d => Selected(w.Host, d.Target) && (d.Files.Length == 0 || d.Status != null)))
-                    { <span>@disk.Machine · @(disk.Status ?? "Sampling guest files…")</span> }
+                    { <span>@disk.Machine Â· @(disk.Status ?? "Sampling guest filesâ€¦")</span> }
                 }
                 @if (cpu && w.Guests.Cpu is {} sample)
                 {
                     @foreach (var coverage in sample.Sample.Coverage.Where(c => Selected(w.Host, c.Machine)))
                     {
                         if (!coverage.SampleAvailable || coverage.HostCores == null)
-                        { <span>@coverage.Machine · @(coverage.Failure ?? "CPU attribution unavailable")</span> }
+                        { <span>@coverage.Machine Â· @(coverage.Failure ?? "CPU attribution unavailable")</span> }
                         else if (coverage.HostCores > coverage.AttributedCores)
-                        { <span>@coverage.Machine · @((100 * (coverage.HostCores.Value - coverage.AttributedCores) / sample.Sample.Host.LogicalProcessors).ToString("N2"))% of host CPU unassigned</span> }
+                        { <span>@coverage.Machine Â· @((100 * (coverage.HostCores.Value - coverage.AttributedCores) / sample.Sample.Host.LogicalProcessors).ToString("N2"))% of host CPU unassigned</span> }
                     }
                 }
             }
@@ -65,6 +65,8 @@
         }
         @if (cpu)
         {
+            @foreach (var w in Frames.Where(w => w.CpuStatus != null))
+            { <p role="status">@w.Host Â· @w.CpuStatus</p> }
             var rows = Frames.SelectMany(w => GuestProjection.CpuRows(w, target => Selected(w.Host, target))
                 .Select(row => (w.Host, Row: row))).Where(r => Matches(r.Row.Row.Process))
                 .OrderByDescending(r => guestCpuSort ? r.Row.Row.GuestCpuShare : r.Row.HostPercent).Take(limit).ToArray();
@@ -106,7 +108,7 @@
         if (enabled) hiddenGuests.Remove((hostName, target));
         else hiddenGuests.Add((hostName, target));
     }
-    private static string Percent(double? p) => p.HasValue ? p.Value.ToString("N2") + "%" : "—";
+    private static string Percent(double? p) => p.HasValue ? p.Value.ToString("N2") + "%" : "â€”";
     private string host = "", filter = "", group = "Process", sort = "Total";
     private int limit = 20;
     private IEnumerable<PerformanceWindow> Frames => Sources.Where(s => s.Selected && (host.Length == 0 || host == s.Frame!.Host)).Select(s => s.Frame!);

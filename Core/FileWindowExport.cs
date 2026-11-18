@@ -7,6 +7,7 @@ public static class FileWindowExport
 {
     public static byte[] Encode(PerformanceWindow window)
     {
+        window.DiskPaths.RequireHostAggregate();
         var disk = window.DiskPaths;
         if (!double.IsFinite(disk.Seconds) || disk.Seconds <= 0 || disk.EventsLost < 0 ||
             disk.NamedBytes < 0 || disk.KeylessBytes < 0 || disk.KeylessBytes > disk.CapturedBytes)

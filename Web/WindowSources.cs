@@ -55,8 +55,9 @@ internal sealed class WindowSources : BackgroundService
                 bool replay = s.Config.ReplayFile != null;
                 bool stale = !replay && s.Frame != null && (s.Status != null ||
                     now - s.Frame.CpuEnd > TimeSpan.FromSeconds(s.Config.StaleAfterSeconds));
-                bool selected = !stale && s.Frame != null && claimed.Add(s.Frame.Host);
-                return new SourceWindow(s.Config.Name, s.Frame, s.Status, replay, stale, selected);
+                bool scoped = s.Frame != null && s.Frame.DiskPaths.Scope != "host";
+                bool selected = !scoped && !stale && s.Frame != null && claimed.Add(s.Frame.Host);
+                return new SourceWindow(s.Config.Name, s.Frame, scoped ? "Process-scoped capture; excluded from host aggregate" : s.Status, replay, stale, selected);
             }).ToArray();
             if (last == null || !last.Windows.SequenceEqual(windows))
                 last = new(windows, $"\"{Guid.NewGuid():N}\"");
@@ -97,8 +98,17 @@ internal sealed class WindowSources : BackgroundService
                 {
                     if (!process.HasExited)
                     {
-                        process.Kill(entireProcessTree: true);
-                        await process.WaitForExitAsync();
+                        CollectorProcess.RequestStop(process);
+                        // A collector emits its last measured window during termination.
+                        // Keep reading so a full stdout pipe cannot hold the child open.
+                        var drain = process.StandardOutput.BaseStream.CopyToAsync(Stream.Null);
+                        try { await process.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(5)); }
+                        catch (TimeoutException)
+                        {
+                            if (!process.HasExited) process.Kill(entireProcessTree: true);
+                            await process.WaitForExitAsync();
+                        }
+                        await drain;
                     }
                 }
             }

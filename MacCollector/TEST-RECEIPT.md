@@ -1,5 +1,7 @@
 # Mac physical I/O focused receipt
 
+On November 18, 2026, the published Blazor browser viewer on josh-mac received eight consecutive windows from one host capture. The process and file rankings identified both controlled workers. Each recorded 180,363,264 read bytes in 303 operations and 180,355,072 write bytes in 172 operations. A third worker and background activity ran concurrently. Unknown processes retained 267,976,704 read bytes and 318,338,357 write bytes. Checks reconciled file rows, preserved exited workers and verified that CPU capability was visible. The positional PID probe produced one window. A termination request closed the trace and delivered its final window in 0.529 seconds.
+
 2026-11-17, josh-mac, .NET 10. Optional collector with the shared Core window contract.
 All shell operations ran through finite `with-limits` bounds. Public evidence below
 contains aggregates and synthetic fixture descriptions only, not user paths or traces.
