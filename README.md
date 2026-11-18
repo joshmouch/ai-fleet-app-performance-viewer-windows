@@ -8,6 +8,12 @@ Run the installed executable with `--collect` and redirect standard output to a 
 
 Frames carry the host, boot time when available, capture identity, sequence, separate measurement windows and path coverage. Disk paths use a rolling window and a blank path retains unmatched reads, writes and operation counts. Replace the previous disk frame when refreshing a ranking. Add `--guests` to include running Hyper-V and WSL CPU samples and guest files behind active VHDX paths. Each client can independently expand a guest for both resources. CPU shares apply to the measured host budget. Missing samples retain the host rows. Disk totals conserve each direction and operation count, including backing-file traffic without a guest weight. Windows samples continue while guest discovery or tracing is pending.
 
+### Export file windows to history
+
+The Windows executable accepts `--export [windows.ndjson]`. The portable .NET entry point is `Export/PerformanceViewer.Export.csproj`. Both read collector windows from the supplied file or standard input and send host physical file intervals to an OTLP/HTTP logs receiver. Set `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` to its full logs URL. Optional request headers use `OTEL_EXPORTER_OTLP_LOGS_HEADERS` or the shared `OTEL_EXPORTER_OTLP_HEADERS` setting.
+
+The exporter preserves each window identity and includes unresolved files in the read/write byte and operation totals. It checks coverage before sending, compresses requests and retries transient failures. A failed input line is reported on standard error and the command exits unsuccessfully. Replaying the original file sends the same identities. The local viewer runs independently of export.
+
 ### Local web viewer
 
 Run `dotnet run --project Web/PerformanceViewer.Web.csproj` with .NET 10 and open `http://127.0.0.1:5217`. The Blazor server owns one reader per configured source across browser tabs. The CPU and Disk lists rank both Windows hosts together. Disk groups by process or filename, with separate read, write and total rates. Source status identifies old samples and offline collectors. A replay remains selectable after the last frame.
