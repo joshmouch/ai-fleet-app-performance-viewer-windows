@@ -2,6 +2,12 @@
 
 A Windows desktop viewer for finding the processes behind CPU and disk activity across the Windows host, Hyper-V guests, and WSL.
 
+### Read live samples without opening the desktop
+
+Run the installed executable with `--collect` and redirect standard output to a file or pipe. Each UTF-8 JSON line contains a host CPU process sample and a physical disk path sample from the same collectors used by the desktop. The default interval is ten seconds. Use `--interval 5 --count 3 --disk 0` for three five-second CPU samples with Disk 0 path detail. Omitting `--disk` includes every observed device layer, including potentially overlapping Storage Spaces layers. Windows tracing permissions still apply. The disk status field carries any trace error.
+
+Frames carry the host, boot time when available, capture identity, sequence, separate measurement windows and path coverage. Disk paths use a rolling window and a blank path retains unmatched reads, writes and operation counts. Replace the previous disk frame when refreshing a ranking. The standalone stream currently covers host activity. The desktop also has interactive guest expansion.
+
 - **CPU** and **Disk** share a bottom details pane, a search field, guest selection, and ranking options. Details start open and all discovered guests start checked. Search filters the sampled rows before ranking them.
 - CPU and Disk use the same overview layout, with current readings at left and their history at right. Keep formatting changes aligned across both views.
 - **Settings → Usage band %** starts at 10. Enter a whole percent from 1 to 100, or clear it to return to **Top rows** and optional machine grouping. CPU bands use sampled host-equivalent CPU time. Disk bands use captured bytes in the selected scope. Each row stays in the band where its cumulative share starts, so a large row can span several bands. The denominator includes unattributed usage. Band headers sum the displayed rows' numeric metrics, excluding PIDs. Guest busy percentages add the individual guest shares in that band.

@@ -12,14 +12,6 @@ using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Win32;
 
-internal sealed record CpuProcessRow(int Pid, string Process, double Cores, double? GuestCpuShare = null,
-    double? AttributedCores = null, long Started = 0);
-internal sealed record CpuProcessSample(int LogicalProcessors, double Seconds, CpuProcessRow[] Rows,
-    double TotalCores = 0, double ProcessCores = 0);
-internal sealed record CpuMachineProcesses(string Name, CpuProcessRow[] Rows);
-/// <param name="Failure">Why the guest sample is unavailable, as the session reported it; null when it is available or no cause is known.</param>
-internal sealed record GuestCpuCoverage(string Machine, double? HostCores, double AttributedCores, bool SampleAvailable, string Failure = null);
-internal sealed record ClusterCpuSample(CpuProcessSample Host, CpuMachineProcesses[] Guests, GuestCpuCoverage[] Coverage);
 internal sealed record CpuExpansionTarget(string Name, bool IsWsl = false, string CounterName = null)
 {
     public string CounterInstance => IsWsl ? CounterName : Name;
@@ -342,11 +334,11 @@ internal static class CpuProcessSampler
         catch (Exception e) when (!cancellation.IsCancellationRequested) { return (null, e.Message); }
     }
 
-    public static async Task<CpuProcessSample> ReadHost(CancellationToken cancellation)
+    public static async Task<CpuProcessSample> ReadHost(CancellationToken cancellation, TimeSpan? interval = null)
     {
         var before = ReadHostTimes();
         long start = Stopwatch.GetTimestamp();
-        await Task.Delay(1000, cancellation).ConfigureAwait(false);
+        await Task.Delay(interval ?? TimeSpan.FromSeconds(1), cancellation).ConfigureAwait(false);
         var after = ReadHostTimes();
         double seconds = Stopwatch.GetElapsedTime(start).TotalSeconds;
         var rows = after.Where(entry => before.TryGetValue(entry.Key, out var previous) && entry.Value.Time > previous.Time)
