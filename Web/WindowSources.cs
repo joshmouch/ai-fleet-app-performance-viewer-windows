@@ -41,13 +41,16 @@ internal sealed class WindowSources : BackgroundService
             throw new InvalidDataException("Source names must be unique.");
     }
 
-    public SourceWindow[] Read()
+    public sealed record Snapshot(SourceWindow[] Windows, string Tag);
+    private Snapshot? last;
+
+    public Snapshot Read()
     {
         lock (gate)
         {
             var claimed = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var now = DateTimeOffset.UtcNow;
-            return sources.Select(s =>
+            var windows = sources.Select(s =>
             {
                 bool replay = s.Config.ReplayFile != null;
                 bool stale = !replay && s.Frame != null && (s.Status != null ||
@@ -55,6 +58,9 @@ internal sealed class WindowSources : BackgroundService
                 bool selected = !stale && s.Frame != null && claimed.Add(s.Frame.Host);
                 return new SourceWindow(s.Config.Name, s.Frame, s.Status, replay, stale, selected);
             }).ToArray();
+            if (last == null || !last.Windows.SequenceEqual(windows))
+                last = new(windows, $"\"{Guid.NewGuid():N}\"");
+            return last;
         }
     }
 
