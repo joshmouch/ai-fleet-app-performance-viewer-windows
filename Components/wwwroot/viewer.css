@@ -68,7 +68,7 @@ p { margin: .75rem 0; }
     border-block-end: 1px solid var(--resource-edge); border-radius: .2rem .2rem 0 0;
 }
 .resource-overview { flex: 1; display: flex; flex-direction: column; min-height: 0; padding: .3rem .4rem; }
-.resource-overview > .resource-card-face { flex: none; padding: 0; background: Canvas; }
+.resource-overview > .resource-card-face { flex: none; padding: 0; }
 .resource-card[data-selected="true"] { outline: 2px solid Highlight; outline-offset: -2px; }
 .resource-card[data-selected="true"]:not(.resource-overview) > .resource-card-face {
     display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: start; gap: .35rem;

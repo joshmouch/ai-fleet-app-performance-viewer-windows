@@ -22,7 +22,7 @@
                         @onclick="OpenPane" @onclick:stopPropagation="true">≡</button>
                 }
             </div>
-            @if (Overview || GraphOpen || MetricsVisible && (!Disk || DiskActivity.HasActivity(ChartNode.Reading)))
+            @if (Overview || GraphOpen || MetricsVisible && (!Disk || Node.HostShare > 0 || DiskActivity.HasActivity(ChartNode.Reading)))
             {
                 <ResourceChart Node="ChartNode" Disk="Disk" Controls="Overview" Graph="GraphOpen" Metrics="MetricsVisible" Stored="Stored"
                     History="@(Overview || GraphOpen ? ReadHistory(Node.Id) : [])" />
@@ -53,7 +53,7 @@
             {
                 <ResourceCard @key="child.Node.Id" Node="child.Node" Disk="Disk" SelectedId="@SelectedId" VisibleChildren="VisibleChildren"
                     ReadHistory="ReadHistory" ReadDetails="ReadDetails" BandPercent="BandPercent" Selection="Selection" Scope="Scope"
-                    CardReading="child.Reading" RelativeHeat="child.RelativeHeat" />
+                    CardReading="child.Reading" />
             }
         </div>
     }
@@ -92,7 +92,6 @@
     [Parameter] public RenderFragment? Breadcrumb { get; set; }
     [Parameter] public int BandPercent { get; set; }
     [Parameter] public ResourceReading? CardReading { get; set; }
-    [Parameter] public double RelativeHeat { get; set; }
     private ResourceCardEntry[] Children = [];
     private bool graph, details, metrics = true;
     protected override void OnParametersSet()
@@ -110,13 +109,6 @@
         ? Node with { Reading = reading } : Node;
     private Task Select() => Selection.InvokeAsync(Overview || Selected ? null : Node.Id);
     private Task Clear() => Selection.InvokeAsync(null);
-    private string Fill
-    {
-        get
-        {
-            double tint = Disk ? RelativeHeat > 0 ? 8 + 50 * Math.Clamp(RelativeHeat, 0, 1) : 0
-                : Math.Clamp(Node.Reading.Active.GetValueOrDefault() * .42, 0, 42);
-            return FormattableString.Invariant($"--resource-heat:{tint:0.##}%");
-        }
-    }
+    // Give small host shares some contrast without scaling each branch to its hottest child.
+    private string Fill => FormattableString.Invariant($"--resource-heat:{58 * Math.Sqrt(Math.Clamp(Node.HostShare ?? 0, 0, 1)):0.##}%");
 }

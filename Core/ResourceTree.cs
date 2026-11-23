@@ -8,7 +8,7 @@ public readonly record struct ResourceReading(double? Active = null, double? Rea
 
 public sealed record ResourceNode(string Id, string Name, string? Type, ResourceKind Kind, ResourceReading Reading,
     ResourceNode[] Children, string? Host = null, int? Disk = null, string? BackingPath = null,
-    string? Target = null, string? Machine = null, string? Device = null);
+    string? Target = null, string? Machine = null, string? Device = null, double? HostShare = null);
 
 public static class ResourceTree
 {
@@ -51,7 +51,9 @@ public static class ResourceTree
         if (counters?.Processors is { Length: > 0 } processors)
             children.Add(new(id + "/logical", "Logical processors", "Windows host", ResourceKind.CpuGroup,
                 new(busy), processors.Select(p => new ResourceNode(id + "/processor/" + p.Id,
-                    "CPU " + p.Id, null, ResourceKind.Processor, new(p.Busy), [], host)).ToArray(), host));
+                    "CPU " + p.Id, null, ResourceKind.Processor, new(p.Busy), [], host,
+                    HostShare: Share(p.Busy, 100.0 * frame.Cpu.LogicalProcessors))).ToArray(), host,
+                HostShare: Share(busy, 100)));
         var cluster = frame.Guests?.Cpu?.Sample;
         if (cluster != null)
         {
@@ -63,13 +65,17 @@ public static class ResourceTree
                     double? impact = cluster.Host.LogicalProcessors <= 0 ? null :
                         guest.Rows.Sum(row => row.AttributedCores ?? 0) * 100 / cluster.Host.LogicalProcessors;
                     return new ResourceNode(id + "/guest/" + guest.Name, guest.Name, "Guest", ResourceKind.VirtualMachine,
-                        new(impact), [], host, Target: target, Machine: guest.Name);
+                        new(impact), [], host, Target: target, Machine: guest.Name, HostShare: Share(impact, 100));
                 }).OrderBy(node => node.Name, PathComparer).ToArray();
             if (guestNodes.Length > 0)
+            {
+                var guestCpu = counters?.Guests ?? Sum(guestNodes.Select(n => n.Reading.Active));
                 children.Add(new(id + "/guests", "Guests", "Host-equivalent CPU", ResourceKind.CpuGroup,
-                    new(counters?.Guests ?? Sum(guestNodes.Select(n => n.Reading.Active))), guestNodes, host));
+                    new(guestCpu), guestNodes, host, HostShare: Share(guestCpu, 100)));
+            }
         }
-        return new(id, host, "Windows host", ResourceKind.Host, reading, children.ToArray(), host);
+        return new(id, host, "Windows host", ResourceKind.Host, reading, children.ToArray(), host,
+            HostShare: Share(busy, 100));
     }
 
     private static ResourceNode DiskHost(PerformanceWindow frame, Func<string, string, bool> includesGuest,
@@ -80,13 +86,17 @@ public static class ResourceTree
         if (sample is null || sample.Disks.Length == 0)
         {
             var bytes = frame.DiskPaths.Totals();
-            return new(id, frame.Host, null, ResourceKind.Host, Rate(bytes, frame.DiskPaths.Seconds), [], frame.Host);
+            return new(id, frame.Host, null, ResourceKind.Host, Rate(bytes, frame.DiskPaths.Seconds), [], frame.Host,
+                HostShare: Share(bytes.TotalBytes, bytes.TotalBytes));
         }
 
         var visible = VisibleDisks(sample, includeAll);
         var files = sample.Files.ToLookup(row => row.Number);
+        var diskBytes = visible.ToDictionary(disk => disk.Number, disk => files[disk.Number].Sum(row => row.Totals.TotalBytes));
+        // Measure every share against the same Windows trace window, including unattributed traffic.
+        var hostBytes = frame.DiskPaths.Seconds > 0 ? diskBytes.Values.Sum() : 0;
         var virtualFiles = sample.VirtualDisks.ToLookup(file => file.Number);
-        var guestWindows = (frame.Guests?.Disks ?? []).Where(window => includesGuest(frame.Host, window.Target))
+        var guestWindows = (frame.Guests?.Disks ?? [])
             .SelectMany(window => window.BackingPaths.Select(path => (Path: path, Window: window)))
             .ToLookup(pair => pair.Path, pair => pair.Window, PathComparer);
         var disks = visible.OrderBy(disk => disk.Mounts.FirstOrDefault() ?? disk.Name, PathComparer).Select(disk =>
@@ -97,37 +107,45 @@ public static class ResourceTree
             ResourceNode Vhdx(VirtualDiskMeasurement file)
             {
                 string fileId = diskId + "/" + file.Path.ToUpperInvariant();
-                var devices = guestWindows[file.Path].Where(guest => !string.IsNullOrEmpty(guest.Device))
-                    .DistinctBy(guest => (guest.Machine, guest.Target, guest.Device))
-                    .Select(guest => new ResourceNode(fileId + "/device/" + guest.Target + "/" + guest.Machine + "/" + guest.Device,
+                var backingBytes = DiskIoMerge.Sum(perPath[file.Path].Select(row => row.Totals));
+                var backingShare = Share(backingBytes.TotalBytes, hostBytes);
+                var guestDevices = guestWindows[file.Path].Where(guest => !string.IsNullOrEmpty(guest.Device))
+                    .DistinctBy(guest => (guest.Machine, guest.Target, guest.Device)).ToArray();
+                // A single matched device can use the backing file's measured impact. A shared backing
+                // file has no per-device Windows measurement, so the guest rates do not drive the tint.
+                var deviceShare = guestDevices.Length == 1 ? backingShare : null;
+                var devices = guestDevices.Where(guest => includesGuest(frame.Host, guest.Target)).Select(guest =>
+                    new ResourceNode(fileId + "/device/" + guest.Target + "/" + guest.Machine + "/" + guest.Device,
                         guest.Device, "Guest device", ResourceKind.GuestDevice,
                         Rate(DiskIoMerge.Sum(guest.Files.Select(row => row.Totals)), guest.Seconds), [],
-                        frame.Host, disk.Number, file.Path, guest.Target, guest.Machine, guest.Device)).ToArray();
-                var fileReading = Rate(DiskIoMerge.Sum(perPath[file.Path].Select(row => row.Totals)), frame.DiskPaths.Seconds);
-                return new(fileId, FileName(file.Path), null, ResourceKind.VirtualDisk, fileReading, devices,
-                    frame.Host, disk.Number, file.Path, file.Target, file.Machine);
+                        frame.Host, disk.Number, file.Path, guest.Target, guest.Machine, guest.Device, deviceShare)).ToArray();
+                return new(fileId, FileName(file.Path), null, ResourceKind.VirtualDisk, Rate(backingBytes, frame.DiskPaths.Seconds),
+                    devices, frame.Host, disk.Number, file.Path, file.Target, file.Machine, HostShare: backingShare);
             }
 
             return new ResourceNode(diskId, disk.Mounts.FirstOrDefault() ?? disk.Name, disk.Kind, ResourceKind.Disk,
-                new(disk.Active, disk.ReadMiB, disk.WriteMiB), virtualDisks.Select(Vhdx).ToArray(), frame.Host, disk.Number);
+                new(disk.Active, disk.ReadMiB, disk.WriteMiB), virtualDisks.Select(Vhdx).ToArray(), frame.Host, disk.Number,
+                HostShare: Share(diskBytes[disk.Number], hostBytes));
         }).ToArray();
         var vhdx = disks.SelectMany(disk => disk.Children).ToArray();
         ResourceNode[] children = grouping switch
         {
-            DiskGrouping.Workloads =>
-            [
-                new(id + "/windows", "Windows", "Host file I/O", ResourceKind.WindowsIo,
-                    Rate(DiskIoMerge.Sum(ResourceDiskScope.NativeWindowsFiles(frame, includeAll).Select(row => row.Totals)),
-                        frame.DiskPaths.Seconds), [], frame.Host),
-                ..GroupByMachine(vhdx, frame.Host, id + "/workloads", null)
-            ],
+            DiskGrouping.Workloads => [WindowsWorkload(), ..GroupByMachine(vhdx, frame.Host, id + "/workloads", null)],
             DiskGrouping.Vhdx => vhdx.Select(file => file with { Type = file.Machine }).ToArray(),
             _ => disks.Select(disk => disk with
             {
                 Children = GroupByMachine(disk.Children, frame.Host, disk.Id, disk.Disk)
             }).ToArray()
         };
-        return new(id, frame.Host, null, ResourceKind.Host, DiskTotal(disks), children, frame.Host);
+        return new(id, frame.Host, null, ResourceKind.Host, DiskTotal(disks), children, frame.Host,
+            HostShare: Share(hostBytes, hostBytes));
+
+        ResourceNode WindowsWorkload()
+        {
+            var bytes = DiskIoMerge.Sum(ResourceDiskScope.NativeWindowsFiles(frame, includeAll).Select(row => row.Totals));
+            return new(id + "/windows", "Windows", "Host file I/O", ResourceKind.WindowsIo, Rate(bytes, frame.DiskPaths.Seconds),
+                [], frame.Host, HostShare: Share(bytes.TotalBytes, hostBytes));
+        }
     }
 
     internal static DiskResourceMeasurement[] VisibleDisks(ResourceMeasurements samples, bool includeAll)
@@ -145,11 +163,15 @@ public static class ResourceTree
                 var files = machine.ToArray();
                 return new ResourceNode(parentId + "/vm/" + machine.Key.ToUpperInvariant(), machine.Key,
                     machine.All(file => file.Target == "WSL") ? "WSL distribution" : "Hyper-V virtual machine",
-                    ResourceKind.VirtualMachine, DiskTotal(files), files, host, number, Machine: machine.Key);
+                    ResourceKind.VirtualMachine, DiskTotal(files), files, host, number, Machine: machine.Key,
+                    HostShare: Sum(files.Select(file => file.HostShare)));
             }).Concat(disks.Where(disk => disk.Machine == null)).ToArray();
     }
 
     private static string FileName(string path) => path[(Math.Max(path.LastIndexOf('/'), path.LastIndexOf('\\')) + 1)..];
+
+    private static double? Share(double? amount, double total) =>
+        amount is double measured && double.IsFinite(measured) && total > 0 ? Math.Clamp(measured / total, 0, 1) : null;
 
     public static ResourceReading Rate(FileIoTotals totals, double seconds) => seconds <= 0
         ? default : new(Read: totals.ReadBytes / (1048576 * seconds), Write: totals.WriteBytes / (1048576 * seconds));

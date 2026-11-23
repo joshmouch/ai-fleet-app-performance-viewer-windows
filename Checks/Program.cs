@@ -42,12 +42,10 @@ Check(!DiskActivity.MeetsCutoffs(new(0, 0, 0), 0, 0) &&
     !DiskActivity.MeetsCutoffs(new(40, 0, .5), 25, 1) &&
     DiskActivity.MeetsCutoffs(new(null, 0, 2), 25, 1),
     "disk cutoffs omit idle disks, require both measured thresholds, and admit rate-only children");
-Check(DiskActivity.RelativeHeat(new(20, 2, 4), 40, 20) == .5 &&
-    DiskActivity.RelativeHeat(new(null, 5, 15), 40, 20) == 1,
-    "disk heat scales within siblings by active time and transfer separately");
 Check(ResourceTree.Build(true, [measured], (_, _) => true, true).Reading.Write == 36, "explicit all-disks scope");
-Check(ResourceTree.Build(false, [measured], (_, _) => true, false).Children.Single().Children.Single().Reading.Active == 42,
-    "CPU and disk use the same nested measurement shape");
+var processor = ResourceTree.Build(false, [measured], (_, _) => true, false).Children.Single().Children.Single();
+Check(processor.Reading.Active == 42 && processor.HostShare == 42.0 / (100 * measured.Cpu.LogicalProcessors),
+    "a logical processor shows its own busy percentage and colors by its contribution to host capacity");
 var smallerHost = measured with { Host = "fixture-small", Cpu = measured.Cpu with { LogicalProcessors = 2 },
     Resources = measured.Resources with { Cpu = measured.Resources.Cpu with { Busy = 81 } } };
 Check(ResourceTree.Build(false, [measured, smallerHost], (_, _) => true, false).Reading.Active == 41,
@@ -137,6 +135,21 @@ Check(workload.Children.Length == 2 && workload.Type == "WSL distribution" &&
     workload.Children.Select(node => node.Id).ToHashSet().SetEquals(flatLayout.Children.Select(node => node.Id)),
     "two volumes backing one workload share one parent while keeping their VHDX identities");
 var narrowed = workload.Children.Single(node => node.BackingPath == backing.Path);
+var captureBytes = twoDisks.DiskPaths.Totals().TotalBytes;
+var vhdxShare = (double)raw[backing].TotalBytes / captureBytes;
+var storedVhdx = ResourceTree.Walk(storageLayout).Single(node => node.Id == narrowed.Id);
+var flatVhdx = flatLayout.Children.Single(node => node.Id == narrowed.Id);
+Check(narrowed.HostShare == vhdxShare && storedVhdx.HostShare == vhdxShare && flatVhdx.HostShare == vhdxShare &&
+    narrowed.Children.Single().HostShare == vhdxShare && windowsWorkload.HostShare == (double)raw[unknown].TotalBytes / captureBytes,
+    "card heat uses one host byte denominator across all groupings and uses backing I/O for guest devices");
+Check(Math.Abs(workload.HostShare.GetValueOrDefault() + windowsWorkload.HostShare.GetValueOrDefault() - 1) < 1e-12,
+    "workload heat includes the whole host budget, including unresolved Windows traffic");
+var sharedBacking = twoDisks with { Guests = twoDisks.Guests with
+    { Disks = [..twoDisks.Guests.Disks, new("guest-two", "guest-two", "/dev/sdc", [backing.Path], 4, [], false, null)] } };
+var visibleDevice = ResourceTree.Build(true, [sharedBacking], (_, target) => target != "guest-two", false, DiskGrouping.Vhdx)
+    .Children.Single(node => node.Id == narrowed.Id).Children.Single();
+Check(visibleDevice.HostShare == null,
+    "hiding a guest device with a shared backing does not turn the other device into the owner of the full host budget");
 foreach (var node in new[] { narrowed, storageLayout.Children.Single(node => node.Disk == 2) })
 {
     var rows = ResourceDiskScope.Rows(twoDisks, node, _ => true, false);

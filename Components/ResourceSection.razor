@@ -153,7 +153,7 @@
     private ResourceCardEntry[] ReadChildren(ResourceNode node) => Disk
         ? diskCards.GetValueOrDefault(node.Id) ?? []
         : node.Children.Where(ShowCpuNode).Take(Math.Clamp(Preferences.MaxCards, 1, 100))
-            .Select(child => new ResourceCardEntry(child, child.Reading, 0)).ToArray();
+            .Select(child => new ResourceCardEntry(child, child.Reading)).ToArray();
     private bool ShowCpuNode(ResourceNode node) =>
         ((Matches(node.Name) || Matches(node.Type)) && (node.Reading.Active == null || node.Reading.Active >= Preferences.MinCpuActivity)) ||
         node.Children.Any(ShowCpuNode);
@@ -169,14 +169,11 @@
             var children = node.Children.Select(child => Visit(child, matches)).Where(child => child.Visible).ToArray();
             if (children.Length > 0)
             {
-                double peakActive = children.Max(child => child.Reading.Active.GetValueOrDefault());
-                double peakTransfer = children.Max(child => DiskActivity.Transfer(child.Reading));
                 diskCards[node.Id] = children.OrderByDescending(child => child.Reading.Active)
                     .ThenByDescending(child => DiskActivity.Transfer(child.Reading))
                     .ThenBy(child => child.Node.Name, StringComparer.OrdinalIgnoreCase)
                     .Take(Math.Clamp(Preferences.MaxCards, 1, 100))
-                    .Select(child => new ResourceCardEntry(child.Node, child.Reading,
-                        DiskActivity.RelativeHeat(child.Reading, peakActive, peakTransfer)))
+                    .Select(child => new ResourceCardEntry(child.Node, child.Reading))
                     .ToArray();
             }
             var reading = node.Kind is ResourceKind.Host or ResourceKind.Disk ? AverageDiskCounters(node) : node.Reading;

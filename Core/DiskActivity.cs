@@ -22,10 +22,6 @@ public static class DiskActivity
     public static bool MeetsCutoffs(ResourceReading reading, double activeCutoff, double transferCutoff) =>
         HasActivity(reading) && (reading.Active == null || reading.Active >= activeCutoff) && Transfer(reading) >= transferCutoff;
 
-    public static double RelativeHeat(ResourceReading reading, double peakActive, double peakTransfer) =>
-        Math.Max(peakActive > 0 ? reading.Active.GetValueOrDefault() / peakActive : 0,
-            peakTransfer > 0 ? Transfer(reading) / peakTransfer : 0);
-
     private static void Accumulate(double? value, double seconds, ref double total, ref double duration)
     {
         if (value is not double measured || !double.IsFinite(measured)) return;

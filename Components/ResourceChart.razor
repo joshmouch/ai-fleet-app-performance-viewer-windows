@@ -1,8 +1,8 @@
 @using Microsoft.AspNetCore.Components
 @using Microsoft.AspNetCore.Components.Web
 
-<div class="resource-chart @(Compact ? "resource-chart-compact" : "")" title="@CompactHint">
-    @if (MetricsVisible && Current.Length > 0)
+<div class="resource-chart @(Compact ? "resource-chart-compact" : "")" title="@MeasurementHint">
+    @if (MetricsVisible && HasMetrics)
     {
         <dl class="resource-metrics">
             @foreach (var metric in Current)
@@ -11,6 +11,10 @@
                     @if (GraphVisible && Plotted.Contains(metric))
                     { <span class="metric-key" aria-hidden="true"></span> }
                     @Label(metric)</dt><dd>@Format(metric)</dd></div>
+            }
+            @if (HostIoShare is string share)
+            {
+                <div><dt>@(Node.Kind == ResourceKind.GuestDevice ? "Backing I/O" : "Host I/O")</dt><dd>@share</dd></div>
             }
         </dl>
     }
@@ -51,7 +55,7 @@
         <div class="resource-actions" aria-label="Graph and metrics">
             <button type="button" class="resource-icon" aria-label="@(HideGraph ? "Show graph" : "Hide graph")"
                 title="@(HideGraph ? "Show graph" : "Hide graph")" aria-pressed="@(!HideGraph ? "true" : "false")" @onclick="() => HideGraph = !HideGraph" @onclick:stopPropagation="true">∿</button>
-            @if (Current.Length > 0)
+            @if (HasMetrics)
             {
                 <button type="button" class="resource-icon" aria-label="@(HideMetrics ? "Show metrics" : "Hide metrics")"
                     title="@(HideMetrics ? "Show metrics" : "Hide metrics")" aria-pressed="@(!HideMetrics ? "true" : "false")" @onclick="() => HideMetrics = !HideMetrics" @onclick:stopPropagation="true">№</button>
@@ -84,12 +88,32 @@
         new("Guest CPU", "%", "guest", r => r.Guests),
         new("Hypervisor overhead", "%", "active", r => r.Hypervisor)];
     private Metric[] AvailableMetrics => Disk ? DiskMetrics : Node.Kind is ResourceKind.System or ResourceKind.Host ? CpuMetrics : [CpuMetrics[0]];
-    private string? CompactHint => Disk && Compact
-        ? $"Physical averages use up to {DiskActivity.WindowSeconds}s. Darker cards have higher activity or transfer than their siblings."
-        : null;
-    private string Label(Metric metric) => Disk && Compact && Node.Kind == ResourceKind.Disk
-        ? metric.Class == "active" ? "Avg active" : $"Avg {metric.Label.ToLowerInvariant()}"
-        : metric.Label;
+    private bool HasMetrics => Current.Length > 0 || HostIoShare != null;
+    private string? HostIoShare => Disk && Node.Kind is not (ResourceKind.System or ResourceKind.Host) && Node.HostShare is double share
+        ? FormatShare(share) : null;
+    private static string FormatShare(double share) => share is > 0 and < .0001 ? $"<{.0001:P2}" : $"{share:P2}";
+    private string? MeasurementHint
+    {
+        get
+        {
+            if (Node.HostShare is double share)
+            {
+                if (!Disk) return $"{FormatShare(share)} of {Node.Host} CPU capacity.";
+                var hint = $"{FormatShare(share)} of {Node.Host} captured read and write bytes.";
+                if (Node.Kind == ResourceKind.GuestDevice) return $"{hint} Guest file rates include cached I/O.";
+                return Compact && Node.Kind == ResourceKind.Disk
+                    ? $"{hint} Physical rates and active time are averaged over up to {DiskActivity.WindowSeconds}s." : hint;
+            }
+            return Node.Kind == ResourceKind.GuestDevice ? "Guest file rates include cached I/O. Host share is unavailable." : null;
+        }
+    }
+    private string Label(Metric metric) => Node.Kind switch
+    {
+        ResourceKind.GuestDevice => $"Guest {metric.Label.ToLowerInvariant()}",
+        ResourceKind.Disk when Compact => metric.Class == "active" ? "Avg active" : $"Avg {metric.Label.ToLowerInvariant()}",
+        ResourceKind.VirtualMachine when !Disk => "Host CPU",
+        _ => metric.Label
+    };
     private Metric[] Current = [], Plotted = [];
     protected override void OnParametersSet()
     {
