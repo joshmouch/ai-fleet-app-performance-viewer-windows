@@ -1,401 +1,167 @@
 @using Microsoft.AspNetCore.Components
 @using Microsoft.AspNetCore.Components.Web
-@using System.Globalization
+@using Microsoft.JSInterop
+@using System.Text.Json
+@inject IJSRuntime Browser
 
-<main class="viewer" @onclick="Clear">
+<main class="viewer">
     <h1 class="visually-hidden">AI Fleet Cluster Performance Viewer</h1>
-    <div class="viewer-controls" @onclick:stopPropagation="true">
-        <div class="toolbar quick-settings">
-            <div class="switch" aria-label="Resource">
-                <button type="button" aria-pressed="@(!disk ? "true" : "false")" @onclick="() => Show(false)">CPU</button>
-                <button type="button" aria-pressed="@(disk ? "true" : "false")" @onclick="() => Show(true)">Disk</button>
-            </div>
-            <input type="search" aria-label="Filter resources, processes and paths" placeholder="Filter resources, processes, paths"
-                @bind="filter" @bind:event="oninput" />
-            @if (Notice == null && Sources.Length > 0 && !archive.Active)
-            {
-                <details class="source-info">
-                    <summary title="Collection status">@(Sources.Length == 1 ? Status(Sources[0]) : $"{Sources.Count(s => s.Selected)}/{Sources.Length} sources ready")</summary>
-                    <ul class="sources" aria-label="Collection status">
-                        @foreach (var source in Sources)
-                        { <li><strong>@source.Name</strong> <span>@Status(source)</span></li> }
-                    </ul>
-                </details>
-            }
-            <button type="button" aria-expanded="@settings" @onclick="() => settings = !settings">Settings @(settings ? "▴" : "▾")</button>
-        </div>
-        @if (settings)
-        {
-            <div class="toolbar advanced-settings">
-                <label>Host <select @bind="host" @bind:after="Refresh">
-                    <option value="">All hosts</option>
-                    @foreach (var name in Sources.Select(s => s.Frame?.Host ?? s.GuestOf).OfType<string>().Distinct(StringComparer.OrdinalIgnoreCase).Order())
-                    { <option value="@name">@name</option> }
-                </select></label>
-                <label>Guest details <input type="checkbox" @bind="guests" @bind:after="Refresh" /></label>
-                @if (guests)
-                {
-                    @foreach (var target in GuestTargets)
-                    {
-                        <label><input type="checkbox" checked="@IncludesGuest(target.Host, target.Target)"
-                            @onchange="e => SetGuest(target.Host, target.Target, (bool)e.Value!)" /> @target.Target</label>
-                    }
-                }
-                @if (disk)
-                {
-                    <label>Min avg active % <input type="number" min="0" max="100" @bind="minDiskActivity" /></label>
-                    <label>Min avg I/O MiB/s <input type="number" min="0" step="0.1" @bind="minRate" /></label>
-                    <label>All disks <input type="checkbox" @bind="allDisks" @bind:after="Refresh" /></label>
-                }
-                else { <label>Min CPU % <input type="number" min="0" max="100" @bind="minCpuActivity" /></label> }
-                <label>Max cards per level <input type="number" min="1" max="100" @bind="maxCards" /></label>
-                <label>Top rows <input type="number" min="1" max="100" @bind="maxRows" /></label>
-                <label>Usage band % <input type="number" min="1" max="100" @bind="band" /></label>
-                <label>Sort details <select @bind="sort">
-                    <option value="impact">@(disk ? "Host total" : "CPU impact")</option>
-                    @if (disk) { <option value="read">Read</option><option value="write">Write</option> }
-                    <option value="guest">@(disk ? "Guest total" : "Guest CPU share")</option>
-                </select></label>
-                @if (disk) { <HistoryPicker Changed="SetHistory" /> }
-                <details><summary>Stored timelines</summary><ResourceHistory @key="disk" Disk="disk" /></details>
-            </div>
-        }
-    </div>
-    @if (Notice is { } notice)
+    @if (!ready)
     {
-        <section class="viewer-empty" aria-label="Measurement status">
-            <MeasurementNotice Title="@notice.Title" Detail="@notice.Detail" Loading="@notice.Loading" />
-        </section>
+        <MeasurementNotice Title="Opening viewer" Loading="true" />
     }
     else
     {
-        if (disk) { BuildDiskCards(scope); }
-        <ResourceCard @key="(disk, scope.Id)" Node="scope" Disk="disk" Overview="true" Stored="archive.Active" SelectedId="@selected"
-            VisibleChildren="ReadChildren" ReadHistory="ReadHistory" ReadDetails="ReadDetails" BandPercent="@Math.Clamp(band ?? 0, 0, 100)"
-            Selection="Select" Scope="ChangeScope" PaneOpen="@(!closedPanes.Contains((disk, scope.Id)))"
-            OpenPane="OpenPane" ClosePane="ClosePane">
-            <Breadcrumb>
-                @if (scope.Id != root.Id)
+        <div class="viewer-controls">
+            <div class="toolbar quick-settings">
+                <div class="switch" role="group" aria-label="Show resources">
+                    <button type="button" aria-pressed="@Pressed(preferences.ShowCpu)" @onclick="ToggleCpu">CPU</button>
+                    <button type="button" aria-pressed="@Pressed(preferences.ShowDisk)" @onclick="ToggleDisk">Disk</button>
+                </div>
+                @if (preferences.ShowDisk)
                 {
-                    <nav class="resource-breadcrumb" aria-label="Scope" @onclick:stopPropagation="true">
-                        @foreach (var parent in Ancestors)
-                        { <button type="button" @onclick="() => ChangeScope(parent.Id)">@parent.Name</button><span aria-hidden="true">›</span> }
-                    </nav>
+                    <select aria-label="Group Disk cards by" title="Group Disk cards by" @bind="preferences.Grouping" @bind:after="Save">
+                        <option value="@DiskGrouping.Storage">Storage</option>
+                        <option value="@DiskGrouping.Workloads">Workloads</option>
+                        <option value="@DiskGrouping.Vhdx">VHDX</option>
+                    </select>
                 }
-            </Breadcrumb>
-        </ResourceCard>
+                <input type="search" aria-label="Filter resources, processes and paths" placeholder="Filter resources, processes, paths"
+                    @bind="filter" @bind:event="oninput" />
+                @if (Sources.Length > 0 && !archive.Active)
+                {
+                    <details class="source-info">
+                        <summary title="Collection status">@(Sources.Length == 1 ? Status(Sources[0]) : $"{Sources.Count(s => s.Selected)}/{Sources.Length} sources ready")</summary>
+                        <ul class="sources" aria-label="Collection status">
+                            @foreach (var source in Sources)
+                            { <li><strong>@source.Name</strong> <span>@Status(source)</span></li> }
+                        </ul>
+                    </details>
+                }
+                <button type="button" aria-expanded="@Pressed(settings)" @onclick="ToggleSettings">Settings @(settings ? "▴" : "▾")</button>
+            </div>
+            @if (settingsOpened)
+            {
+                <div class="toolbar advanced-settings" hidden="@(!settings)">
+                    <label>Host <select @bind="preferences.Host" @bind:after="Save">
+                        <option value="">All hosts</option>
+                        @foreach (var name in HostNames) { <option value="@name">@name</option> }
+                    </select></label>
+                    <label>Guest details <input type="checkbox" @bind="preferences.Guests" @bind:after="Save" /></label>
+                    @if (preferences.Guests)
+                    {
+                        @foreach (var target in GuestTargets)
+                        {
+                            <label><input type="checkbox" checked="@preferences.IncludesGuest(target.Host, target.Target)"
+                                @onchange="e => SetGuest(target, (bool)e.Value!)" /> @target.Target</label>
+                        }
+                    }
+                    @if (preferences.ShowCpu)
+                    {
+                        <label>Min CPU % <input type="number" min="0" max="100" @bind="preferences.MinCpuActivity" @bind:after="Save" /></label>
+                        <label>CPU sort <select @bind="preferences.CpuSort" @bind:after="Save">
+                            <option value="impact">CPU impact</option><option value="guest">Guest CPU share</option>
+                        </select></label>
+                    }
+                    @if (preferences.ShowDisk)
+                    {
+                        <label>Min avg active % <input type="number" min="0" max="100" @bind="preferences.MinDiskActivity" @bind:after="Save" /></label>
+                        <label>Min avg I/O MiB/s <input type="number" min="0" step="0.1" @bind="preferences.MinRate" @bind:after="Save" /></label>
+                        <label>All disks <input type="checkbox" @bind="preferences.AllDisks" @bind:after="Save" /></label>
+                        <label>Disk sort <select @bind="preferences.DiskSort" @bind:after="Save">
+                            <option value="impact">Host total</option><option value="read">Read</option>
+                            <option value="write">Write</option><option value="guest">Guest total</option>
+                        </select></label>
+                    }
+                    <label>Max cards per level <input type="number" min="1" max="100" @bind="preferences.MaxCards" @bind:after="Save" /></label>
+                    <label>Top rows <input type="number" min="1" max="100" @bind="preferences.MaxRows" @bind:after="Save" /></label>
+                    <label>Usage band % <input type="number" min="1" max="100" @bind="preferences.Band" @bind:after="Save" /></label>
+                    @if (preferences.ShowDisk || archive.Active)
+                    {
+                        <div hidden="@(!preferences.ShowDisk)"><HistoryPicker Changed="value => archive = value" /></div>
+                    }
+                    @if (preferences.ShowCpu || preferences.ShowDisk)
+                    {
+                        <button type="button" aria-expanded="@Pressed(timelines)" @onclick="() => timelines = !timelines">Stored timelines</button>
+                    }
+                    @if (settings && timelines)
+                    {
+                        @if (preferences.ShowCpu) { <ResourceHistory Disk="false" /> }
+                        @if (preferences.ShowDisk) { <ResourceHistory Disk="true" /> }
+                    }
+                    @if (preferenceError != null) { <span role="status">@preferenceError</span> }
+                </div>
+            }
+        </div>
+        @if (!preferences.ShowCpu && !preferences.ShowDisk)
+        {
+            <MeasurementNotice Title="Turn on CPU or Disk to view activity" />
+        }
+        <div class="viewer-sections @(Combined ? "viewer-combined" : "")">
+            <ResourceSection Sources="Sources" Preferences="preferences" Visible="preferences.ShowCpu" Combined="Combined" Filter="@filter" />
+            <ResourceSection Sources="Sources" Preferences="preferences" Visible="preferences.ShowDisk" Combined="Combined" Filter="@filter"
+                Disk="true" Archive="archive" />
+        </div>
     }
 </main>
 
 @code {
     [Parameter] public SourceWindow[] Sources { get; set; } = [];
-    private bool disk, settings, allDisks;
-    private bool guests = true;
-    private double minCpuActivity;
-    private double minDiskActivity = DiskActivity.DefaultActiveCutoff, minRate = DiskActivity.DefaultTransferCutoff;
-    private int maxCards = 12, maxRows = 20;
-    private int? band = 10;
-    private string filter = "", host = "", sort = "impact";
-    private string? selected;
-    private string scopeId = "system";
+    private const string PreferenceKey = "ai-fleet-performance-viewer.preferences.v1";
+    private ViewerPreferences preferences = new();
+    private bool ready, settings, settingsOpened, timelines;
+    private string? preferenceError;
+    private string filter = "";
     private HistorySelection archive = new(false, null);
-    private readonly HashSet<(string, string)> hiddenGuests = new();
-    private readonly HashSet<(bool, string)> closedPanes = new();
-    private readonly Dictionary<(bool Disk, string Id), List<ResourcePoint>> points = new();
-    private readonly Dictionary<string, ResourceCardEntry[]> diskCards = new(StringComparer.Ordinal);
-    private ResourceNode root = ResourceTree.Build(false, [], (_, _) => false, false);
-    private ResourceNode scope = default!;
-    private ViewNotice? Notice;
-    private sealed record ViewNotice(string Title, string? Detail = null, bool Loading = false);
-    private Dictionary<string, ResourceNode> nodes = new(StringComparer.Ordinal);
-    private ResourceNode[] Ancestors => PathTo(root, scope.Id).SkipLast(1).ToArray();
-    private IEnumerable<PerformanceWindow> Frames => Sources.Where(s => s.Selected && s.Frame != null &&
-        (host.Length == 0 || string.Equals(host, s.Frame.Host, StringComparison.OrdinalIgnoreCase))).Select(s => s.Frame!);
+    private bool Combined => preferences.ShowCpu && preferences.ShowDisk;
+    private IEnumerable<string> HostNames => Sources.Select(source => source.Frame?.Host ?? source.GuestOf)
+        .Append(preferences.Host).OfType<string>().Where(name => name.Length != 0).Distinct(StringComparer.OrdinalIgnoreCase).Order();
+    private IEnumerable<ViewerPreferences.Guest> GuestTargets => Sources.Where(source => source.Selected).SelectMany(source =>
+        source.Frame is { } frame
+            ? (frame.Guests?.Cpu?.Sample.Coverage.Select(row => row.Machine) ?? [])
+                .Concat(frame.Guests?.Disks.Select(row => row.Target) ?? []).Select(target => new ViewerPreferences.Guest(frame.Host, target))
+            : source.GuestOf is { } host ? [new(host, source.Name)] : [])
+        .Where(guest => preferences.Host.Length == 0 || string.Equals(guest.Host, preferences.Host, StringComparison.OrdinalIgnoreCase))
+        .Distinct();
 
-    private IEnumerable<(string Host, string Target)> GuestTargets => Frames.SelectMany(frame =>
-        (frame.Guests?.Cpu?.Sample.Coverage.Select(row => row.Machine) ?? [])
-            .Concat(frame.Guests?.Disks.Select(row => row.Target) ?? []).Select(target => (frame.Host, target)))
-        .Concat(Sources.Where(s => s.GuestOf != null).Select(s => (s.GuestOf!, s.Name))).Distinct();
-
-    protected override void OnParametersSet() => Refresh();
-    private void Show(bool value)
+    protected override async Task OnAfterRenderAsync(bool firstRender)
     {
-        if (disk == value) return;
-        disk = value;
-        sort = "impact";
-        scopeId = "system";
-        selected = null;
-        archive = new(false, null);
-        Refresh();
-    }
-    private void SetHistory(HistorySelection value)
-    {
-        archive = value;
-        scopeId = "system";
-        selected = null;
-        Refresh();
-    }
-    private void Refresh()
-    {
-        var frames = Frames.ToArray();
-        Notice = ReadNotice(frames.Length > 0);
-        root = ResourceTree.Build(disk, frames, IncludesGuest, allDisks);
-        if (disk && archive.Active)
+        if (!firstRender) return;
+        try
         {
-            var stored = archive.Window;
-            var total = stored == null ? default : DiskIoMerge.Sum(stored.Rows.Select(row => row.ToDiskRow(stored.Host).Totals));
-            root = root with { Name = stored?.Host ?? "Disk history", Children = [],
-                Reading = stored == null ? default : ResourceTree.Rate(total, stored.DurationSeconds()) };
-        }
-        nodes = ResourceTree.Walk(root).ToDictionary(node => node.Id);
-        scope = nodes.GetValueOrDefault(scopeId) ?? root;
-        if (selected != null && !nodes.ContainsKey(selected)) selected = null;
-        if (archive.Active || frames.Length == 0) return;
-        var at = frames.Max(frame => disk ? frame.DiskPaths.End : frame.CpuEnd);
-        var seconds = frames.Max(frame => frame.Cpu.Seconds);
-        foreach (var node in nodes.Values)
-        {
-            var key = (disk, node.Id);
-            if (!points.TryGetValue(key, out var samples)) points.Add(key, samples = []);
-            if (samples.Count > 0 && samples[^1].At > at) samples.Clear();
-            var point = new ResourcePoint(at, node.Reading, seconds);
-            if (samples.Count > 0 && samples[^1].At == at) samples[^1] = point;
-            else
+            var json = await Browser.InvokeAsync<string?>("localStorage.getItem", PreferenceKey);
+            if (json != null)
             {
-                if (samples.Count == 60) samples.RemoveAt(0);
-                samples.Add(point);
+                var saved = JsonSerializer.Deserialize<ViewerPreferences>(json);
+                if (saved is { Host: not null, HiddenGuests: not null } && Enum.IsDefined(saved.Grouping)) preferences = saved;
             }
         }
-        foreach (var key in points.Keys.Where(key => key.Disk == disk && !nodes.ContainsKey(key.Id)).ToArray())
-            points.Remove(key);
+        catch (JSDisconnectedException) { return; }
+        catch (Exception e) when (e is JSException or JsonException) { preferenceError = "Saved settings could not be loaded."; }
+        ready = true;
+        StateHasChanged();
     }
-    private ViewNotice? ReadNotice(bool hasFrames)
+
+    private async Task Save()
     {
-        if (archive.Active)
+        try
         {
-            if (archive.Loading) return new("Loading stored disk data", Loading: true);
-            return archive.Window != null ? null : new(archive.Message ?? "No stored disk samples in this time range.");
+            await Browser.InvokeVoidAsync("localStorage.setItem", PreferenceKey, JsonSerializer.Serialize(preferences));
+            preferenceError = null;
         }
-        if (hasFrames) return null;
-        if (Sources.Length == 0) return new("No measurement sources configured.");
-        var relevant = Sources.Where(s => s.GuestOf == null &&
-            (host.Length == 0 || string.Equals(host, s.Frame?.Host, StringComparison.OrdinalIgnoreCase))).ToArray();
-        var waiting = relevant.FirstOrDefault(s => s.Loading);
-        if (waiting != null) return new(disk ? "Loading disk data" : "Loading CPU data", waiting.Status, Loading: true);
-        var cause = relevant.Select(s => s.Status).FirstOrDefault(status => !string.IsNullOrWhiteSpace(status));
-        return new(disk ? "Disk data unavailable" : "CPU data unavailable",
-            cause ?? (relevant.Any(s => s.Stale) ? "The last sample is stale." : "No host has usable measurements."));
-    }
-    private void Select(string? id) => selected = id;
-    private void Clear() => selected = null;
-    private void ChangeScope(string id)
-    {
-        scopeId = id;
-        scope = nodes.GetValueOrDefault(id) ?? root;
-        selected = null;
-    }
-    private void OpenPane() => closedPanes.Remove((disk, scope.Id));
-    private void ClosePane() => closedPanes.Add((disk, scope.Id));
-    private bool IncludesGuest(string machine, string target) => guests && !hiddenGuests.Contains((machine, target));
-    private void SetGuest(string machine, string target, bool enabled)
-    {
-        if (enabled) hiddenGuests.Remove((machine, target)); else hiddenGuests.Add((machine, target));
-        Refresh();
-    }
-    private static IEnumerable<ResourceNode> PathTo(ResourceNode node, string id)
-    {
-        if (node.Id == id) return [node];
-        foreach (var child in node.Children)
-        {
-            var path = PathTo(child, id);
-            if (path.Any()) return path.Prepend(node);
-        }
-        return [];
-    }
-    private ResourceCardEntry[] ReadChildren(ResourceNode node) => disk
-        ? diskCards.GetValueOrDefault(node.Id) ?? []
-        : node.Children.Where(ShowCpuNode).Take(Math.Clamp(maxCards, 1, 100))
-            .Select(child => new ResourceCardEntry(child, child.Reading, 0)).ToArray();
-    private bool ShowCpuNode(ResourceNode node) =>
-        ((Matches(node.Name) || Matches(node.Type)) && (node.Reading.Active == null || node.Reading.Active >= minCpuActivity)) ||
-        node.Children.Any(ShowCpuNode);
-
-    private void BuildDiskCards(ResourceNode currentScope)
-    {
-        diskCards.Clear();
-        Visit(currentScope);
-
-        (ResourceNode Node, ResourceReading Reading, bool Visible, bool ShowsBusyChildren) Visit(ResourceNode node)
-        {
-            var children = node.Children.Select(Visit).Where(child => child.Visible).ToArray();
-            if (children.Length > 0)
-            {
-                double peakActive = children.Max(child => child.Reading.Active.GetValueOrDefault());
-                double peakTransfer = children.Max(child => DiskActivity.Transfer(child.Reading));
-                diskCards[node.Id] = children.OrderByDescending(child => child.Reading.Active)
-                    .ThenByDescending(child => DiskActivity.Transfer(child.Reading))
-                    .ThenBy(child => child.Node.Name, StringComparer.OrdinalIgnoreCase)
-                    .Take(Math.Clamp(maxCards, 1, 100))
-                    .Select(child => new ResourceCardEntry(child.Node, child.Reading,
-                        DiskActivity.RelativeHeat(child.Reading, peakActive, peakTransfer), child.ShowsBusyChildren))
-                    .ToArray();
-            }
-            var reading = node.Kind is ResourceKind.Host or ResourceKind.Disk ? AverageDiskCounters(node) : node.Reading;
-            bool passes = DiskActivity.MeetsCutoffs(reading, minDiskActivity, minRate);
-            bool visible = children.Length > 0 || (passes && (Matches(node.Name) || Matches(node.Type)));
-            return (node, reading, visible, children.Length > 0 && !passes);
-        }
+        catch (JSDisconnectedException) { }
+        catch (JSException) { preferenceError = "Settings could not be saved."; }
     }
 
-    private ResourceReading AverageDiskCounters(ResourceNode node)
+    private Task ToggleCpu() { preferences.ShowCpu = !preferences.ShowCpu; return Save(); }
+    private Task ToggleDisk() { preferences.ShowDisk = !preferences.ShowDisk; return Save(); }
+    private void ToggleSettings() { settings = !settings; settingsOpened = true; }
+    private Task SetGuest(ViewerPreferences.Guest target, bool enabled)
     {
-        var history = ReadHistory(node.Id);
-        if (history.Count == 0) return node.Reading;
-        var cutoff = history[^1].At.AddSeconds(-DiskActivity.WindowSeconds);
-        var intervals = history.Select((point, i) =>
-        {
-            var start = point.At.AddSeconds(-Math.Clamp(point.Seconds, 0, DiskActivity.WindowSeconds));
-            if (i > 0 && start < history[i - 1].At) start = history[i - 1].At;
-            return (point.Reading, (point.At - (start < cutoff ? cutoff : start)).TotalSeconds);
-        });
-        return DiskActivity.Average(intervals);
+        if (enabled) preferences.HiddenGuests.Remove(target); else preferences.HiddenGuests.Add(target);
+        return Save();
     }
-    private IReadOnlyList<ResourcePoint> ReadHistory(string id) => archive.Active ? [] : points.GetValueOrDefault((disk, id)) ?? [];
-    private bool Matches(string? text) => filter.Length == 0 || text?.Contains(filter, StringComparison.OrdinalIgnoreCase) == true;
-
-    private ResourceDetailTable ReadDetails(ResourceNode node, bool paths) => disk ? ReadDisk(node, paths) : ReadCpu(node, paths);
-    private IEnumerable<PerformanceWindow> FramesFor(ResourceNode node) => Frames.Where(frame =>
-        node.Host == null || string.Equals(frame.Host, node.Host, StringComparison.OrdinalIgnoreCase));
-    private static string Format(double? value) => value?.ToString("N2", CultureInfo.CurrentCulture) ?? "—";
-    private static string Count(long? value) => value?.ToString("N0", CultureInfo.CurrentCulture) ?? "—";
-    private static string Percent(double? value) => value.HasValue ? Format(value) + "%" : "—";
-
-    private ResourceDetailTable ReadCpu(ResourceNode node, bool paths)
-    {
-        string[] columns = ["Process", "PID", "Environment", .. paths ? new[] { "Command" } : [],
-            "CPU impact", "Guest CPU share"];
-        if (node.Kind == ResourceKind.Processor)
-            return new(columns, [], Note: "Process CPU is measured across logical processors.");
-        var rows = FramesFor(node).SelectMany(w => GuestProjection.CpuRows(w, target => IncludesGuest(w.Host, target))
-            .Where(row => node.Machine != null ? row.Machine == node.Machine :
-                !node.Id.EndsWith("/guests", StringComparison.Ordinal) || row.Machine != w.Host))
-            .Select(row =>
-            {
-                double? guest = 100 * row.Row.GuestCpuShare;
-                return (Eligible: Matches(row.Row.Process) || Matches(row.Machine), Row: new ResourceDetailRow(
-                    [row.Row.Process, row.Row.Pid.ToString(CultureInfo.CurrentCulture), row.Machine,
-                    .. paths ? new[] { "—" } : [], Percent(row.HostPercent), Percent(guest)],
-                    (sort == "guest" ? guest : row.HostPercent).GetValueOrDefault(),
-                    [..new double?[paths ? 4 : 3], row.HostPercent, guest]));
-            }).ToArray();
-        return new(columns, rows.Where(x => x.Eligible).Select(x => x.Row).OrderByDescending(r => r.Weight)
-            .Take(Math.Clamp(maxRows, 1, 100)).ToArray(), rows.Sum(x => x.Row.Weight),
-            paths ? "Command lines are unavailable in these samples." : null);
-    }
-
-    private ResourceDetailTable ReadDisk(ResourceNode node, bool paths)
-    {
-        string[] columns = ["Process", "PID", "Environment", .. paths ? new[] { "File", "Folder" } : [],
-            "Read MiB/s", "Write MiB/s", "Total MiB/s", "Reads", "Writes", "Total ops", "Guest MiB/s"];
-        DiskGuestRate? hostSum = null, guestSum = null;
-        var rows = DiskRows(node, paths).Select(row =>
-        {
-            var (machine, key, physical, guest) = row;
-            bool eligible = Matches(key.Process) || Matches(key.Path) || Matches(machine);
-            if (eligible && physical is { } hostRate) hostSum = hostSum.GetValueOrDefault() + hostRate;
-            if (eligible && guest is { } guestRate) guestSum = guestSum.GetValueOrDefault() + guestRate;
-            long? operations = physical?.Reads + physical?.Writes;
-            var values = new ResourceDetailRow([key.Process, key.Pid.ToString(CultureInfo.CurrentCulture), machine,
-                .. paths ? new[] { key.Path.Length == 0 ? "Unresolved file path" : key.Filename, key.Filepath } : [],
-                Format(physical?.Read), Format(physical?.Write), Format(physical?.Total), Count(physical?.Reads),
-                Count(physical?.Writes), Count(operations), Format(guest?.Total)], (sort switch
-                { "guest" => guest?.Total, "read" => physical?.Read, "write" => physical?.Write, _ => physical?.Total ?? guest?.Total }).GetValueOrDefault(),
-                [..new double?[paths ? 5 : 3], physical?.Read, physical?.Write, physical?.Total,
-                    physical?.Reads, physical?.Writes, operations, guest?.Total]);
-            return (Eligible: eligible, Row: values);
-        }).ToArray();
-        string? summary = hostSum is { } host ? DiskSummary("Host", host) : null;
-        if (guestSum is { } guestTotals)
-            summary = summary == null ? DiskSummary("Guest files", guestTotals)
-                : $"{summary} · Guest files {Format(guestTotals.Total)} MiB/s";
-        var note = archive.Active ? null : string.Join(" · ", FramesFor(node)
-            .Select(frame => frame.DiskPaths.Status).OfType<string>().Where(status => !string.IsNullOrWhiteSpace(status)).Distinct());
-        return new(columns, rows.Where(x => x.Eligible).Select(x => x.Row).OrderByDescending(row => row.Weight)
-            .Take(Math.Clamp(maxRows, 1, 100)).ToArray(), rows.Sum(x => x.Row.Weight),
-            Note: string.IsNullOrEmpty(note) ? null : note, Summary: summary);
-    }
-
-    private static string DiskSummary(string basis, DiskGuestRate rate) =>
-        $"{basis} read {Format(rate.Read)} MiB/s / {Count(rate.Reads)} ops · "
-        + $"Write {Format(rate.Write)} MiB/s / {Count(rate.Writes)} ops · "
-        + $"Total {Format(rate.Total)} MiB/s / {Count(rate.Reads + rate.Writes)} ops";
-
-    private record FileRow(string Machine, FileIoKey Key, DiskGuestRate? Physical, DiskGuestRate? Guest);
-    private IEnumerable<FileRow> DiskRows(ResourceNode node, bool paths)
-    {
-        if (archive.Active)
-        {
-            if (archive.Window is { } stored)
-            {
-                var seconds = stored.DurationSeconds();
-                bool physical = stored.Layer == "physical";
-                var entries = stored.Rows.Select(r =>
-                {
-                    var row = r.ToDiskRow(physical ? stored.Host : stored.Scope);
-                    return physical ? row : row with { Guest = DiskGuestRate.From(row.Totals, seconds) };
-                });
-                foreach (var row in Group(entries, physical ? seconds : null, paths)) yield return row;
-            }
-            yield break;
-        }
-        foreach (var frame in FramesFor(node))
-        {
-            if (frame.DiskPaths.Seconds <= 0) continue;
-            if (node.Kind == ResourceKind.GuestDevice)
-            {
-                foreach (var guest in frame.Guests?.Disks ?? [])
-                    if (guest.Seconds > 0 && guest.Machine == node.Machine && guest.Device == node.Device &&
-                        guest.BackingPaths.Contains(node.BackingPath, StringComparer.OrdinalIgnoreCase))
-                        foreach (var row in Group(GuestFiles(guest), null, paths)) yield return row;
-                continue;
-            }
-            var measured = frame;
-            if (frame.Resources is { } samples && (node.Disk.HasValue || !allDisks))
-            {
-                var mounted = samples.Disks.Where(d => d.StorageSpaces || d.Mounts.Length > 0).Select(d => d.Number).ToHashSet();
-                var backing = node.BackingPath != null ? new HashSet<string>([node.BackingPath], StringComparer.OrdinalIgnoreCase)
-                    : node.Kind == ResourceKind.VirtualMachine ? ResourceTree.Walk(node).Select(n => n.BackingPath)
-                        .OfType<string>().ToHashSet(StringComparer.OrdinalIgnoreCase) : null;
-                var files = samples.Files.Where(row => (node.Disk.HasValue ? row.Number == node.Disk :
-                    allDisks || mounted.Count == 0 || mounted.Contains(row.Number)) &&
-                    (backing == null || backing.Contains(row.File.Path))).GroupBy(row => row.File)
-                    .Select(g => new MeasuredFile(g.Key, DiskIoMerge.Sum(g.Select(row => row.Totals)))).ToArray();
-                measured = frame with { DiskPaths = frame.DiskPaths with { Files = files } };
-            }
-            foreach (var row in Group(GuestProjection.DiskRows(measured, target => IncludesGuest(frame.Host, target) &&
-                (node.Target == null || target == node.Target)), measured.DiskPaths.Seconds, paths)) yield return row;
-        }
-        if (node.Disk.HasValue) yield break;
-        foreach (var source in Sources.Where(s => s.Selected && s.GuestOf != null && s.GuestDisk != null &&
-            (node.Host == null || node.Host == s.GuestOf) && IncludesGuest(s.GuestOf!, s.Name) &&
-            !Frames.Any(w => w.Host == s.GuestOf && (w.Guests?.Disks ?? []).Any(d => d.Target == s.Name && d.Files.Length > 0))))
-            foreach (var row in Group(GuestFiles(source.GuestDisk!), null, paths)) yield return row;
-    }
-    private static IEnumerable<DiskIoRow> GuestFiles(GuestDiskWindow guest) => guest.Seconds <= 0 ? [] : guest.Files.Select(f =>
-        new DiskIoRow(f.File, guest.Machine, default, DiskGuestRate.From(f.Totals, guest.Seconds)));
-
-    private static IEnumerable<FileRow> Group(IEnumerable<DiskIoRow> rows, double? seconds, bool paths)
-    {
-        foreach (var g in rows.GroupBy(row => (row.Machine, Key: paths ? row.Key : row.Key.ProcessKey)))
-        {
-            var physical = seconds.HasValue ? DiskGuestRate.From(DiskIoMerge.Sum(g.Select(row => row.Totals)), seconds.Value)
-                : (DiskGuestRate?)null;
-            DiskGuestRate? guest = null;
-            foreach (var row in g)
-                if (row.Guest is { } rate) guest = guest.GetValueOrDefault() + rate;
-            yield return new(g.Key.Machine, g.Key.Key, physical, guest);
-        }
-    }
+    private static string Pressed(bool value) => value ? "true" : "false";
     private static string Status(SourceWindow source)
     {
         var frame = source.Frame;

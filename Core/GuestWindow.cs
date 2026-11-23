@@ -35,9 +35,11 @@ public static class GuestProjection
         }
     }
 
-    public static DiskIoRow[] DiskRows(PerformanceWindow frame, Func<string, bool> selected)
+    public static DiskIoRow[] DiskRows(PerformanceWindow frame, Func<string, bool> selected,
+        Func<GuestDiskWindow, bool> inScope = null)
     {
-        var disks = (frame.Guests?.Disks ?? []).Where(d => selected(d.Target) && d.Seconds > 0 && d.Files.Length > 0).ToArray();
+        var disks = (frame.Guests?.Disks ?? []).Where(d => selected(d.Target) && (inScope?.Invoke(d) ?? true) &&
+            d.Seconds > 0 && d.Files.Length > 0).ToArray();
         if (disks.Length == 0)
             return frame.DiskPaths.Files.Select(f => new DiskIoRow(f.File, frame.Host, f.Totals)).ToArray();
         var entries = frame.DiskPaths.Files.ToDictionary(f => f.File, f => f.Totals);

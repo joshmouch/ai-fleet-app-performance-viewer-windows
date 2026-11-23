@@ -101,6 +101,60 @@ Check(GuestProjection.CpuRows(layered, _ => false).Any(r => r.Row.Pid == 222), "
 var layeredDisk = GuestProjection.DiskRows(layered, _ => true);
 Check(layeredDisk.Any(r => r.Key.Path == "/repo/a") && DiskIoMerge.Sum(layeredDisk.Select(r => r.Totals)).Equals(window.DiskPaths.Totals()), "guest path replay conserves four totals");
 Check(GuestProjection.DiskRows(layered, _ => false).Single(r => r.Key == backing).Totals.Equals(raw[backing]), "toggle restores backing file");
+
+var otherBacking = new FileIoKey(4, "System", @"E:\vm\buildkit.vhdx");
+var otherHost = new FileIoTotals { ReadBytes = 661, WriteBytes = 997, Reads = 2, Writes = 11 };
+var twoDisks = layered with
+{
+    DiskPaths = layered.DiskPaths with { Files = [..layered.DiskPaths.Files, new(otherBacking, otherHost)] },
+    Guests = layered.Guests with
+    {
+        Disks =
+        [
+            ..layered.Guests.Disks,
+            new("WSL / distro", "WSL", "/dev/sdb", [otherBacking.Path], 4,
+                [new(new(35, "buildkitd", "/cache/layers"), new() { ReadBytes = 200, WriteBytes = 900, Reads = 2, Writes = 5 })],
+                false, null)
+        ]
+    },
+    Resources = measured.Resources with
+    {
+        Disks = [..measured.Resources.Disks, new(3, "Second volume", "Volume", [@"E:\"], false, 5, 11, 55)],
+        Files = [..measured.Resources.Files, new(3, otherBacking, otherHost)],
+        VirtualDisks = [ new(2, backing.Path, "WSL / distro", "WSL"), new(3, otherBacking.Path, "WSL / distro", "WSL") ]
+    }
+};
+var storageLayout = ResourceTree.Build(true, [twoDisks], (_, _) => true, false, DiskGrouping.Storage);
+var workloadLayout = ResourceTree.Build(true, [twoDisks], (_, _) => true, false, DiskGrouping.Workloads);
+var flatLayout = ResourceTree.Build(true, [twoDisks], (_, _) => true, false, DiskGrouping.Vhdx);
+Check(storageLayout.Reading == workloadLayout.Reading && storageLayout.Reading == flatLayout.Reading &&
+    storageLayout.Children.All(disk => disk.Kind == ResourceKind.Disk) &&
+    flatLayout.Children.All(disk => disk.Kind == ResourceKind.VirtualDisk) && flatLayout.Children.Length == 2,
+    "disk layout changes tree shape without changing the system measurements");
+var workload = workloadLayout.Children.Single(node => node.Kind == ResourceKind.VirtualMachine);
+var windowsWorkload = workloadLayout.Children.Single(node => node.Kind == ResourceKind.WindowsIo);
+Check(workload.Children.Length == 2 && workload.Type == "WSL distribution" &&
+    workload.Children.Select(node => node.Id).ToHashSet().SetEquals(flatLayout.Children.Select(node => node.Id)),
+    "two volumes backing one workload share one parent while keeping their VHDX identities");
+var narrowed = workload.Children.Single(node => node.BackingPath == backing.Path);
+foreach (var node in new[] { narrowed, storageLayout.Children.Single(node => node.Disk == 2) })
+{
+    var rows = ResourceDiskScope.Rows(twoDisks, node, _ => true, false);
+    var expected = node.Kind == ResourceKind.VirtualDisk ? raw[backing] : window.DiskPaths.Totals();
+    Check(rows.Any(row => row.Key.Path == "/repo/a") && rows.All(row => row.Key.Path != "/cache/layers") &&
+        DiskIoMerge.Sum(rows.Select(row => row.Totals)).Equals(expected),
+        "volume and VHDX exclude sibling guest disk paths and preserve each directional total");
+}
+var workloadRows = ResourceDiskScope.Rows(twoDisks, workload, _ => true, false);
+Check(workloadRows.Any(row => row.Key.Path == "/cache/layers") &&
+    DiskIoMerge.Sum(workloadRows.Select(row => row.Totals)).Equals(DiskIoMerge.Sum([raw[backing], otherHost])),
+    "workload includes both backing volumes but excludes native Windows activity");
+Check(ResourceDiskScope.Rows(twoDisks, windowsWorkload, _ => true, false).Single().Totals.Equals(raw[unknown]) &&
+    ResourceDiskScope.Rows(twoDisks, narrowed, _ => false, false).Single().Totals.Equals(raw[backing]),
+    "native workload keeps unresolved host IO and disabling expansion restores the full backing file budget");
+Check(ResourceDiskScope.DeviceWindows(twoDisks, narrowed.Children.Single()).Single().Device == "/dev/sda",
+    "guest device details match the selected device and backing path");
+
 try
 {
     PerformanceWindow.Decode(encoded.Replace(PerformanceWindow.CurrentSchema, "incompatible"));

@@ -1,6 +1,7 @@
 #nullable enable
 
-public enum ResourceKind { System, Host, CpuGroup, Processor, Disk, VirtualMachine, VirtualDisk, GuestDevice }
+public enum ResourceKind { System, Host, CpuGroup, Processor, Disk, WindowsIo, VirtualMachine, VirtualDisk, GuestDevice }
+public enum DiskGrouping { Storage, Workloads, Vhdx }
 
 public readonly record struct ResourceReading(double? Active = null, double? Read = null, double? Write = null,
     double? Windows = null, double? Guests = null, double? Hypervisor = null);
@@ -14,11 +15,11 @@ public static class ResourceTree
     private static readonly StringComparer PathComparer = StringComparer.OrdinalIgnoreCase;
 
     public static ResourceNode Build(bool disk, IEnumerable<PerformanceWindow> frames,
-        Func<string, string, bool> includesGuest, bool includeAllDisks)
+        Func<string, string, bool> includesGuest, bool includeAllDisks, DiskGrouping diskGrouping = DiskGrouping.Storage)
     {
         var sources = frames.OrderBy(w => w.Host, PathComparer).ToArray();
         var hosts = sources.Select(w => disk
-            ? DiskHost(w, includesGuest, includeAllDisks)
+            ? DiskHost(w, includesGuest, includeAllDisks, diskGrouping)
             : CpuHost(w, includesGuest)).ToArray();
         var capacity = sources.Select(frame => frame.Cpu.LogicalProcessors).ToArray();
         var reading = disk ? DiskTotal(hosts) : new ResourceReading(
@@ -71,7 +72,8 @@ public static class ResourceTree
         return new(id, host, "Windows host", ResourceKind.Host, reading, children.ToArray(), host);
     }
 
-    private static ResourceNode DiskHost(PerformanceWindow frame, Func<string, string, bool> includesGuest, bool includeAll)
+    private static ResourceNode DiskHost(PerformanceWindow frame, Func<string, string, bool> includesGuest,
+        bool includeAll, DiskGrouping grouping)
     {
         string id = "disk/" + frame.Host;
         var sample = frame.Resources;
@@ -81,45 +83,70 @@ public static class ResourceTree
             return new(id, frame.Host, null, ResourceKind.Host, Rate(bytes, frame.DiskPaths.Seconds), [], frame.Host);
         }
 
-        var mounted = sample.Disks.Where(disk => disk.StorageSpaces || disk.Mounts.Length > 0).ToArray();
-        var visible = includeAll || mounted.Length == 0 ? sample.Disks : mounted;
+        var visible = VisibleDisks(sample, includeAll);
         var files = sample.Files.ToLookup(row => row.Number);
-        var children = visible.OrderBy(disk => disk.Mounts.FirstOrDefault() ?? disk.Name, PathComparer).Select(disk =>
+        var virtualFiles = sample.VirtualDisks.ToLookup(file => file.Number);
+        var guestWindows = (frame.Guests?.Disks ?? []).Where(window => includesGuest(frame.Host, window.Target))
+            .SelectMany(window => window.BackingPaths.Select(path => (Path: path, Window: window)))
+            .ToLookup(pair => pair.Path, pair => pair.Window, PathComparer);
+        var disks = visible.OrderBy(disk => disk.Mounts.FirstOrDefault() ?? disk.Name, PathComparer).Select(disk =>
         {
             string diskId = id + "/" + disk.Number;
-            var virtualDisks = sample.VirtualDisks.Where(file => file.Number == disk.Number)
-                .OrderBy(file => file.Path, PathComparer).DistinctBy(file => file.Path, PathComparer).ToArray();
+            var virtualDisks = virtualFiles[disk.Number].DistinctBy(file => file.Path, PathComparer);
             var perPath = files[disk.Number].Where(row => row.File.Path.Length > 0).ToLookup(row => row.File.Path, PathComparer);
             ResourceNode Vhdx(VirtualDiskMeasurement file)
             {
-                var guest = (frame.Guests?.Disks ?? []).FirstOrDefault(window =>
-                    includesGuest(frame.Host, window.Target) && window.BackingPaths.Any(path => PathComparer.Equals(path, file.Path)));
                 string fileId = diskId + "/" + file.Path.ToUpperInvariant();
-                ResourceNode[] devices = guest is { Device.Length: > 0 } ? [
-                    new(fileId + "/device/" + guest.Device, guest.Device, "Guest device", ResourceKind.GuestDevice,
+                var devices = guestWindows[file.Path].Where(guest => !string.IsNullOrEmpty(guest.Device))
+                    .DistinctBy(guest => (guest.Machine, guest.Target, guest.Device))
+                    .Select(guest => new ResourceNode(fileId + "/device/" + guest.Target + "/" + guest.Machine + "/" + guest.Device,
+                        guest.Device, "Guest device", ResourceKind.GuestDevice,
                         Rate(DiskIoMerge.Sum(guest.Files.Select(row => row.Totals)), guest.Seconds), [],
-                        frame.Host, disk.Number, file.Path, guest.Target, guest.Machine, guest.Device)
-                ] : [];
+                        frame.Host, disk.Number, file.Path, guest.Target, guest.Machine, guest.Device)).ToArray();
                 var fileReading = Rate(DiskIoMerge.Sum(perPath[file.Path].Select(row => row.Totals)), frame.DiskPaths.Seconds);
                 return new(fileId, FileName(file.Path), null, ResourceKind.VirtualDisk, fileReading, devices,
                     frame.Host, disk.Number, file.Path, file.Target, file.Machine);
             }
 
-            var attached = virtualDisks.Where(file => file.Machine != null).GroupBy(file => file.Machine!, PathComparer)
-                .Select(machine =>
-                {
-                    ResourceNode[] files = machine.Select(Vhdx).ToArray();
-                    return new ResourceNode(diskId + "/vm/" + machine.Key, machine.Key,
-                        machine.All(file => file.Target == "WSL") ? "WSL distribution" : "Hyper-V virtual machine",
-                        ResourceKind.VirtualMachine, DiskTotal(files), files, frame.Host, disk.Number,
-                        Target: machine.First().Target, Machine: machine.Key);
-                });
-            ResourceNode[] nested = attached.Concat(virtualDisks.Where(file => file.Machine == null).Select(Vhdx))
-                .OrderBy(node => node.Name, PathComparer).ToArray();
             return new ResourceNode(diskId, disk.Mounts.FirstOrDefault() ?? disk.Name, disk.Kind, ResourceKind.Disk,
-                new(disk.Active, disk.ReadMiB, disk.WriteMiB), nested, frame.Host, disk.Number);
+                new(disk.Active, disk.ReadMiB, disk.WriteMiB), virtualDisks.Select(Vhdx).ToArray(), frame.Host, disk.Number);
         }).ToArray();
-        return new(id, frame.Host, null, ResourceKind.Host, DiskTotal(children), children, frame.Host);
+        var vhdx = disks.SelectMany(disk => disk.Children).ToArray();
+        ResourceNode[] children = grouping switch
+        {
+            DiskGrouping.Workloads =>
+            [
+                new(id + "/windows", "Windows", "Host file I/O", ResourceKind.WindowsIo,
+                    Rate(DiskIoMerge.Sum(ResourceDiskScope.NativeWindowsFiles(frame, includeAll).Select(row => row.Totals)),
+                        frame.DiskPaths.Seconds), [], frame.Host),
+                ..GroupByMachine(vhdx, frame.Host, id + "/workloads", null)
+            ],
+            DiskGrouping.Vhdx => vhdx.Select(file => file with { Type = file.Machine }).ToArray(),
+            _ => disks.Select(disk => disk with
+            {
+                Children = GroupByMachine(disk.Children, frame.Host, disk.Id, disk.Disk)
+            }).ToArray()
+        };
+        return new(id, frame.Host, null, ResourceKind.Host, DiskTotal(disks), children, frame.Host);
+    }
+
+    internal static DiskResourceMeasurement[] VisibleDisks(ResourceMeasurements samples, bool includeAll)
+    {
+        if (includeAll) return samples.Disks;
+        var mounted = samples.Disks.Where(disk => disk.StorageSpaces || disk.Mounts.Length > 0).ToArray();
+        return mounted.Length == 0 ? samples.Disks : mounted;
+    }
+
+    private static ResourceNode[] GroupByMachine(ResourceNode[] disks, string host, string parentId, int? number)
+    {
+        return disks.Where(disk => disk.Machine != null).GroupBy(disk => disk.Machine!, PathComparer)
+            .Select(machine =>
+            {
+                var files = machine.ToArray();
+                return new ResourceNode(parentId + "/vm/" + machine.Key.ToUpperInvariant(), machine.Key,
+                    machine.All(file => file.Target == "WSL") ? "WSL distribution" : "Hyper-V virtual machine",
+                    ResourceKind.VirtualMachine, DiskTotal(files), files, host, number, Machine: machine.Key);
+            }).Concat(disks.Where(disk => disk.Machine == null)).ToArray();
     }
 
     private static string FileName(string path) => path[(Math.Max(path.LastIndexOf('/'), path.LastIndexOf('\\')) + 1)..];

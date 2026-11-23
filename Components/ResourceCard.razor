@@ -12,11 +12,8 @@
                 @if (Overview) { <h2 class="resource-name">@Node.Name</h2> }
                 else
                 {
-                    <button type="button" class="resource-name" aria-pressed="@(Selected ? "true" : "false")" @onclick="Select" @onclick:stopPropagation="true">@Node.Name</button>
-                }
-                @if (ShowsBusyChildren)
-                {
-                    <span class="quiet resource-child-status" title="A nested disk meets the activity or transfer filters for its available measurements.">Busy children</span>
+                    <button type="button" class="resource-name" title="@Node.BackingPath" aria-pressed="@(Selected ? "true" : "false")"
+                        @onclick="Select" @onclick:stopPropagation="true">@Node.Name</button>
                 }
                 @if (Node.Type is not null) { <span class="resource-type">@Node.Type</span> }
                 @if (Overview && !PaneOpen)
@@ -25,7 +22,7 @@
                         @onclick="OpenPane" @onclick:stopPropagation="true">≡</button>
                 }
             </div>
-            @if (Overview || GraphOpen || MetricsVisible && (!ShowsBusyChildren || CardReading is { } reading && DiskActivity.HasActivity(reading)))
+            @if (Overview || GraphOpen || MetricsVisible && (!Disk || DiskActivity.HasActivity(ChartNode.Reading)))
             {
                 <ResourceChart Node="ChartNode" Disk="Disk" Controls="Overview" Graph="GraphOpen" Metrics="MetricsVisible" Stored="Stored"
                     History="@(Overview || GraphOpen ? ReadHistory(Node.Id) : [])" />
@@ -56,13 +53,13 @@
             {
                 <ResourceCard @key="child.Node.Id" Node="child.Node" Disk="Disk" SelectedId="@SelectedId" VisibleChildren="VisibleChildren"
                     ReadHistory="ReadHistory" ReadDetails="ReadDetails" BandPercent="BandPercent" Selection="Selection" Scope="Scope"
-                    CardReading="child.Reading" RelativeHeat="child.RelativeHeat" ShowsBusyChildren="child.ShowsBusyChildren" />
+                    CardReading="child.Reading" RelativeHeat="child.RelativeHeat" />
             }
         </div>
     }
-    else if (Disk && Overview && Node.Children.Length > 0)
+    else if (EmptyCards is string message)
     {
-        <div class="resource-chart-compact quiet">No disks match the current filters.</div>
+        <div class="resource-chart-compact quiet">@message</div>
     }
     @if (Overview && PaneOpen)
     {
@@ -89,13 +86,13 @@
     [Parameter] public bool Overview { get; set; }
     [Parameter] public bool Stored { get; set; }
     [Parameter] public bool PaneOpen { get; set; }
+    [Parameter] public string? EmptyCards { get; set; }
     [Parameter] public EventCallback OpenPane { get; set; }
     [Parameter] public EventCallback ClosePane { get; set; }
     [Parameter] public RenderFragment? Breadcrumb { get; set; }
     [Parameter] public int BandPercent { get; set; }
     [Parameter] public ResourceReading? CardReading { get; set; }
     [Parameter] public double RelativeHeat { get; set; }
-    [Parameter] public bool ShowsBusyChildren { get; set; }
     private ResourceCardEntry[] Children = [];
     private bool graph, details, metrics = true;
     protected override void OnParametersSet()

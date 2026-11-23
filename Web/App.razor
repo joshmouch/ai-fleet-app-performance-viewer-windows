@@ -13,7 +13,8 @@
     <Dashboard @rendermode="new InteractiveServerRenderMode(prerender: true)" />
     <script src="_framework/blazor.web.js"></script>
     <script src="resource-pane.js"></script>
-    @if (Environment.GetEnvironmentVariable("DOTNET_WATCH") == "1")
+    @if (Environment.GetEnvironmentVariable("DOTNET_WATCH") == "1" &&
+        string.IsNullOrEmpty(Environment.GetEnvironmentVariable("ViewerSourceCheckout")))
     {
         <script src="_framework/aspnetcore-browser-refresh.js"></script>
     }

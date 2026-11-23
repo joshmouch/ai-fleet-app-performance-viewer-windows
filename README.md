@@ -22,6 +22,16 @@ During ETW startup the live stream can contain CPU samples and a disk status bef
 
 The browser and the native window render the same Razor resource cards. CPU and Disk share the scope, wrapping layout, filter, chart and detail controls. Select a card to reveal its toolbar. Use Graph, Metrics or Details to change what the card displays. Use Scope to make the card the overview and the breadcrumb to return to a parent scope. Click empty space or select the same card again to clear the selection. Close the overview details with ×, reopen them with the list icon, or drag their upper divider to resize.
 
+Turn CPU and Disk on independently to compare both in the same window. They share the collector and search field, and each keeps its own scope, details and sort. The viewer remembers visibility, Disk grouping and ranking settings in the current browser or desktop profile. Each new session starts at system scope.
+
+Use the grouping selector beside Disk to change how its cards are organized:
+
+- **Storage** shows the host mount or disk, the owning VM or WSL distribution, the VHDX, and the guest device.
+- **Workloads** shows Windows file I/O and a card for each VM or WSL distribution, with its VHDX files nested together across host volumes. A VHDX with no known owner stays available as a standalone card.
+- **VHDX** goes directly to the backing files and their guest devices.
+
+All groupings use the same system totals. A VHDX's Processes and Paths include guest activity tied to that backing file. They report guest logical I/O separately from measured Windows read and write rates.
+
 The Disk source selector can also read archived physical or guest-logical intervals from a ClickHouse HTTP endpoint. Configure a `FileHistory` array on the web server. For example, one entry can be `{"Name":"Workstation history","Endpoint":"http://127.0.0.1:8123/","Host":"WORKSTATION","Scope":"host","Layer":"physical","LookbackHours":24}`. For authenticated endpoints set `User` and `PasswordEnvironment` on the entry. The latter names an environment variable on the server. Use HTTPS for credentials sent to a remote endpoint.
 
 Choose a source on Disk and enter the UTC end time. The app reads the latest measured window ending at or before it within the lookback. Its rates use that sample’s own duration. The browser and native window use the same rankings, including unresolved operations. Selecting Live returns to the running collectors. This source expects the `otel.performance_file_window_latest` view over exported file windows.
