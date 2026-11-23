@@ -56,21 +56,20 @@
         pending = token;
         try
         {
-            await Changed.InvokeAsync(new(true, null));
             if (!DateTimeOffset.TryParse(time, CultureInfo.InvariantCulture,
                 DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var at))
-            { message = "Enter a valid UTC date and time."; return; }
-            message = "Loading disk history…";
+            { await Changed.InvokeAsync(new(true, null, Message: "Enter a valid UTC date and time.")); return; }
+            await Changed.InvokeAsync(new(true, null, Loading: true));
             var result = await History.ReadAsync(source, at, token.Token);
             if (token.IsCancellationRequested) return;
-            message = result == null ? "No stored window in the configured lookback period." : null;
             await Changed.InvokeAsync(new(true, result));
         }
         catch (OperationCanceledException) when (token.IsCancellationRequested) { }
         catch (Exception ex) when (ex is HttpRequestException or IOException or InvalidDataException or FormatException or
             System.Text.Json.JsonException or OverflowException or KeyNotFoundException or OperationCanceledException or ArgumentException)
         {
-            if (!token.IsCancellationRequested) message = ex is InvalidDataException ? ex.Message : "Disk history request failed.";
+            if (!token.IsCancellationRequested)
+                await Changed.InvokeAsync(new(true, null, Message: ex is InvalidDataException ? ex.Message : "Disk history request failed."));
         }
         finally { if (pending == token) pending = null; }
     }

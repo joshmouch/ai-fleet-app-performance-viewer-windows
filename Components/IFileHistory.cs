@@ -6,4 +6,4 @@ public interface IFileHistory
     Task<StoredFileWindow?> ReadAsync(string source, DateTimeOffset at, CancellationToken stop);
 }
 
-public sealed record HistorySelection(bool Active, StoredFileWindow? Window);
+public sealed record HistorySelection(bool Active, StoredFileWindow? Window, bool Loading = false, string? Message = null);

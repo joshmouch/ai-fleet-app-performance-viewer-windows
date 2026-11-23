@@ -10,7 +10,12 @@
     <link rel="stylesheet" href="_content/PerformanceViewer.Components/viewer.css" />
 </head>
 <body>
-    <Dashboard @rendermode="new InteractiveServerRenderMode(prerender: false)" />
+    <Dashboard @rendermode="new InteractiveServerRenderMode(prerender: true)" />
     <script src="_framework/blazor.web.js"></script>
+    <script src="resource-pane.js"></script>
+    @if (Environment.GetEnvironmentVariable("DOTNET_WATCH") == "1")
+    {
+        <script src="_framework/aspnetcore-browser-refresh.js"></script>
+    }
 </body>
 </html>

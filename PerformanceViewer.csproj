@@ -27,6 +27,7 @@
     <Compile Include="DiskIoDetails.cs" />
     <Compile Include="WindowsDiskFileNames.cs" />
     <Compile Include="WindowsSampleStream.cs" />
+    <Compile Include="WindowsResourceCounters.cs" />
     <Compile Include="WindowsGuestSamples.cs" />
     <Compile Include="WindowsDiskInventory.cs" />
     <ProjectReference Include="Core/PerformanceViewer.Core.csproj" />

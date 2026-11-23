@@ -16,7 +16,7 @@ public sealed record DiskPathWindow(DateTimeOffset End, double Seconds, int? Dis
 // process snapshots. Consumers replace the previous frame rather than summing rolling windows.
 public sealed record PerformanceWindow(string Schema, string Host, DateTimeOffset? Boot,
     Guid Capture, long Sequence, DateTimeOffset CpuEnd, CpuProcessSample Cpu, DiskPathWindow DiskPaths, GuestWindow Guests = null,
-    string CpuStatus = null)
+    string CpuStatus = null, ResourceMeasurements Resources = null)
 {
     public const string CurrentSchema = "performance-viewer/window/v1";
     private static readonly JsonSerializerOptions Options = new(JsonSerializerDefaults.Web)

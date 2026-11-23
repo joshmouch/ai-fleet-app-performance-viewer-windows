@@ -2,7 +2,9 @@
 @implements IAsyncDisposable
 @inject IMetricTimelines History
 
-@if (error != null) { <p role="status">@error</p> }
+@if (error != null) { <MeasurementNotice Title="@error" /> }
+else if (!read) { <MeasurementNotice Title="Loading stored timelines" Loading="true" /> }
+else if (window == null) { <MeasurementNotice Title="No stored timelines available" /> }
 @if (window != null)
 {
     var peak = Disk ? window.Series.SelectMany(s => s.Points).Select(p => p.Value).DefaultIfEmpty(0).Max() : 1;
@@ -13,12 +15,17 @@
         @foreach (var series in window.Series.OrderBy(s => s.Labels).ThenBy(s => s.Signal))
         {
             var last = series.Points.LastOrDefault();
+            var segments = Segments(series, window, peak).ToArray();
             <div class="metric-series">
                 <span>@series.Signal @series.Labels</span>
-                <svg viewBox="0 0 300 36" preserveAspectRatio="none" role="img" aria-label="@($"{series.Signal} history {series.Labels}")">
-                    @foreach (var points in Segments(series, window, peak))
-                    { <polyline points="@points" fill="none" stroke="currentColor" stroke-width="2" vector-effect="non-scaling-stroke" /> }
-                </svg>
+                @if (segments.Length > 0)
+                {
+                    <svg viewBox="0 0 300 36" preserveAspectRatio="none" role="img" aria-label="@($"{series.Signal} history {series.Labels}")">
+                        @foreach (var points in segments)
+                        { <polyline points="@points" fill="none" stroke="currentColor" stroke-width="2" vector-effect="non-scaling-stroke" /> }
+                    </svg>
+                }
+                else { <span class="quiet">History needs at least two adjacent samples</span> }
                 <span class="num">@(last == null ? "No samples" : Disk ? $"{last.Value / 1048576:N2} MiB/s" : $"{100 * last.Value:N1}%")</span>
             </div>
         }
@@ -30,6 +37,7 @@
     private readonly CancellationTokenSource stop = new();
     private Task? refresh;
     private MetricTimeline? window;
+    private bool read;
     private string? error;
     protected override void OnAfterRender(bool first)
     {
@@ -45,8 +53,9 @@
                 try
                 {
                     window = await History.ReadAsync(Disk, stop.Token);
+                    read = true;
                     error = null;
-                    if (window == null) return;
+                    if (window == null) { StateHasChanged(); return; }
                 }
                 catch (Exception e) when (!stop.IsCancellationRequested && e is
                     (HttpRequestException or IOException or InvalidDataException or System.Text.Json.JsonException or
@@ -68,13 +77,16 @@
         foreach (var p in series.Points)
         {
             if (prior.HasValue && p.Time - prior > w.Step)
-            { yield return string.Join(" ", points); points.Clear(); }
+            {
+                if (points.Count > 1) yield return string.Join(" ", points);
+                points.Clear();
+            }
             double x = 300.0 * (p.Time - w.Start) / (w.End - w.Start);
             double y = 35 - 34 * (peak > 0 ? Math.Clamp(p.Value / peak, 0, 1) : 0);
             points.Add(FormattableString.Invariant($"{x:0.##},{y:0.##}"));
             prior = p.Time;
         }
-        if (points.Count > 0) yield return string.Join(" ", points);
+        if (points.Count > 1) yield return string.Join(" ", points);
     }
     public async ValueTask DisposeAsync()
     {

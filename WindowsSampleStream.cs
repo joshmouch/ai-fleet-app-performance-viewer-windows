@@ -15,12 +15,13 @@ internal static class WindowsSampleStream
     {
         int interval = 10;
         int? disk = null, count = null;
-        bool collectGuests = false;
+        bool collectGuests = false, collectResources = false;
         string archiveDirectory = null;
         for (int i = 0; i < args.Length; i++)
         {
             string option = args[i];
             if (option == "--guests") { collectGuests = true; continue; }
+            if (option == "--resources") { collectResources = true; continue; }
             if (option == "--archive" && i + 1 < args.Length && !string.IsNullOrWhiteSpace(args[i + 1]) && !args[i + 1].StartsWith("--"))
             {
                 archiveDirectory = args[++i];
@@ -45,9 +46,10 @@ internal static class WindowsSampleStream
         {
             await using var archive = archiveDirectory == null ? null : new FileWindowArchive(archiveDirectory, stop.Token);
             var index = new VolumePathIndex(Array.Empty<DiskVolume>());
+            var disks = new System.Collections.Generic.Dictionary<int, DiskIdentity>();
             try
             {
-                var disks = WindowsDiskInventory.LoadDiskIdentities();
+                disks = WindowsDiskInventory.LoadDiskIdentities();
                 index = new VolumePathIndex(disks.Values.Where(d => d.Volumes != null).SelectMany(d => d.Volumes));
             }
             catch (Exception ex) when (ex is ManagementException or COMException or UnauthorizedAccessException)
@@ -58,6 +60,7 @@ internal static class WindowsSampleStream
             var captureId = Guid.NewGuid();
             DateTimeOffset? boot = ReadBoot();
             await using var guestSamples = collectGuests ? new WindowsGuestSamples(index) : null;
+            using var resourceCounters = collectResources ? new WindowsResourceCounters(disks) : null;
             using var capture = new VolumeFileIo(true, Array.Empty<int>(), index);
             using var output = new StreamWriter(Console.OpenStandardOutput(), new UTF8Encoding(false));
             for (long sequence = 1; !count.HasValue || sequence <= count; sequence++)
@@ -66,13 +69,14 @@ internal static class WindowsSampleStream
                 var host = CpuProcessSampler.ReadHost(stop.Token, duration);
                 if (guestSamples != null) await guestSamples.Begin(host, duration);
                 var cpu = await host;
-                var paths = capture.Read(true, disk, null, false);
+                var paths = capture.Read(true, disk, null, false, includeDiskFiles: collectResources);
                 var pathWindow = new DiskPathWindow(paths.End, paths.Seconds, disk, paths.Status, paths.EventsLost,
                     paths.DiskBytes, paths.NamedBytes, paths.KeylessBytes,
                     paths.Entries.Select(pair => new MeasuredFile(pair.Key, pair.Value)).ToArray());
                 var frame = new PerformanceWindow(PerformanceWindow.CurrentSchema, Environment.MachineName, boot,
                     captureId, sequence, cpu.End.Value, cpu, pathWindow,
-                    guestSamples == null ? null : await guestSamples.Read(paths, duration));
+                    guestSamples == null ? null : await guestSamples.Read(paths, duration),
+                    Resources: resourceCounters?.Read(paths.DiskFiles, guestSamples));
                 archive?.Record(frame);
                 await output.WriteLineAsync(frame.Encode());
                 await output.FlushAsync();
@@ -106,7 +110,7 @@ internal static class WindowsSampleStream
 
     private static int Usage()
     {
-        Console.Error.WriteLine("Usage: --collect [--guests] [--archive DIRECTORY] [--interval SECONDS] [--disk NUMBER] [--count WINDOWS]");
+        Console.Error.WriteLine("Usage: --collect [--guests] [--resources] [--archive DIRECTORY] [--interval SECONDS] [--disk NUMBER] [--count WINDOWS]");
         return 2;
     }
 }

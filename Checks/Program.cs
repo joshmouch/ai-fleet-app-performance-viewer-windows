@@ -14,6 +14,46 @@ var window = new PerformanceWindow(PerformanceWindow.CurrentSchema, host, time.A
         raw.Select(pair => new MeasuredFile(pair.Key, pair.Value)).ToArray()));
 var encoded = window.Encode();
 var decoded = PerformanceWindow.Decode(encoded);
+Check(decoded.Resources == null, "older sample windows may omit resource measurements");
+var measuredWindow = window with
+{
+    Resources = new(
+        new CpuResourceMeasurements(31, [new("0,0", 42)], 20, 9, 2),
+        [
+            new(2, "Pool volume", "Storage Spaces volume", [@"D:\"], true, 8, 12, 46),
+            new(71, "Backing drive", "Physical disk", [], false, 16, 24, 65)
+        ],
+        raw.Select(pair => new DiskFileMeasurement(2, pair.Key, pair.Value)).ToArray(),
+        [new(2, backing.Path, "guest-one", "guest-one")])
+};
+var measured = PerformanceWindow.Decode(measuredWindow.Encode());
+var diskTree = ResourceTree.Build(true, [measured], (_, _) => true, false);
+var measuredDisk = diskTree.Children.Single();
+var owner = measuredDisk.Children.Single();
+var vhdx = owner.Children.Single();
+Check(measuredDisk.Disk == 2 && owner.Kind == ResourceKind.VirtualMachine && owner.Name == "guest-one" &&
+    vhdx.BackingPath == backing.Path && vhdx.Type == null, "storage volume contains the owning VM and its VHDX");
+Check(diskTree.Reading is { Active: 46, Read: 8, Write: 12 } && vhdx.Reading.Active == null,
+    "device counters exclude backing layers and VHDX active time stays unavailable");
+var average = DiskActivity.Average([(new(60, 3, 9), 20), (new(30, null, 0), 40)]);
+Check(average is { Active: 40, Read: 3, Write: 3 }, "disk average weights elapsed time and preserves missing rates");
+Check(!DiskActivity.MeetsCutoffs(new(0, 0, 0), 0, 0) &&
+    !DiskActivity.MeetsCutoffs(new(24, 8, 1), 25, 1) &&
+    !DiskActivity.MeetsCutoffs(new(40, 0, .5), 25, 1) &&
+    DiskActivity.MeetsCutoffs(new(null, 0, 2), 25, 1),
+    "disk cutoffs omit idle disks, require both measured thresholds, and admit rate-only children");
+Check(DiskActivity.RelativeHeat(new(20, 2, 4), 40, 20) == .5 &&
+    DiskActivity.RelativeHeat(new(null, 5, 15), 40, 20) == 1,
+    "disk heat scales within siblings by active time and transfer separately");
+Check(ResourceTree.Build(true, [measured], (_, _) => true, true).Reading.Write == 36, "explicit all-disks scope");
+Check(ResourceTree.Build(false, [measured], (_, _) => true, false).Children.Single().Children.Single().Reading.Active == 42,
+    "CPU and disk use the same nested measurement shape");
+var smallerHost = measured with { Host = "fixture-small", Cpu = measured.Cpu with { LogicalProcessors = 2 },
+    Resources = measured.Resources with { Cpu = measured.Resources.Cpu with { Busy = 81 } } };
+Check(ResourceTree.Build(false, [measured, smallerHost], (_, _) => true, false).Reading.Active == 41,
+    "multi-host CPU is weighted by logical processor capacity");
+Check(DiskIoMerge.Sum(measured.Resources.Files.Select(row => row.Totals)).Equals(decoded.DiskPaths.Totals()),
+    "resource file measurement conserves read, write and operation counts");
 var payload = FileWindowExport.Encode(decoded);
 Check(payload.SequenceEqual(FileWindowExport.Encode(decoded)), "a retried window keeps the same OTLP bytes");
 using var envelope = System.Text.Json.JsonDocument.Parse(payload);

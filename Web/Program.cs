@@ -1,4 +1,5 @@
 using PerformanceViewer.Web;
+using PerformanceViewer;
 
 var builder = WebApplication.CreateBuilder(args);
 var port = builder.Configuration.GetValue("ViewerPort", 5217);
@@ -55,5 +56,26 @@ app.MapGet("/api/windows", (WindowSources sources, HttpContext context) =>
         return Results.StatusCode(StatusCodes.Status304NotModified);
     return Results.Json(snapshot.Windows);
 });
+app.MapGet("/_viewer/info", () => Results.Text("performance-viewer"));
+if (builder.Configuration["ViewerInstance"] is { Length: > 0 } instance)
+{
+    bool Owned(HttpContext context) => string.Equals(context.Request.Headers["X-Viewer-Instance"], instance, StringComparison.Ordinal);
+    app.MapGet("/_viewer/ready", (HttpContext context) =>
+    {
+        if (!Owned(context)) return Results.NotFound();
+        context.Response.Headers[ViewerStartupProtocol.Header] = ViewerStartupProtocol.Version;
+        return Results.Text(Environment.ProcessId.ToString(System.Globalization.CultureInfo.InvariantCulture));
+    });
+    app.MapPost("/_viewer/exit", (HttpContext context) =>
+    {
+        if (!Owned(context)) return Results.NotFound();
+        context.Response.OnCompleted(() =>
+        {
+            app.Lifetime.StopApplication();
+            return Task.CompletedTask;
+        });
+        return Results.NoContent();
+    });
+}
 app.MapRazorComponents<App>().AddInteractiveServerRenderMode();
 app.Run();

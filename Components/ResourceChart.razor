@@ -1,0 +1,134 @@
+@using Microsoft.AspNetCore.Components
+@using Microsoft.AspNetCore.Components.Web
+
+<div class="resource-chart @(Compact ? "resource-chart-compact" : "")" title="@CompactHint">
+    @if (MetricsVisible && Current.Length > 0)
+    {
+        <dl class="resource-metrics">
+            @foreach (var metric in Current)
+            {
+                <div class="@metric.Class"><dt>
+                    @if (GraphVisible && Plotted.Contains(metric))
+                    { <span class="metric-key" aria-hidden="true"></span> }
+                    @Label(metric)</dt><dd>@Format(metric)</dd></div>
+            }
+        </dl>
+    }
+    @if (GraphVisible && Plotted.Length > 0)
+    {
+        <div class="resource-plot">
+            <div class="chart-scales">
+                @if (Plotted.Any(metric => metric.Unit != "%")) { <span>0–@RateMaximum.ToString("0.#") MiB/s</span> }
+                @if (Plotted.Any(metric => metric.Unit == "%")) { <span class="percent-scale">0–100%</span> }
+            </div>
+            <svg viewBox="0 0 320 65" preserveAspectRatio="none" role="img" aria-label="@($"{Node.Name} history")">
+                <path class="chart-grid" d="M0 1H320 M0 32H320 M0 64H320" />
+                @foreach (var metric in Plotted)
+                {
+                    <path class="@metric.Class" d="@PathFor(metric)" vector-effect="non-scaling-stroke" />
+                }
+            </svg>
+            <div class="chart-times"><span>@History[0].At.ToLocalTime().ToString("HH:mm:ss")</span><span>@History[^1].At.ToLocalTime().ToString("HH:mm:ss")</span></div>
+        </div>
+    }
+    else if (GraphVisible)
+    {
+        <div class="resource-plot resource-plot-status">
+            @{
+                bool collecting = !Stored && Current.Length > 0;
+            }
+            <MeasurementNotice Title="@(Stored ? "Stored measurement window" : collecting ? "Collecting timeline" : "Timeline unavailable")"
+                Detail="@(Stored ? "A stored window supplies totals for one interval." : collecting ? "Waiting for a second measurement." : null)"
+                Loading="collecting" />
+        </div>
+    }
+    else if (Compact && MetricsVisible && Current.Length == 0)
+    {
+        <span class="quiet">No measurements</span>
+    }
+    @if (Controls)
+    {
+        <div class="resource-actions" aria-label="Graph and metrics">
+            <button type="button" class="resource-icon" aria-label="@(HideGraph ? "Show graph" : "Hide graph")"
+                title="@(HideGraph ? "Show graph" : "Hide graph")" aria-pressed="@(!HideGraph ? "true" : "false")" @onclick="() => HideGraph = !HideGraph" @onclick:stopPropagation="true">∿</button>
+            @if (Current.Length > 0)
+            {
+                <button type="button" class="resource-icon" aria-label="@(HideMetrics ? "Show metrics" : "Hide metrics")"
+                    title="@(HideMetrics ? "Show metrics" : "Hide metrics")" aria-pressed="@(!HideMetrics ? "true" : "false")" @onclick="() => HideMetrics = !HideMetrics" @onclick:stopPropagation="true">№</button>
+            }
+        </div>
+    }
+</div>
+
+@code {
+    [Parameter, EditorRequired] public ResourceNode Node { get; set; } = default!;
+    [Parameter] public bool Disk { get; set; }
+    [Parameter] public bool Controls { get; set; }
+    [Parameter] public bool Graph { get; set; }
+    [Parameter] public bool Metrics { get; set; } = true;
+    [Parameter] public bool Stored { get; set; }
+    [Parameter] public IReadOnlyList<ResourcePoint> History { get; set; } = [];
+
+    private bool HideGraph, HideMetrics;
+    private bool Compact => !Controls && !Graph;
+    private bool GraphVisible => Controls ? !HideGraph : Graph;
+    private bool MetricsVisible => Controls ? !HideMetrics : Metrics;
+    private sealed record Metric(string Label, string Unit, string Class, Func<ResourceReading, double?> Read);
+    private static readonly Metric[] DiskMetrics = [
+        new("Read", " MiB/s", "read", r => r.Read),
+        new("Write", " MiB/s", "write", r => r.Write),
+        new("Peak active time", "%", "active", r => r.Active)];
+    private static readonly Metric[] CpuMetrics = [
+        new("CPU busy", "%", "read", r => r.Active),
+        new("Windows CPU", "%", "write", r => r.Windows),
+        new("Guest CPU", "%", "guest", r => r.Guests),
+        new("Hypervisor overhead", "%", "active", r => r.Hypervisor)];
+    private Metric[] AvailableMetrics => Disk ? DiskMetrics : Node.Kind is ResourceKind.System or ResourceKind.Host ? CpuMetrics : [CpuMetrics[0]];
+    private string? CompactHint => Disk && Compact
+        ? $"Physical averages use up to {DiskActivity.WindowSeconds}s. Darker cards have higher activity or transfer than their siblings."
+        : null;
+    private string Label(Metric metric) => Disk && Compact && Node.Kind == ResourceKind.Disk
+        ? metric.Class == "active" ? "Avg active" : $"Avg {metric.Label.ToLowerInvariant()}"
+        : metric.Label;
+    private Metric[] Current = [], Plotted = [];
+    protected override void OnParametersSet()
+    {
+        var metrics = AvailableMetrics;
+        Current = metrics.Where(metric => Known(metric.Read(Node.Reading))).ToArray();
+        Plotted = !Compact && !Stored
+            ? metrics.Where(metric => HasTrend(metric)).ToArray() : [];
+    }
+    private static bool Known(double? value) => value is double number && double.IsFinite(number);
+    private bool HasTrend(Metric metric)
+    {
+        for (int i = 1; i < History.Count; i++)
+            if (History[i - 1].At < History[i].At && Known(metric.Read(History[i - 1].Reading)) &&
+                Known(metric.Read(History[i].Reading))) return true;
+        return false;
+    }
+    private string Format(Metric metric)
+    {
+        if (metric.Read(Node.Reading) is not double value) return "—";
+        return Disk && value is > 0 and < .005 ? $"<{.01:0.00}{metric.Unit}" : $"{value:0.##}{metric.Unit}";
+    }
+    private double RateMaximum => Math.Max(1, Math.Max(Math.Max(Node.Reading.Read ?? 0, Node.Reading.Write ?? 0),
+        History.Select(point => Math.Max(point.Reading.Read ?? 0, point.Reading.Write ?? 0)).DefaultIfEmpty().Max()));
+
+    private string PathFor(Metric metric)
+    {
+        if (History.Count == 0) return "";
+        double maximum = metric.Unit == "%" ? 100 : RateMaximum;
+        double seconds = Math.Max(1, (History[^1].At - History[0].At).TotalSeconds);
+        var path = new System.Text.StringBuilder();
+        bool connected = false;
+        foreach (var point in History)
+        {
+            if (metric.Read(point.Reading) is not double value || !double.IsFinite(value)) { connected = false; continue; }
+            var x = 320 * (point.At - History[0].At).TotalSeconds / seconds;
+            var y = 63 - 61 * Math.Clamp(value / maximum, 0, 1);
+            path.Append(FormattableString.Invariant($"{(connected ? 'L' : 'M')}{x:0.##} {y:0.##} "));
+            connected = true;
+        }
+        return path.ToString();
+    }
+}

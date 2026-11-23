@@ -26,6 +26,14 @@ public struct FileIoTotals
         Writes += value.Writes;
     }
 
+    public readonly FileIoTotals Minus(FileIoTotals value) => new()
+    {
+        ReadBytes = ReadBytes - value.ReadBytes,
+        WriteBytes = WriteBytes - value.WriteBytes,
+        Reads = Reads - value.Reads,
+        Writes = Writes - value.Writes
+    };
+
     public static void AddTo<TKey>(Dictionary<TKey, FileIoTotals> target, TKey key, FileIoTotals value)
     {
         // One hash and probe per update: the slot is updated in place, starting at default for a new key.

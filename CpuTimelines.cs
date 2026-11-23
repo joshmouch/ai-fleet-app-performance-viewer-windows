@@ -193,10 +193,10 @@ internal sealed class Timeline : Form
     private const int PaddingSize = 16;
     private const int CardGap = 6;
     private const int CardsTop = ChartTop + OverallPanelHeight + CardGap;
-    private const double DiskActivityWindow = 60;
+    private const double DiskActivityWindow = DiskActivity.WindowSeconds;
     private const double MinimumDiskCoverage = 20;
-    private const int DefaultDiskCutoff = 25;
-    private const int DefaultTransferCutoff = 1;
+    private const int DefaultDiskCutoff = DiskActivity.DefaultActiveCutoff;
+    private const int DefaultTransferCutoff = DiskActivity.DefaultTransferCutoff;
     private const string UpdateLabel = "Update every";
     private const string DiskCutoffLabel = "Min active";
     private const string TransferCutoffLabel = "Min I/O";
@@ -517,6 +517,8 @@ internal sealed class Timeline : Form
         diskGrid.AutoScroll = true;
         diskGrid.Visible = false;
         diskGrid.SizeChanged += delegate { ResizeDiskCards(); };
+        diskGrid.MouseClick += ClearDiskSelectionOnBackgroundClick;
+        MouseClick += ClearDiskSelectionOnBackgroundClick;
         Controls.Add(diskGrid);
         diskIoDetails.LayoutChanged += delegate
         {
@@ -1094,6 +1096,12 @@ internal sealed class Timeline : Form
     private static string DiskCardGroup(DiskSummary disk) => disk.VirtualDisk == null
         ? Environment.MachineName + " disks"
         : disk.VirtualOwner?.Label is string owner ? owner + " VHDX files" : "VHDX files";
+
+    private void ClearDiskSelectionOnBackgroundClick(object sender, MouseEventArgs e)
+    {
+        if (e.Button == MouseButtons.Left && showingDisks && diskIoDetails.HasSelection)
+            diskIoDetails.SelectAllDisks();
+    }
 
     private void SelectDiskCard(DiskSummary picked)
     {
