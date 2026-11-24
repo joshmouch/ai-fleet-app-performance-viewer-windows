@@ -1,6 +1,6 @@
 #nullable enable
 
-public enum ResourceKind { System, Host, CpuGroup, Processor, Disk, WindowsIo, VirtualMachine, VirtualDisk, GuestDevice }
+public enum ResourceKind { System, Host, CpuGroup, Processor, Disk, WindowsIo, UnattributedIo, VirtualMachine, VirtualDisk, GuestDevice }
 public enum DiskGrouping { Storage, Workloads, Vhdx }
 
 public readonly record struct ResourceReading(double? Active = null, double? Read = null, double? Write = null,
@@ -15,12 +15,13 @@ public static class ResourceTree
     private static readonly StringComparer PathComparer = StringComparer.OrdinalIgnoreCase;
 
     public static ResourceNode Build(bool disk, IEnumerable<PerformanceWindow> frames,
-        Func<string, string, bool> includesGuest, bool includeAllDisks, DiskGrouping diskGrouping = DiskGrouping.Storage)
+        Func<string, string, bool> includesGuest, bool includeAllDisks, DiskGrouping diskGrouping = DiskGrouping.Storage,
+        bool showLogicalProcessors = true)
     {
         var sources = frames.OrderBy(w => w.Host, PathComparer).ToArray();
         var hosts = sources.Select(w => disk
             ? DiskHost(w, includesGuest, includeAllDisks, diskGrouping)
-            : CpuHost(w, includesGuest)).ToArray();
+            : CpuHost(w, includesGuest, showLogicalProcessors)).ToArray();
         var capacity = sources.Select(frame => frame.Cpu.LogicalProcessors).ToArray();
         var reading = disk ? DiskTotal(hosts) : new ResourceReading(
             CapacityAverage(hosts, capacity, reading => reading.Active),
@@ -39,7 +40,7 @@ public static class ResourceTree
                 yield return descendant;
     }
 
-    private static ResourceNode CpuHost(PerformanceWindow frame, Func<string, string, bool> includesGuest)
+    private static ResourceNode CpuHost(PerformanceWindow frame, Func<string, string, bool> includesGuest, bool showLogicalProcessors)
     {
         string host = frame.Host, id = "cpu/" + host;
         var counters = frame.Resources?.Cpu;
@@ -48,7 +49,7 @@ public static class ResourceTree
         var reading = new ResourceReading(busy, Windows: counters?.Windows, Guests: counters?.Guests,
             Hypervisor: counters?.Hypervisor);
         var children = new List<ResourceNode>();
-        if (counters?.Processors is { Length: > 0 } processors)
+        if (showLogicalProcessors && counters?.Processors is { Length: > 0 } processors)
             children.Add(new(id + "/logical", "Logical processors", "Windows host", ResourceKind.CpuGroup,
                 new(busy), processors.Select(p => new ResourceNode(id + "/processor/" + p.Id,
                     "CPU " + p.Id, null, ResourceKind.Processor, new(p.Busy), [], host,
@@ -130,7 +131,7 @@ public static class ResourceTree
         var vhdx = disks.SelectMany(disk => disk.Children).ToArray();
         ResourceNode[] children = grouping switch
         {
-            DiskGrouping.Workloads => [WindowsWorkload(), ..GroupByMachine(vhdx, frame.Host, id + "/workloads", null)],
+            DiskGrouping.Workloads => [..WindowsWorkloads(), ..GroupByMachine(vhdx, frame.Host, id + "/workloads", null)],
             DiskGrouping.Vhdx => vhdx.Select(file => file with { Type = file.Machine }).ToArray(),
             _ => disks.Select(disk => disk with
             {
@@ -140,11 +141,16 @@ public static class ResourceTree
         return new(id, frame.Host, null, ResourceKind.Host, DiskTotal(disks), children, frame.Host,
             HostShare: Share(hostBytes, hostBytes));
 
-        ResourceNode WindowsWorkload()
+        IEnumerable<ResourceNode> WindowsWorkloads()
         {
-            var bytes = DiskIoMerge.Sum(ResourceDiskScope.NativeWindowsFiles(frame, includeAll).Select(row => row.Totals));
-            return new(id + "/windows", "Windows", "Host file I/O", ResourceKind.WindowsIo, Rate(bytes, frame.DiskPaths.Seconds),
-                [], frame.Host, HostShare: Share(bytes.TotalBytes, hostBytes));
+            if (ResourceDiskScope.Breakdown(frame, null, includeAll) is not { } captured) yield break;
+            var hostRate = hostBytes / (1048576 * frame.DiskPaths.Seconds);
+            yield return new(id + "/windows", "Windows files", "Host file I/O", ResourceKind.WindowsIo,
+                new(Read: captured.WindowsFiles.Read, Write: captured.WindowsFiles.Write),
+                [], frame.Host, HostShare: Share(captured.WindowsFiles.Total, hostRate));
+            yield return new(id + "/unattributed", "Unattributed I/O", null, ResourceKind.UnattributedIo,
+                new(Read: captured.Unattributed.Read, Write: captured.Unattributed.Write),
+                [], frame.Host, HostShare: Share(captured.Unattributed.Total, hostRate));
         }
     }
 

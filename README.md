@@ -24,13 +24,17 @@ The browser and the native window render the same Razor resource cards. CPU and 
 
 Turn CPU and Disk on independently to compare both in the same window. They share the collector and search field, and each keeps its own scope, details and sort. The viewer remembers visibility, Disk grouping and ranking settings in the current browser or desktop profile. Each new session starts at system scope.
 
+Enable **Settings → Logical processors** to show per-processor CPU cards. This preference starts off and is saved across restarts. The Processes table ranks activity across the selected host or guest because the process samples aggregate CPU time across processors.
+
 Use the grouping selector beside Disk to change how its cards are organized:
 
 - **Storage** shows the host mount or disk, the owning VM or WSL distribution, the VHDX, and the guest device.
-- **Workloads** shows Windows file I/O and a card for each VM or WSL distribution, with its VHDX files nested together across host volumes. A VHDX with no known owner stays available as a standalone card.
+- **Workloads** shows separate cards for named Windows file I/O, unattributed I/O, and each VM or WSL distribution. A guest's VHDX files stay together across host volumes. A VHDX with no known owner stays available as a standalone card.
 - **VHDX** goes directly to the backing files and their guest devices.
 
 All groupings use the same system totals. A VHDX's Processes and Paths include guest activity tied to that backing file. They report guest logical I/O separately from measured Windows read and write rates.
+
+The Disk overview breaks captured host reads and writes into Windows files, VM/WSL disk files, and unattributed I/O. Its totals cover the file trace window. The timeline reports the device-counter rates and peak active time.
 
 Card colors use the same scale at every nesting level. CPU colors show the share of total host CPU capacity, including for individual logical processors. Disk colors show the share of captured host read and write bytes in the current disk coverage. Grouping, search, and drilling into a card keep that host reference. A guest device shows its own file rates, including cached I/O, and takes its color from the host traffic of its mapped backing file. Devices with a shared backing file stay neutral when their individual host shares are unavailable.
 

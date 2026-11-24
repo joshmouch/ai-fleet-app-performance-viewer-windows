@@ -7,6 +7,9 @@ public readonly record struct FileIoKey(int Pid, string Process, string Path)
     private int LastSeparator => Math.Max(Path.LastIndexOf('\\'), Path.LastIndexOf('/'));
     [JsonIgnore] public string Filename => Path[(LastSeparator + 1)..];
     [JsonIgnore] public string Filepath => Path[..(LastSeparator + 1)];
+    public static bool IsVirtualDisk(ReadOnlySpan<char> path) =>
+        path.EndsWith(".vhdx", StringComparison.OrdinalIgnoreCase) ||
+        path.EndsWith(".avhdx", StringComparison.OrdinalIgnoreCase);
 }
 
 public struct FileIoTotals

@@ -449,7 +449,7 @@ internal sealed class VolumeFileIo : IDisposable
         }
         if (path.IsEmpty)
             return;
-        bool isVirtual = IsVirtualDisk(path);
+        bool isVirtual = FileIoKey.IsVirtualDisk(path);
         // A full rundown contains millions of entries. Keep names for observed file keys
         // and VHDX attachments, which can stay open for the lifetime of a VM.
         if (file == null && !isVirtual && (!scope.Details || kind == 2))
@@ -507,10 +507,6 @@ internal sealed class VolumeFileIo : IDisposable
             requests[irp] = new DiskRequest(e.ProcessID, e.ThreadID, time, processes.GetValueOrDefault(e.ProcessID));
     }
 
-    internal static bool IsVirtualDisk(ReadOnlySpan<char> path) =>
-        path.EndsWith(".vhdx", StringComparison.OrdinalIgnoreCase) ||
-        path.EndsWith(".avhdx", StringComparison.OrdinalIgnoreCase);
-
     private void RecordManifestEvent(TraceEvent e, ETWTraceEventSource source)
     {
         int id = (int)e.ID;
@@ -535,7 +531,7 @@ internal sealed class VolumeFileIo : IDisposable
             {
                 if (fileObject == 0) return;
                 manifestOpens.Remove(fileObject);
-                if (e.PayloadByName("FileName") is string { Length: > 0 } name && (scope.Details || IsVirtualDisk(name)))
+                if (e.PayloadByName("FileName") is string { Length: > 0 } name && (scope.Details || FileIoKey.IsVirtualDisk(name)))
                     manifestOpens.Remember(fileObject, new OpenFile(name));
                 return;
             }
@@ -596,7 +592,7 @@ internal sealed class VolumeFileIo : IDisposable
         }
 
         string name = file?.Path;
-        bool isVirtual = attachment != null || name != null && IsVirtualDisk(name);
+        bool isVirtual = attachment != null || name != null && FileIoKey.IsVirtualDisk(name);
         if (fileKey != 0 && file != null && attachment == null)
         {
             if (isVirtual)
@@ -725,7 +721,7 @@ internal sealed class VolumeFileIo : IDisposable
                     int pid = entry.Key.File.Pid;
                     pending[pid] = pending.GetValueOrDefault(pid) + entry.Value.TotalBytes;
                 }
-                if (string.IsNullOrEmpty(path) || ((!byPath || virtualDisk != null) && !IsVirtualDisk(path)))
+                if (string.IsNullOrEmpty(path) || ((!byPath || virtualDisk != null) && !FileIoKey.IsVirtualDisk(path)))
                     continue;
                 path = pathIndex.Resolve(path, entry.Key.Disk) ?? pathIndex.Resolve(path, null) ?? path;
                 var process = entry.Key.File.ProcessKey;
@@ -747,7 +743,7 @@ internal sealed class VolumeFileIo : IDisposable
                         FileIoTotals.AddTo(diskFiles, (entry.Key.Disk, file), entry.Value);
                     }
                 }
-                if (virtualPaths != null && IsVirtualDisk(path))
+                if (virtualPaths != null && FileIoKey.IsVirtualDisk(path))
                     FileIoTotals.AddTo(virtualPaths, file, entry.Value);
             }
         foreach (var entry in processTotals)

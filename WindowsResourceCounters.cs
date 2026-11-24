@@ -41,7 +41,7 @@ internal sealed class WindowsResourceCounters : IDisposable
             return new DiskResourceMeasurement(number, identity?.Name ?? $"Disk {number}", identity?.Kind,
                 identity?.AccessPaths ?? [], identity?.IsStorageSpaces ?? false, rate?.ReadMiB, rate?.WriteMiB, rate?.Active);
         }).ToArray();
-        var backing = files.Where(row => VolumeFileIo.IsVirtualDisk(row.File.Path))
+        var backing = files.Where(row => FileIoKey.IsVirtualDisk(row.File.Path))
             .Select(row => (row.Number, Path: VmDiskIo.Normalize(row.File.Path))).Distinct()
             .Select(row =>
             {

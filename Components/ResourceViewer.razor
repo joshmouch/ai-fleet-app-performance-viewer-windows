@@ -58,6 +58,7 @@
                     }
                     @if (preferences.ShowCpu)
                     {
+                        <label><input type="checkbox" @bind="preferences.ShowLogicalProcessors" @bind:after="Save" /> Logical processors</label>
                         <label>Min CPU % <input type="number" min="0" max="100" @bind="preferences.MinCpuActivity" @bind:after="Save" /></label>
                         <label>CPU sort <select @bind="preferences.CpuSort" @bind:after="Save">
                             <option value="impact">CPU impact</option><option value="guest">Guest CPU share</option>

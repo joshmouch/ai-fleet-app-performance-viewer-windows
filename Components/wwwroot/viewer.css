@@ -87,6 +87,17 @@ p { margin: .75rem 0; }
 .resource-metrics { display: grid; flex: 0 1 auto; min-width: 0; margin: 0; gap: .06rem; font-variant-numeric: tabular-nums; }
 .resource-metrics div { display: flex; justify-content: space-between; flex-wrap: wrap; column-gap: .65rem; }
 .resource-metrics dd { font-weight: 600; margin: 0; }
+.disk-breakdown { flex: none; width: max-content; align-self: start; margin-inline: .25rem; font-size: .82rem;
+    font-variant-numeric: tabular-nums; }
+.disk-breakdown th, .disk-breakdown td { padding: .08rem .28rem; }
+.disk-breakdown tbody th { background: transparent; text-align: start; font-weight: 400; }
+.disk-breakdown tfoot td { font-weight: 600; }
+@media (max-width: 42rem) {
+    .resource-chart:has(> .disk-breakdown) { display: grid; grid-template-columns: minmax(0, 1fr) auto; }
+    .resource-chart:has(> .disk-breakdown) > .resource-actions { grid-column: 2; grid-row: 1; }
+    .disk-breakdown { width: 100%; grid-column: 1 / -1; grid-row: 2; margin-inline: 0; }
+    .resource-chart:has(> .disk-breakdown) > .resource-plot { grid-column: 1 / -1; grid-row: 3; }
+}
 .resource-chart-compact { font-size: .88rem; margin: .05rem 0 0; }
 .resource-chart-compact .resource-metrics { display: flex; flex-wrap: wrap; gap: .05rem .7rem; }
 .resource-chart-compact .resource-metrics div { gap: .28rem; }

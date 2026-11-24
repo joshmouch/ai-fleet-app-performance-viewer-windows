@@ -2,7 +2,7 @@
 @using Microsoft.AspNetCore.Components.Web
 
 <div class="resource-chart @(Compact ? "resource-chart-compact" : "")" title="@MeasurementHint">
-    @if (MetricsVisible && HasMetrics)
+    @if (MetricsVisible && (Current.Length > 0 || HostIoShare != null))
     {
         <dl class="resource-metrics">
             @foreach (var metric in Current)
@@ -17,6 +17,21 @@
                 <div><dt>@(Node.Kind == ResourceKind.GuestDevice ? "Backing I/O" : "Host I/O")</dt><dd>@share</dd></div>
             }
         </dl>
+    }
+    @if (MetricsVisible && Breakdown is { } captured)
+    {
+        <table class="disk-breakdown" aria-label="Captured disk I/O by workload in MiB per second"
+            title="Captured host file I/O. These rates use the trace window. The timeline also shows device-counter measurements.">
+            <thead>
+                <tr><th scope="col">Captured MiB/s</th><th class="num" scope="col">Read</th><th class="num" scope="col">Write</th></tr>
+            </thead>
+            <tbody>
+                <tr><th scope="row">Windows files</th><td class="num">@FormatRate(captured.WindowsFiles.Read)</td><td class="num">@FormatRate(captured.WindowsFiles.Write)</td></tr>
+                <tr><th scope="row" title="VHDX and AVHDX files">VM/WSL disk files</th><td class="num">@FormatRate(captured.BackingFiles.Read)</td><td class="num">@FormatRate(captured.BackingFiles.Write)</td></tr>
+                <tr><th scope="row" title="Captured requests without a file path">Unattributed I/O</th><td class="num">@FormatRate(captured.Unattributed.Read)</td><td class="num">@FormatRate(captured.Unattributed.Write)</td></tr>
+            </tbody>
+            <tfoot><tr><th scope="row">Total</th><td class="num">@FormatRate(captured.Total.Read)</td><td class="num">@FormatRate(captured.Total.Write)</td></tr></tfoot>
+        </table>
     }
     @if (GraphVisible && Plotted.Length > 0)
     {
@@ -71,6 +86,7 @@
     [Parameter] public bool Graph { get; set; }
     [Parameter] public bool Metrics { get; set; } = true;
     [Parameter] public bool Stored { get; set; }
+    [Parameter] public DiskIoBreakdown? Breakdown { get; set; }
     [Parameter] public IReadOnlyList<ResourcePoint> History { get; set; } = [];
 
     private bool HideGraph, HideMetrics;
@@ -88,7 +104,7 @@
         new("Guest CPU", "%", "guest", r => r.Guests),
         new("Hypervisor overhead", "%", "active", r => r.Hypervisor)];
     private Metric[] AvailableMetrics => Disk ? DiskMetrics : Node.Kind is ResourceKind.System or ResourceKind.Host ? CpuMetrics : [CpuMetrics[0]];
-    private bool HasMetrics => Current.Length > 0 || HostIoShare != null;
+    private bool HasMetrics => Current.Length > 0 || HostIoShare != null || Breakdown.HasValue;
     private string? HostIoShare => Disk && Node.Kind is not (ResourceKind.System or ResourceKind.Host) && Node.HostShare is double share
         ? FormatShare(share) : null;
     private static string FormatShare(double share) => share is > 0 and < .0001 ? $"<{.0001:P2}" : $"{share:P2}";
@@ -135,6 +151,7 @@
         if (metric.Read(Node.Reading) is not double value) return "—";
         return Disk && value is > 0 and < .005 ? $"<{.01:0.00}{metric.Unit}" : $"{value:0.##}{metric.Unit}";
     }
+    private static string FormatRate(double value) => value is > 0 and < .005 ? $"<{.01:0.00}" : $"{value:0.##}";
     private double RateMaximum => Math.Max(1, Math.Max(Math.Max(Node.Reading.Read ?? 0, Node.Reading.Write ?? 0),
         History.Select(point => Math.Max(point.Reading.Read ?? 0, point.Reading.Write ?? 0)).DefaultIfEmpty().Max()));
 

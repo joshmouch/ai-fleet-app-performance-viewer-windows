@@ -46,6 +46,9 @@ Check(ResourceTree.Build(true, [measured], (_, _) => true, true).Reading.Write =
 var processor = ResourceTree.Build(false, [measured], (_, _) => true, false).Children.Single().Children.Single();
 Check(processor.Reading.Active == 42 && processor.HostShare == 42.0 / (100 * measured.Cpu.LogicalProcessors),
     "a logical processor shows its own busy percentage and colors by its contribution to host capacity");
+var cpuWithoutProcessors = ResourceTree.Build(false, [measured], (_, _) => true, false, showLogicalProcessors: false);
+Check(cpuWithoutProcessors.Reading.Active == 31 && !ResourceTree.Walk(cpuWithoutProcessors).Any(node => node.Kind == ResourceKind.Processor),
+    "hiding logical processors keeps the host summary and omits processor cards");
 var smallerHost = measured with { Host = "fixture-small", Cpu = measured.Cpu with { LogicalProcessors = 2 },
     Resources = measured.Resources with { Cpu = measured.Resources.Cpu with { Busy = 81 } } };
 Check(ResourceTree.Build(false, [measured, smallerHost], (_, _) => true, false).Reading.Active == 41,
@@ -100,11 +103,19 @@ var layeredDisk = GuestProjection.DiskRows(layered, _ => true);
 Check(layeredDisk.Any(r => r.Key.Path == "/repo/a") && DiskIoMerge.Sum(layeredDisk.Select(r => r.Totals)).Equals(window.DiskPaths.Totals()), "guest path replay conserves four totals");
 Check(GuestProjection.DiskRows(layered, _ => false).Single(r => r.Key == backing).Totals.Equals(raw[backing]), "toggle restores backing file");
 
-var otherBacking = new FileIoKey(4, "System", @"E:\vm\buildkit.vhdx");
+var otherBacking = new FileIoKey(4, "System", @"E:\vm\buildkit.AVHDX");
 var otherHost = new FileIoTotals { ReadBytes = 661, WriteBytes = 997, Reads = 2, Writes = 11 };
+var nativePath = new FileIoKey(9, "host-process", @"E:\cache\state");
+var nativeHost = new FileIoTotals { ReadBytes = 201, WriteBytes = 511, Reads = 6, Writes = 8 };
 var twoDisks = layered with
 {
-    DiskPaths = layered.DiskPaths with { Files = [..layered.DiskPaths.Files, new(otherBacking, otherHost)] },
+    DiskPaths = layered.DiskPaths with
+    {
+        Disk = null,
+        Files = [..layered.DiskPaths.Files, new(otherBacking, otherHost), new(nativePath, nativeHost)],
+        CapturedBytes = layered.DiskPaths.CapturedBytes + otherHost.TotalBytes + nativeHost.TotalBytes,
+        NamedBytes = layered.DiskPaths.NamedBytes + otherHost.TotalBytes + nativeHost.TotalBytes
+    },
     Guests = layered.Guests with
     {
         Disks =
@@ -118,7 +129,7 @@ var twoDisks = layered with
     Resources = measured.Resources with
     {
         Disks = [..measured.Resources.Disks, new(3, "Second volume", "Volume", [@"E:\"], false, 5, 11, 55)],
-        Files = [..measured.Resources.Files, new(3, otherBacking, otherHost)],
+        Files = [..measured.Resources.Files, new(3, otherBacking, otherHost), new(3, nativePath, nativeHost)],
         VirtualDisks = [ new(2, backing.Path, "WSL / distro", "WSL"), new(3, otherBacking.Path, "WSL / distro", "WSL") ]
     }
 };
@@ -131,6 +142,7 @@ Check(storageLayout.Reading == workloadLayout.Reading && storageLayout.Reading =
     "disk layout changes tree shape without changing the system measurements");
 var workload = workloadLayout.Children.Single(node => node.Kind == ResourceKind.VirtualMachine);
 var windowsWorkload = workloadLayout.Children.Single(node => node.Kind == ResourceKind.WindowsIo);
+var unattributedWorkload = workloadLayout.Children.Single(node => node.Kind == ResourceKind.UnattributedIo);
 Check(workload.Children.Length == 2 && workload.Type == "WSL distribution" &&
     workload.Children.Select(node => node.Id).ToHashSet().SetEquals(flatLayout.Children.Select(node => node.Id)),
     "two volumes backing one workload share one parent while keeping their VHDX identities");
@@ -140,9 +152,11 @@ var vhdxShare = (double)raw[backing].TotalBytes / captureBytes;
 var storedVhdx = ResourceTree.Walk(storageLayout).Single(node => node.Id == narrowed.Id);
 var flatVhdx = flatLayout.Children.Single(node => node.Id == narrowed.Id);
 Check(narrowed.HostShare == vhdxShare && storedVhdx.HostShare == vhdxShare && flatVhdx.HostShare == vhdxShare &&
-    narrowed.Children.Single().HostShare == vhdxShare && windowsWorkload.HostShare == (double)raw[unknown].TotalBytes / captureBytes,
+    narrowed.Children.Single().HostShare == vhdxShare &&
+    Math.Abs(windowsWorkload.HostShare.GetValueOrDefault() - (double)nativeHost.TotalBytes / captureBytes) < 1e-12,
     "card heat uses one host byte denominator across all groupings and uses backing I/O for guest devices");
-Check(Math.Abs(workload.HostShare.GetValueOrDefault() + windowsWorkload.HostShare.GetValueOrDefault() - 1) < 1e-12,
+Check(Math.Abs(workload.HostShare.GetValueOrDefault() + windowsWorkload.HostShare.GetValueOrDefault() +
+    unattributedWorkload.HostShare.GetValueOrDefault() - 1) < 1e-12,
     "workload heat includes the whole host budget, including unresolved Windows traffic");
 var sharedBacking = twoDisks with { Guests = twoDisks.Guests with
     { Disks = [..twoDisks.Guests.Disks, new("guest-two", "guest-two", "/dev/sdc", [backing.Path], 4, [], false, null)] } };
@@ -162,11 +176,25 @@ var workloadRows = ResourceDiskScope.Rows(twoDisks, workload, _ => true, false);
 Check(workloadRows.Any(row => row.Key.Path == "/cache/layers") &&
     DiskIoMerge.Sum(workloadRows.Select(row => row.Totals)).Equals(DiskIoMerge.Sum([raw[backing], otherHost])),
     "workload includes both backing volumes but excludes native Windows activity");
-Check(ResourceDiskScope.Rows(twoDisks, windowsWorkload, _ => true, false).Single().Totals.Equals(raw[unknown]) &&
+Check(ResourceDiskScope.Rows(twoDisks, windowsWorkload, _ => true, false).Single().Totals.Equals(nativeHost) &&
+    ResourceDiskScope.Rows(twoDisks, unattributedWorkload, _ => true, false).Single().Totals.Equals(raw[unknown]) &&
     ResourceDiskScope.Rows(twoDisks, narrowed, _ => false, false).Single().Totals.Equals(raw[backing]),
-    "native workload keeps unresolved host IO and disabling expansion restores the full backing file budget");
+    "native and unattributed workloads are separate and disabling expansion restores the full backing file budget");
 Check(ResourceDiskScope.DeviceWindows(twoDisks, narrowed.Children.Single()).Single().Device == "/dev/sda",
     "guest device details match the selected device and backing path");
+var captured = ResourceDiskScope.Breakdown(twoDisks, null, false)!.Value;
+var captureRate = DiskGuestRate.From(twoDisks.DiskPaths.Totals(), twoDisks.DiskPaths.Seconds);
+Check(captured.WindowsFiles == DiskGuestRate.From(nativeHost, twoDisks.DiskPaths.Seconds) &&
+    captured.BackingFiles == DiskGuestRate.From(DiskIoMerge.Sum([raw[backing], otherHost]), twoDisks.DiskPaths.Seconds) &&
+    captured.Unattributed == DiskGuestRate.From(raw[unknown], twoDisks.DiskPaths.Seconds) &&
+    Math.Abs(captured.Total.Read - captureRate.Read) < 1e-12 && Math.Abs(captured.Total.Write - captureRate.Write) < 1e-12 &&
+    captured.Total.Reads == captureRate.Reads && captured.Total.Writes == captureRate.Writes,
+    "workload breakdown reconciles all four host trace totals without counting guest samples");
+var volumeCapture = ResourceDiskScope.Breakdown(twoDisks, 2, false)!.Value;
+Check(volumeCapture.WindowsFiles == default && volumeCapture.BackingFiles == DiskGuestRate.From(raw[backing], twoDisks.DiskPaths.Seconds),
+    "scoping the breakdown to a volume excludes I/O from the other volume");
+Check(ResourceDiskScope.Breakdown(twoDisks with { DiskPaths = twoDisks.DiskPaths with { Seconds = 0 } }, null, false) == null,
+    "an unmeasured trace window has no breakdown");
 
 try
 {

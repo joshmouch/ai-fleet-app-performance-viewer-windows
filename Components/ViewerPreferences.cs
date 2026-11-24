@@ -4,6 +4,7 @@ public sealed class ViewerPreferences
 {
     public bool ShowCpu { get; set; } = true;
     public bool ShowDisk { get; set; }
+    public bool ShowLogicalProcessors { get; set; }
     public DiskGrouping Grouping { get; set; } = DiskGrouping.Storage;
     public string Host { get; set; } = "";
     public bool Guests { get; set; } = true;

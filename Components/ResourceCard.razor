@@ -25,6 +25,7 @@
             @if (Overview || GraphOpen || MetricsVisible && (!Disk || Node.HostShare > 0 || DiskActivity.HasActivity(ChartNode.Reading)))
             {
                 <ResourceChart Node="ChartNode" Disk="Disk" Controls="Overview" Graph="GraphOpen" Metrics="MetricsVisible" Stored="Stored"
+                    Breakdown="Breakdown"
                     History="@(Overview || GraphOpen ? ReadHistory(Node.Id) : [])" />
             }
         </div>
@@ -85,6 +86,7 @@
     [Parameter] public bool Disk { get; set; }
     [Parameter] public bool Overview { get; set; }
     [Parameter] public bool Stored { get; set; }
+    [Parameter] public DiskIoBreakdown? Breakdown { get; set; }
     [Parameter] public bool PaneOpen { get; set; }
     [Parameter] public string? EmptyCards { get; set; }
     [Parameter] public EventCallback OpenPane { get; set; }
