@@ -5,7 +5,7 @@
     <div class="resource-details-tabs">
         @if (Close.HasDelegate) { <h3 class="resource-detail-heading">@Node.Name details</h3> }
         <button type="button" aria-pressed="@(!Paths ? "true" : "false")" @onclick="() => Show(false)">Processes</button>
-        <button type="button" aria-pressed="@(Paths ? "true" : "false")" @onclick="() => Show(true)">@(Disk ? "Paths" : "Commands")</button>
+        @if (Disk) { <button type="button" aria-pressed="@(Paths ? "true" : "false")" @onclick="() => Show(true)">Paths</button> }
         @if (Data.Summary is string summary)
         {
             <span class="resource-details-summary" title="Totals for all matching rows in this scope">@summary</span>
@@ -22,28 +22,45 @@
     }
     @if (Data.Rows.Length > 0)
     {
+        var labels = Data.LabelColumns;
         <div class="scroll">
             <table>
-                <thead><tr>@foreach (string column in Data.Columns) { <th scope="col">@column</th> }</tr></thead>
+                <thead><tr>
+                    @foreach (string column in labels) { <th scope="col">@column</th> }
+                    @foreach (var metric in Data.Metrics)
+                    {
+                        bool sorted = Data.SortedBy == metric.Key;
+                        <th scope="col" class="num" aria-sort="@(sorted ? "descending" : null)" title="@metric.Hint">
+                            @if (metric.Sortable)
+                            {
+                                <button type="button" class="detail-sort" @onclick="() => SortChanged.InvokeAsync(metric.Key)">
+                                    @metric.Label @if (sorted) { <span aria-hidden="true">▼</span> }
+                                </button>
+                            }
+                            else { @metric.Label }
+                        </th>
+                    }
+                </tr></thead>
                 <tbody>
                 @foreach (var group in Bands)
                 {
                     @if (group.Label != null)
                     {
                         <tr class="resource-band" title="Rows grouped by where their cumulative share starts. Subtotals cover the displayed rows.">
-                            <th colspan="@group.FirstNumber" scope="rowgroup">@group.Label</th>
-                            @for (int column = group.FirstNumber; column < Data.Columns.Length; column++)
-                            { <td class="num">@Subtotal(group.Rows, column)</td> }
+                            <th colspan="@labels.Length" scope="rowgroup">@group.Label</th>
+                            @for (int column = 0; column < Data.Metrics.Length; column++)
+                            { <td class="num">@Data.Metrics[column].Display(Subtotal(group.Rows, column))</td> }
                         </tr>
                     }
                     @foreach (var row in group.Rows)
                     {
                         <tr>
-                            @for (int column = 0; column < row.Values.Length; column++)
+                            @foreach (var label in row.Labels)
                             {
-                                var value = row.Values[column];
-                                <td class="@(column >= FirstNumber ? "num" : "resource-cell")" title="@value">@value</td>
+                                <td class="resource-cell" title="@label">@label</td>
                             }
+                            @for (int column = 0; column < Data.Metrics.Length; column++)
+                            { <td class="num">@Data.Metrics[column].Display(row.Values[column])</td> }
                         </tr>
                     }
                 }
@@ -60,16 +77,16 @@
     [Parameter] public bool Disk { get; set; }
     [Parameter] public int BandPercent { get; set; }
     [Parameter] public EventCallback Close { get; set; }
+    [Parameter] public EventCallback<string> SortChanged { get; set; }
     private bool Paths;
     private ResourceDetailTable Data = new([], []);
-    private int FirstNumber => Data.Columns.Length - (Disk ? 7 : 2);
     protected override void OnParametersSet() => Data = Read(Node, Paths);
     private void Show(bool paths)
     {
         Paths = paths;
         Data = Read(Node, Paths);
     }
-    private sealed record Band(string? Label, ResourceDetailRow[] Rows, int FirstNumber = 0);
+    private sealed record Band(string? Label, ResourceDetailRow[] Rows);
     private IEnumerable<Band> Bands
     {
         get
@@ -84,14 +101,12 @@
                 return start;
             }
             return data.Rows.GroupBy(Bucket).Select(g =>
-                new Band($"Starts in {g.Key}–{Math.Min(100, g.Key + BandPercent)}%", g.ToArray(), FirstNumber)).ToArray();
+                new Band($"Starts in {g.Key}–{Math.Min(100, g.Key + BandPercent)}%", g.ToArray())).ToArray();
         }
     }
-    private string Subtotal(ResourceDetailRow[] rows, int column)
+    private static double? Subtotal(ResourceDetailRow[] rows, int column)
     {
-        var values = rows.Select(row => row.Numbers[column]).OfType<double>().ToArray();
-        if (values.Length == 0) return "—";
-        var format = Data.Columns[column] is "Reads" or "Writes" or "Total ops" ? "N0" : "N2";
-        return values.Sum().ToString(format) + (Disk ? "" : "%");
+        var values = rows.Select(row => row.Values[column]).OfType<double>().ToArray();
+        return values.Length == 0 ? null : values.Sum();
     }
 }

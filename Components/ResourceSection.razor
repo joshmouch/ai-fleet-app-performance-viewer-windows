@@ -16,6 +16,7 @@
                 VisibleChildren="ReadChildren" ReadHistory="ReadHistory" ReadDetails="ReadDetails"
                 EmptyCards="@EmptyCards" Breakdown="@ReadBreakdown()"
                 BandPercent="@Math.Clamp(Preferences.Band ?? 0, 0, 100)" Selection="Select" Scope="ChangeScope"
+                SortChanged="ChangeSort"
                 PaneOpen="@(!closedPanes.Contains(scope.Id))" OpenPane="OpenPane" ClosePane="ClosePane">
                 <Breadcrumb>
                     @if (Combined) { <span class="resource-section-label">@(Disk ? "Disk" : "CPU")</span> }
@@ -40,8 +41,15 @@
     [Parameter] public bool Combined { get; set; }
     [Parameter] public string Filter { get; set; } = "";
     [Parameter] public HistorySelection Archive { get; set; } = new(false, null);
+    [Parameter] public EventCallback SavePreferences { get; set; }
 
     private string Sort => Disk ? Preferences.DiskSort : Preferences.CpuSort;
+    private Task ChangeSort(string sort)
+    {
+        if (Disk) Preferences.DiskSort = sort;
+        else Preferences.CpuSort = sort;
+        return SavePreferences.InvokeAsync();
+    }
     private string? selected;
     private string scopeId = "system";
     private DiskGrouping previousGrouping;
@@ -202,34 +210,24 @@
     private IReadOnlyList<ResourcePoint> ReadHistory(string id) => Archive.Active ? [] : points.GetValueOrDefault(id) ?? [];
     private bool Matches(string? text) => Filter.Length == 0 || text?.Contains(Filter, StringComparison.OrdinalIgnoreCase) == true;
 
-    private ResourceDetailTable ReadDetails(ResourceNode node, bool paths) => Disk ? ReadDisk(node, paths) : ReadCpu(node, paths);
+    private ResourceDetailTable ReadDetails(ResourceNode node, bool paths) => Disk ? ReadDisk(node, paths) : ReadCpu(node);
     private IEnumerable<PerformanceWindow> FramesFor(ResourceNode node) => Frames.Where(frame =>
         node.Host == null || string.Equals(frame.Host, node.Host, StringComparison.OrdinalIgnoreCase));
     private static string Format(double? value) => value?.ToString("N2", CultureInfo.CurrentCulture) ?? "—";
     private static string Count(long? value) => value?.ToString("N0", CultureInfo.CurrentCulture) ?? "—";
-    private static string Percent(double? value) => value.HasValue ? Format(value) + "%" : "—";
 
-    private ResourceDetailTable ReadCpu(ResourceNode node, bool paths)
+    private ResourceDetailTable ReadCpu(ResourceNode node)
     {
-        string[] columns = ["Process", "PID", "Environment", .. paths ? new[] { "Command" } : [],
-            "CPU impact", "Guest CPU share"];
+        var metrics = ResourceDetailTable.CpuMetrics;
         if (node.Kind == ResourceKind.Processor)
-            return new(columns, [], Note: "Process CPU is measured across the host. Per-processor attribution is unavailable.");
+            return new(metrics, [], Note: "Process CPU is measured across the host. Per-processor attribution is unavailable.");
         var rows = FramesFor(node).SelectMany(w => GuestProjection.CpuRows(w, target => Preferences.IncludesGuest(w.Host, target))
             .Where(row => node.Machine != null ? row.Machine == node.Machine :
                 !node.Id.EndsWith("/guests", StringComparison.Ordinal) || row.Machine != w.Host))
-            .Select(row =>
-            {
-                double? guest = 100 * row.Row.GuestCpuShare;
-                return (Eligible: Matches(row.Row.Process) || Matches(row.Machine), Row: new ResourceDetailRow(
-                    [row.Row.Process, row.Row.Pid.ToString(CultureInfo.CurrentCulture), row.Machine,
-                    .. paths ? new[] { "—" } : [], Percent(row.HostPercent), Percent(guest)],
-                    (Sort == "guest" ? guest : row.HostPercent).GetValueOrDefault(),
-                    [..new double?[paths ? 4 : 3], row.HostPercent, guest]));
-            }).ToArray();
-        return new(columns, rows.Where(x => x.Eligible).Select(x => x.Row).OrderByDescending(r => r.Weight)
-            .Take(Math.Clamp(Preferences.MaxRows, 1, 100)).ToArray(), rows.Sum(x => x.Row.Weight),
-            paths ? "Command lines are unavailable in these samples." : null);
+            .Select(row => (Eligible: Matches(row.Row.Process) || Matches(row.Machine), Row: new ResourceDetailRow(
+                ResourceDetailTable.Identity(row.Row.Process, row.Row.Pid, row.Machine),
+                [row.HostPercent, 100 * row.Row.GuestCpuShare])));
+        return ResourceDetailTable.Rank(metrics, rows, Sort, Preferences.MaxRows);
     }
 
     private DiskIoBreakdown? ReadBreakdown()
@@ -251,8 +249,8 @@
 
     private ResourceDetailTable ReadDisk(ResourceNode node, bool paths)
     {
-        string[] columns = ["Process", "PID", "Environment", .. paths ? new[] { "File", "Folder" } : [],
-            "Read MiB/s", "Write MiB/s", "Total MiB/s", "Reads", "Writes", "Total ops", "Guest MiB/s"];
+        bool guestOnly = node.Kind == ResourceKind.GuestDevice || Archive.Active && Archive.Window?.Layer == "guest-logical";
+        var metrics = ResourceDetailTable.DiskMetrics(guestOnly);
         DiskGuestRate? hostSum = null, guestSum = null;
         var rows = DiskRows(node, paths).Select(row =>
         {
@@ -260,15 +258,9 @@
             bool eligible = Matches(key.Process) || Matches(key.Path) || Matches(machine);
             if (eligible && physical is { } hostRate) hostSum = hostSum.GetValueOrDefault() + hostRate;
             if (eligible && guest is { } guestRate) guestSum = guestSum.GetValueOrDefault() + guestRate;
-            long? operations = physical?.Reads + physical?.Writes;
-            var values = new ResourceDetailRow([key.Process, key.Pid.ToString(CultureInfo.CurrentCulture), machine,
-                .. paths ? new[] { key.Path.Length == 0 ? "Unresolved file path" : key.Filename, key.Filepath } : [],
-                Format(physical?.Read), Format(physical?.Write), Format(physical?.Total), Count(physical?.Reads),
-                Count(physical?.Writes), Count(operations), Format(guest?.Total)], (Sort switch
-                { "guest" => guest?.Total, "read" => physical?.Read ?? guest?.Read, "write" => physical?.Write ?? guest?.Write,
-                    _ => physical?.Total ?? guest?.Total }).GetValueOrDefault(),
-                [..new double?[paths ? 5 : 3], physical?.Read, physical?.Write, physical?.Total,
-                    physical?.Reads, physical?.Writes, operations, guest?.Total]);
+            var io = guestOnly ? guest : physical;
+            var values = new ResourceDetailRow(ResourceDetailTable.Identity(key.Process, key.Pid, machine, paths ? key : null),
+                [physical?.Total, guest?.Total, io?.Read, io?.Write, io?.Reads, io?.Writes, io?.Reads + io?.Writes]);
             return (Eligible: eligible, Row: values);
         }).ToArray();
         string? summary = hostSum is { } host ? DiskSummary("Host", host) : null;
@@ -277,9 +269,9 @@
                 : $"{summary} · Guest files {Format(guestTotals.Total)} MiB/s";
         var note = Archive.Active ? null : string.Join(" · ", FramesFor(node)
             .Select(frame => frame.DiskPaths.Status).OfType<string>().Where(status => !string.IsNullOrWhiteSpace(status)).Distinct());
-        return new(columns, rows.Where(x => x.Eligible).Select(x => x.Row).OrderByDescending(row => row.Weight)
-            .Take(Math.Clamp(Preferences.MaxRows, 1, 100)).ToArray(), rows.Sum(x => x.Row.Weight),
-            Note: string.IsNullOrEmpty(note) ? null : note, Summary: summary);
+        return ResourceDetailTable.Rank(metrics, rows, guestOnly && Sort == "impact" ? "guest" : Sort, Preferences.MaxRows,
+            string.IsNullOrEmpty(note) ? null : note,
+            summary, paths, fallback: "guest");
     }
 
     private static string DiskSummary(string basis, DiskGuestRate rate) =>

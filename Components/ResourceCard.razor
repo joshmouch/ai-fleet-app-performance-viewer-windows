@@ -45,7 +45,7 @@
     </div>
     @if (DetailsOpen)
     {
-        <ResourceDetails Node="Node" Read="ReadDetails" Disk="Disk" BandPercent="BandPercent" />
+        <ResourceDetails Node="Node" Read="ReadDetails" Disk="Disk" BandPercent="BandPercent" SortChanged="SortChanged" />
     }
     @if (Children.Length > 0)
     {
@@ -54,7 +54,7 @@
             {
                 <ResourceCard @key="child.Node.Id" Node="child.Node" Disk="Disk" SelectedId="@SelectedId" VisibleChildren="VisibleChildren"
                     ReadHistory="ReadHistory" ReadDetails="ReadDetails" BandPercent="BandPercent" Selection="Selection" Scope="Scope"
-                    CardReading="child.Reading" />
+                    CardReading="child.Reading" SortChanged="SortChanged" />
             }
         </div>
     }
@@ -70,7 +70,8 @@
                 <button type="button" class="resource-splitter" data-resource-splitter
                     aria-label="Resize the details pane with the pointer or arrow keys"></button>
             }
-            <ResourceDetails Node="Node" Read="ReadDetails" Disk="Disk" BandPercent="BandPercent" Close="ClosePane" />
+            <ResourceDetails Node="Node" Read="ReadDetails" Disk="Disk" BandPercent="BandPercent" Close="ClosePane"
+                SortChanged="SortChanged" />
         </div>
     }
 </article>
@@ -93,6 +94,7 @@
     [Parameter] public EventCallback ClosePane { get; set; }
     [Parameter] public RenderFragment? Breadcrumb { get; set; }
     [Parameter] public int BandPercent { get; set; }
+    [Parameter] public EventCallback<string> SortChanged { get; set; }
     [Parameter] public ResourceReading? CardReading { get; set; }
     private ResourceCardEntry[] Children = [];
     private bool graph, details, metrics = true;

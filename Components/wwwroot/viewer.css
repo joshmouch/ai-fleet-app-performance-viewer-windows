@@ -147,6 +147,9 @@ p { margin: .75rem 0; }
 .resource-details-summary { margin: .15rem 0 .15rem auto; font-size: .85em; font-variant-numeric: tabular-nums; }
 .resource-details .close-details { position: absolute; inset: 0 0 auto auto; }
 .resource-details th, .resource-details td { padding: .14rem .3rem; }
+.resource-details .detail-sort { border: 0; padding: 0; background: transparent; font: inherit; color: inherit; cursor: pointer; }
+.resource-details .detail-sort:hover { text-decoration: underline; }
+.resource-details .detail-sort span { font-size: .7em; }
 .resource-details table { min-width: max-content; }
 .resource-details .resource-cell { max-width: 20rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .resource-details .resource-band td { font-weight: 600; background: color-mix(in srgb, CanvasText 7%, Canvas); }

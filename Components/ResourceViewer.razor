@@ -60,19 +60,12 @@
                     {
                         <label><input type="checkbox" @bind="preferences.ShowLogicalProcessors" @bind:after="Save" /> Logical processors</label>
                         <label>Min CPU % <input type="number" min="0" max="100" @bind="preferences.MinCpuActivity" @bind:after="Save" /></label>
-                        <label>CPU sort <select @bind="preferences.CpuSort" @bind:after="Save">
-                            <option value="impact">CPU impact</option><option value="guest">Guest CPU share</option>
-                        </select></label>
                     }
                     @if (preferences.ShowDisk)
                     {
                         <label>Min avg active % <input type="number" min="0" max="100" @bind="preferences.MinDiskActivity" @bind:after="Save" /></label>
                         <label>Min avg I/O MiB/s <input type="number" min="0" step="0.1" @bind="preferences.MinRate" @bind:after="Save" /></label>
                         <label>All disks <input type="checkbox" @bind="preferences.AllDisks" @bind:after="Save" /></label>
-                        <label>Disk sort <select @bind="preferences.DiskSort" @bind:after="Save">
-                            <option value="impact">Host total</option><option value="read">Read</option>
-                            <option value="write">Write</option><option value="guest">Guest total</option>
-                        </select></label>
                     }
                     <label>Max cards per level <input type="number" min="1" max="100" @bind="preferences.MaxCards" @bind:after="Save" /></label>
                     <label>Top rows <input type="number" min="1" max="100" @bind="preferences.MaxRows" @bind:after="Save" /></label>
@@ -99,9 +92,10 @@
             <MeasurementNotice Title="Turn on CPU or Disk to view activity" />
         }
         <div class="viewer-sections @(Combined ? "viewer-combined" : "")">
-            <ResourceSection Sources="Sources" Preferences="preferences" Visible="preferences.ShowCpu" Combined="Combined" Filter="@filter" />
+            <ResourceSection Sources="Sources" Preferences="preferences" Visible="preferences.ShowCpu" Combined="Combined" Filter="@filter"
+                SavePreferences="Save" />
             <ResourceSection Sources="Sources" Preferences="preferences" Visible="preferences.ShowDisk" Combined="Combined" Filter="@filter"
-                Disk="true" Archive="archive" />
+                Disk="true" Archive="archive" SavePreferences="Save" />
         </div>
     }
 </main>
