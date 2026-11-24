@@ -1,19 +1,21 @@
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory)][ValidateSet('Package', 'Source')][string]$Mode,
+    [Parameter(Mandatory)][ValidateSet('Package', 'Source', 'Both')][string]$Mode,
     [Parameter(Mandatory)][string]$Package,
     [string]$SourceCheckout
 )
 
 $ErrorActionPreference = 'Stop'
 $packageFile = (Get-Item -LiteralPath $Package).FullName
-if ($Mode -eq 'Source') {
+if ($Mode -eq 'Both' -and !$SourceCheckout) { $SourceCheckout = Split-Path -Parent $PSScriptRoot }
+if ($Mode -ne 'Package') {
     if (!$SourceCheckout) { throw 'Source mode needs the viewer checkout.' }
     $SourceCheckout = (Resolve-Path -LiteralPath $SourceCheckout).Path
     if (!(Test-Path -LiteralPath (Join-Path $SourceCheckout 'Web/PerformanceViewer.Web.csproj') -PathType Leaf)) {
         throw "The web project was not found in $SourceCheckout."
     }
 }
+$modes = if ($Mode -eq 'Both') { 'Package', 'Source' } else { $Mode }
 
 $identity = (Get-FileHash -LiteralPath $packageFile -Algorithm SHA256).Hash.ToLowerInvariant()
 $installRoot = (New-Item -Path (Join-Path $env:LOCALAPPDATA 'Programs/AIFleetPerformanceViewerShell') -ItemType Directory -Force).FullName
@@ -65,41 +67,56 @@ try {
     }
 
     $shellPath = [IO.File]::ReadAllText((Join-Path $release 'ShellPath.txt'))
-    $content = if ($Mode -eq 'Source') { $SourceCheckout } else { $release }
-    $record = @{Shell = $shellPath; Content = $content} | ConvertTo-Json -Compress
-    $modeSettings = Join-Path $installRoot "$Mode.json"
-    $pendingSettings = Join-Path $installRoot ('.settings-' + [Guid]::NewGuid().ToString('N'))
-    [IO.File]::WriteAllText($pendingSettings, $record)
-    [IO.File]::Move($pendingSettings, $modeSettings, $true)
-
     $programs = [Environment]::GetFolderPath('Programs')
-    $linkName = "Performance Viewer ($Mode).lnk"
-    $link = Join-Path $programs $linkName
+    $taskbar = Join-Path $env:APPDATA 'Microsoft/Internet Explorer/Quick Launch/User Pinned/TaskBar'
     $desktop = New-Object -ComObject WScript.Shell
     $identityType = 'PerformanceViewer.Native.ViewerWindowsIdentity' -as [type]
     if (!$identityType) {
         Add-Type -Path (Join-Path $PSScriptRoot 'Platforms/Windows/ViewerWindowsIdentity.cs')
     }
-    function Set-ViewerShortcut([string]$Path, [bool]$VerifyOwner = $false) {
+    function Set-ViewerShortcut([string]$Path, [string]$InstallMode, [bool]$VerifyOwner = $false) {
         $shortcut = $desktop.CreateShortcut($Path)
-        $oldModeRoot = Join-Path $installRoot $Mode
+        $oldModeRoot = Join-Path $installRoot $InstallMode
         if ($VerifyOwner -and $shortcut.TargetPath -ne $launcher -and
             !$shortcut.TargetPath.StartsWith(($oldModeRoot + '\'), [StringComparison]::OrdinalIgnoreCase)) {
             throw "The existing pin $Path belongs to another installation."
         }
-        if ($shortcut.TargetPath -eq $launcher -and $shortcut.Arguments -eq $Mode -and
+        if ($shortcut.TargetPath -eq $launcher -and $shortcut.Arguments -eq $InstallMode -and
             $shortcut.WorkingDirectory -eq $installRoot) { return }
         $shortcut.TargetPath = $launcher
         $shortcut.WorkingDirectory = $installRoot
-        $shortcut.Arguments = $Mode
+        $shortcut.Arguments = $InstallMode
         $shortcut.IconLocation = $shortcut.TargetPath + ',0'
-        $shortcut.Description = "AI Fleet Cluster Performance Viewer ($Mode)"
+        $shortcut.Description = "AI Fleet Cluster Performance Viewer ($InstallMode)"
         $shortcut.Save()
-        [PerformanceViewer.Native.ViewerWindowsIdentity]::IdentifyShortcut($Path, $Mode -eq 'Source')
+        [PerformanceViewer.Native.ViewerWindowsIdentity]::IdentifyShortcut($Path, $InstallMode -eq 'Source')
     }
-    Set-ViewerShortcut $link
-    $pinned = Join-Path $env:APPDATA "Microsoft/Internet Explorer/Quick Launch/User Pinned/TaskBar/$linkName"
-    if (Test-Path -LiteralPath $pinned -PathType Leaf) { Set-ViewerShortcut $pinned $true }
-    Get-Item -LiteralPath $link
+    $shortcuts = foreach ($installMode in $modes) {
+        $content = if ($installMode -eq 'Source') { $SourceCheckout } else { $release }
+        $record = @{Shell = $shellPath; Content = $content} | ConvertTo-Json -Compress
+        $modeSettings = Join-Path $installRoot "$installMode.json"
+        $pendingSettings = Join-Path $installRoot ('.settings-' + [Guid]::NewGuid().ToString('N'))
+        [IO.File]::WriteAllText($pendingSettings, $record)
+        [IO.File]::Move($pendingSettings, $modeSettings, $true)
+
+        $linkName = "Performance Viewer ($installMode).lnk"
+        $link = Join-Path $programs $linkName
+        Set-ViewerShortcut $link $installMode
+        [pscustomobject]@{ Mode = $installMode; StartMenu = $link; Taskbar = (Join-Path $taskbar $linkName) }
+    }
+    foreach ($shortcut in $shortcuts) {
+        if ($Mode -eq 'Both' -and !(Test-Path -LiteralPath $shortcut.Taskbar -PathType Leaf)) {
+            $pinScript = Join-Path $PSScriptRoot 'Pin-ViewerTaskbar.ps1'
+            $windowsPowerShell = Join-Path $env:SystemRoot 'System32/WindowsPowerShell/v1.0/powershell.exe'
+            & $windowsPowerShell -NoLogo -NoProfile -NonInteractive -STA -File $pinScript -Shortcut $shortcut.StartMenu -Pin $shortcut.Taskbar
+            if ($LASTEXITCODE -ne 0 -or !(Test-Path -LiteralPath $shortcut.Taskbar -PathType Leaf)) {
+                throw "Both modes are installed. Windows could not pin $($shortcut.Mode) to the taskbar."
+            }
+        }
+        if (Test-Path -LiteralPath $shortcut.Taskbar -PathType Leaf) {
+            Set-ViewerShortcut $shortcut.Taskbar $shortcut.Mode $true
+        }
+        Get-Item -LiteralPath $shortcut.StartMenu
+    }
 }
 finally { $installationLock.Dispose() }

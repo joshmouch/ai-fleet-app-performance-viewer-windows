@@ -70,7 +70,15 @@ The local command can be an absolute path to the published executable. The remot
 
 `Native/PerformanceViewer.Native.csproj` opens the local Razor UI in a .NET MAUI WebView. The web host owns sampling. Package mode runs the web host and collector from the installed release. Source mode watches the checkout and builds the web host and collector into the viewer's local app-data runtime directory on Windows. The runtime directory gives the binaries the same Windows integrity level as other viewer components. Source edits rebuild the host and reload the page in the existing desktop window. Both modes use loopback port 5217 by default, so one mode can own the local live collectors at a time.
 
-The Windows bundle scripts live in `Native/`. `Build-ViewerPackage.ps1` builds a versioned ZIP. The shell and launcher declare their own versions in their project files. `Install-Viewer.ps1` creates either a **Performance Viewer (Package)** or **Performance Viewer (Source)** Start menu shortcut. Source mode also takes the checkout path. Both taskbar pins keep the same launcher path across updates. Each mode has an installation record that selects its shell and release or checkout. The launcher updates the shell selection at install time, and the shell checks the web host's startup protocol. The Windows collector needs elevation to trace file I/O.
+The Windows bundle scripts live in `Native/`. `Build-ViewerPackage.ps1` builds a versioned ZIP. From the viewer checkout, use PowerShell 7 on the signed-in Windows desktop to install or update both modes and pin them to the taskbar.
+
+```powershell
+./Native/Install-Viewer.ps1 -Mode Both -Package 'C:\Downloads\PerformanceViewer-win-x64.zip'
+```
+
+**Performance Viewer (Source)** runs from the checkout containing the installer. Use `-SourceCheckout` to point it at a different checkout. **Performance Viewer (Package)** runs from the ZIP. To update both, rerun the same command with the new ZIP. Existing pins keep their position and launcher path. The first pin for each mode uses the Windows 11 taskbar in the signed-in session. The `Package` and `Source` modes remain available for separate installs.
+
+The shell and launcher declare their own versions in their project files. Each mode has an installation record that selects its shell and release or checkout. The launcher updates the shell selection at install time, and the shell checks the web host's startup protocol. The Windows collector needs elevation to trace file I/O.
 
 - **CPU** and **Disk** share a bottom details pane, a search field, guest selection, and ranking options. Details start open and all discovered guests start checked. Search filters the sampled rows before ranking them.
 - Double-click a card or use **Scope to this**. System, host, VM and WSL scopes follow across CPU and Disk. A VM scope includes its backing files across storage volumes. Disk, VHDX, guest device and logical processor drill-downs stay in their own pane.
