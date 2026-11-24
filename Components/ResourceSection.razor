@@ -44,6 +44,8 @@
     [Parameter] public string Filter { get; set; } = "";
     [Parameter] public HistorySelection Archive { get; set; } = new(false, null);
     [Parameter] public EventCallback SavePreferences { get; set; }
+    [Parameter, EditorRequired] public ResourceScope SharedScope { get; set; } = default!;
+    [Parameter] public EventCallback<ResourceScope> SharedScopeChanged { get; set; }
 
     private string Sort => Disk ? Preferences.DiskSort : Preferences.CpuSort;
     private Task ChangeSort(string sort)
@@ -55,7 +57,8 @@
     private string? selected;
     private ElementReference section;
     private string? scopeFocus;
-    private string scopeId = "system";
+    private string? localScopeId;
+    private ResourceScope? appliedScope;
     private DiskGrouping previousGrouping;
     private string previousHost = "";
     private bool previousAllDisks;
@@ -66,17 +69,42 @@
     private readonly Dictionary<string, DiskProjection> diskProjections = new(StringComparer.Ordinal);
     private DiskProjectionInput? projectionInput;
     private ResourceNode root = ResourceTree.Build(false, [], (_, _) => false, false);
+    private ResourceNode sharedRoot = default!;
     private ResourceNode scope = default!;
     private ViewNotice? Notice;
     private sealed record ViewNotice(string Title, string? Detail = null, bool Loading = false);
     private Dictionary<string, ResourceNode> nodes = new(StringComparer.Ordinal);
-    private ResourceNode[] Ancestors => PathTo(root, scope.Id).SkipLast(1).ToArray();
+    private IEnumerable<ResourceNode> Ancestors
+    {
+        get
+        {
+            if (sharedRoot.Id != root.Id)
+            {
+                var sharedParents = PathTo(root, sharedRoot.Id).SkipLast(1)
+                    .Where(node => ResourceTree.SharedScope(node) != null).ToArray();
+                if (sharedParents.Length > 0)
+                {
+                    foreach (var parent in sharedParents) yield return parent;
+                }
+                else
+                {
+                    yield return root;
+                    if (SharedScope.Target != null && root.Children.FirstOrDefault(node => node.Kind == ResourceKind.Host &&
+                        string.Equals(node.Host, SharedScope.Host, StringComparison.OrdinalIgnoreCase)) is { } host)
+                        yield return host;
+                }
+            }
+            foreach (var parent in PathTo(sharedRoot, scope.Id).SkipLast(1)) yield return parent;
+        }
+    }
     private string? EmptyCards
     {
         get
         {
             if (Archive.Active) return null;
             if (Filter.Length > 0) return "No cards match the current search and activity filters.";
+            if (scope.Id == sharedRoot.Id && SharedScope.Target != null && scope.Reading == default && scope.Children.Length == 0)
+                return Disk ? "No disk measurements for this guest yet." : "No CPU measurements for this guest yet.";
             if (!Disk || scope.Kind is not (ResourceKind.System or ResourceKind.Host)) return null;
             if (scope.Children.Length > 0) return "No cards match the current activity filters.";
             return Preferences.Grouping == DiskGrouping.Vhdx ? "No VHDX measurements yet." : "No per-disk measurements available.";
@@ -90,13 +118,15 @@
         if (!Visible) return;
         bool populationChanged = previousHost != Preferences.Host || Disk && previousAllDisks != Preferences.AllDisks;
         if (populationChanged) points.Clear();
-        if (populationChanged || Disk && (previousGrouping != Preferences.Grouping || wasArchived != Archive.Active))
+        if (populationChanged || Disk && (previousGrouping != Preferences.Grouping || wasArchived != Archive.Active) ||
+            !ReferenceEquals(appliedScope, SharedScope))
         {
             previousHost = Preferences.Host;
             previousAllDisks = Preferences.AllDisks;
             previousGrouping = Preferences.Grouping;
             wasArchived = Archive.Active;
-            scopeId = "system";
+            appliedScope = SharedScope;
+            localScopeId = null;
             selected = null;
         }
         Refresh();
@@ -115,10 +145,11 @@
                 Reading = stored == null ? default : ResourceTree.Rate(total, stored.DurationSeconds()) };
         }
         nodes = ResourceTree.Walk(root).ToDictionary(node => node.Id);
-        if (!Disk && !Preferences.ShowLogicalProcessors &&
-            (scope?.Kind == ResourceKind.Processor || scope?.Children.Any(child => child.Kind == ResourceKind.Processor) == true))
-            scopeId = "system";
-        scope = nodes.GetValueOrDefault(scopeId) ?? root;
+        sharedRoot = Archive.Active ? root : ResourceTree.ResolveScope(root, SharedScope, Disk);
+        nodes.TryAdd(sharedRoot.Id, sharedRoot);
+        scope = localScopeId == null ? sharedRoot :
+            ResourceTree.Walk(sharedRoot).FirstOrDefault(node => node.Id == localScopeId) ?? sharedRoot;
+        if (scope.Id == sharedRoot.Id) localScopeId = null;
         if (selected != null && !nodes.ContainsKey(selected)) selected = null;
         if (Archive.Active || frames.Length == 0) return;
         var latest = frames.Max(frame => Disk ? frame.DiskPaths.End : frame.CpuEnd);
@@ -158,14 +189,16 @@
     }
     private void Select(string? id) => selected = id;
     private void Clear() => selected = null;
-    private void ChangeScope(string id)
+    private Task ChangeScope(string id)
     {
-        if (scope.Id == id || !nodes.TryGetValue(id, out var next)) return;
-        bool returning = PathTo(root, scope.Id).Any(node => node.Id == id);
+        if (scope.Id == id || !nodes.TryGetValue(id, out var next)) return Task.CompletedTask;
+        bool returning = Ancestors.Any(node => node.Id == id);
         scopeFocus = returning ? scope.Id : "";
-        scopeId = id;
-        scope = next;
         selected = null;
+        if (ResourceTree.SharedScope(next) is { } shared) return SharedScopeChanged.InvokeAsync(shared);
+        localScopeId = id;
+        scope = next;
+        return Task.CompletedTask;
     }
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {

@@ -43,7 +43,7 @@
             @if (settingsOpened)
             {
                 <div class="toolbar advanced-settings" hidden="@(!settings)">
-                    <label>Host <select @bind="preferences.Host" @bind:after="Save">
+                    <label>Host <select @bind="preferences.Host" @bind:after="ChangeHost">
                         <option value="">All hosts</option>
                         @foreach (var name in HostNames) { <option value="@name">@name</option> }
                     </select></label>
@@ -93,9 +93,9 @@
         }
         <div class="viewer-sections @(Combined ? "viewer-combined" : "")">
             <ResourceSection Sources="Sources" Preferences="preferences" Visible="preferences.ShowCpu" Combined="Combined" Filter="@filter"
-                SavePreferences="Save" />
+                SavePreferences="Save" SharedScope="sharedScope" SharedScopeChanged="ChangeScope" />
             <ResourceSection Sources="Sources" Preferences="preferences" Visible="preferences.ShowDisk" Combined="Combined" Filter="@filter"
-                Disk="true" Archive="archive" SavePreferences="Save" />
+                Disk="true" Archive="archive" SavePreferences="Save" SharedScope="sharedScope" SharedScopeChanged="ChangeScope" />
         </div>
     }
 </main>
@@ -107,6 +107,7 @@
     private bool ready, settings, settingsOpened, timelines;
     private string? preferenceError;
     private string filter = "";
+    private ResourceScope sharedScope = new();
     private HistorySelection archive = new(false, null);
     private bool Combined => preferences.ShowCpu && preferences.ShowDisk;
     private IEnumerable<string> HostNames => Sources.Select(source => source.Frame?.Host ?? source.GuestOf)
@@ -150,6 +151,8 @@
 
     private Task ToggleCpu() { preferences.ShowCpu = !preferences.ShowCpu; return Save(); }
     private Task ToggleDisk() { preferences.ShowDisk = !preferences.ShowDisk; return Save(); }
+    private void ChangeScope(ResourceScope scope) => sharedScope = scope;
+    private Task ChangeHost() { sharedScope = new(); return Save(); }
     private void ToggleSettings() { settings = !settings; settingsOpened = true; }
     private Task SetGuest(ViewerPreferences.Guest target, bool enabled)
     {

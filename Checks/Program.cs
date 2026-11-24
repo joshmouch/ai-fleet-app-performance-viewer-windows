@@ -179,6 +179,34 @@ var unattributedWorkload = workloadLayout.Children.Single(node => node.Kind == R
 Check(workload.Children.Length == 2 && workload.Type == "WSL distribution" &&
     workload.Children.Select(node => node.Id).ToHashSet().SetEquals(flatLayout.Children.Select(node => node.Id)),
     "two volumes backing one workload share one parent while keeping their VHDX identities");
+var wslScope = ResourceTree.SharedScope(wslVm)!;
+var distroScope = ResourceTree.SharedScope(workload)!;
+Check(wslScope.Target == "WSL" && wslScope.Machine == null && distroScope == ResourceTree.SharedScope(wslVm.Children.Single()),
+    "CPU and Disk identify the same WSL distribution and distinguish it from the shared WSL VM");
+foreach (var layout in new[] { storageLayout, workloadLayout, flatLayout })
+{
+    foreach (var shared in new[] { wslScope, distroScope })
+    {
+        var guestDisk = ResourceTree.ResolveScope(layout, shared, disk: true);
+        var rows = ResourceDiskScope.Rows(twoDisks, guestDisk, _ => true, false);
+        Check(guestDisk.Children.Length == 2 && guestDisk.Disk == null &&
+            DiskIoMerge.Sum(rows.Select(row => row.Totals)).Equals(DiskIoMerge.Sum([raw[backing], otherHost])),
+            "shared guest scope includes all backing files across volumes and preserves the captured budget in every layout");
+    }
+}
+var hypervDisk = twoDisks with { Resources = twoDisks.Resources with
+    { VirtualDisks = twoDisks.Resources.VirtualDisks.Select(file => file with { Machine = vmCard.Name, Target = vmCard.Target }).ToArray() } };
+var cpuScope = ResourceTree.SharedScope(vmCard)!;
+var hypervStorage = ResourceTree.Build(true, [hypervDisk], (_, _) => true, false);
+var diskVmCard = hypervStorage.Children.First(node => node.Disk == 2).Children.Single();
+var scopedCpuVm = ResourceTree.ResolveScope(ResourceTree.Build(false, [guestWindow], (_, _) => true, false), cpuScope, disk: false);
+Check(ResourceTree.SharedScope(diskVmCard) == cpuScope &&
+    ResourceTree.ResolveScope(hypervStorage, cpuScope, disk: true).Children.Length == 2 &&
+    scopedCpuVm.Id == vmCard.Id && scopedCpuVm.Reading == vmCard.Reading,
+    "a VM card on either pane selects the same complete VM across disk volumes");
+var otherHostScope = ResourceTree.ResolveScope(storageLayout, new ResourceScope("not in the sample"), disk: true);
+Check(otherHostScope.Reading == default && otherHostScope.Children.Length == 0,
+    "a temporarily unavailable host does not display another host's data");
 var narrowed = workload.Children.Single(node => node.BackingPath == backing.Path);
 var captureBytes = twoDisks.DiskPaths.Totals().TotalBytes;
 var vhdxShare = (double)raw[backing].TotalBytes / captureBytes;

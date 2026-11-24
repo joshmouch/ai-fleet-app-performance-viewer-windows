@@ -6,7 +6,7 @@
     data-expanded="@(GraphOpen || DetailsOpen ? "true" : "false")"
     data-branch="@(Children.Length > 0 ? "true" : "false")" data-processor="@(Node.Kind == ResourceKind.Processor ? "true" : "false")"
     style="@Fill" @onclick="Select" @onclick:stopPropagation="true">
-    <div class="resource-card-face">
+    <div class="resource-card-face" @ondblclick="ScopeCard" @ondblclick:stopPropagation="true">
         <div class="resource-card-summary">
             <div class="resource-card-heading">
                 @Breadcrumb
@@ -32,7 +32,8 @@
         </div>
         @if (!Overview && Selected)
         {
-            <div class="resource-card-actions" role="group" aria-label="@($"Actions for {Node.Name}")" @onclick:stopPropagation="true">
+            <div class="resource-card-actions" role="group" aria-label="@($"Actions for {Node.Name}")" @onclick:stopPropagation="true"
+                @ondblclick:stopPropagation="true">
                 <button type="button" class="resource-icon" aria-label="Graph" title="Graph"
                     aria-pressed="@(GraphOpen ? "true" : "false")" @onclick="() => graph = !graph">∿</button>
                 <button type="button" class="resource-icon" aria-label="Metrics" title="Metrics"
@@ -40,7 +41,7 @@
                 <button type="button" class="resource-icon" aria-label="Details" title="Details"
                     aria-pressed="@(DetailsOpen ? "true" : "false")" @onclick="() => details = !details">≡</button>
                 <button type="button" class="resource-icon" aria-label="Scope to this" title="Scope to this"
-                    @onclick="() => Scope.InvokeAsync(Node.Id)">⌖</button>
+                    @onclick="ScopeCard">⌖</button>
             </div>
         }
     </div>
@@ -113,6 +114,7 @@
     private ResourceNode ChartNode => Disk && !Overview && !GraphOpen && CardReading is { } reading
         ? Node with { Reading = reading } : Node;
     private Task Select() => Selection.InvokeAsync(Overview || Selected ? null : Node.Id);
+    private Task ScopeCard() => Overview ? Task.CompletedTask : Scope.InvokeAsync(Node.Id);
     private Task Clear() => Selection.InvokeAsync(null);
     // Give small host shares some contrast without scaling each branch to its hottest child.
     private string Fill => FormattableString.Invariant($"--resource-heat:{58 * Math.Sqrt(Math.Clamp(Node.HostShare ?? 0, 0, 1)):0.##}%");

@@ -3,6 +3,11 @@
 public enum ResourceKind { System, Host, CpuGroup, Processor, Disk, WindowsIo, UnattributedIo, VirtualMachine, GuestCpuDistribution, VirtualDisk, GuestDevice }
 public enum DiskGrouping { Storage, Workloads, Vhdx }
 
+public sealed record ResourceScope(string? Host = null, string? Target = null, string? Machine = null)
+{
+    public string? Name => Machine ?? Target ?? Host;
+}
+
 public readonly record struct ResourceReading(double? Active = null, double? Read = null, double? Write = null,
     double? Windows = null, double? Guests = null, double? Hypervisor = null, double? Vmmem = null);
 
@@ -30,7 +35,7 @@ public static class ResourceTree
             Guests: CapacityAverage(hosts, capacity, reading => reading.Guests),
             Hypervisor: CapacityAverage(hosts, capacity, reading => reading.Hypervisor));
         return new("system", hosts.Length > 1 ? "All hosts" : "This system", null, ResourceKind.System, reading,
-            hosts.Length == 1 ? hosts[0].Children : hosts);
+            hosts.Length == 1 ? hosts[0].Children : hosts, Host: hosts.Length == 1 ? hosts[0].Host : null);
     }
 
     public static IEnumerable<ResourceNode> Walk(ResourceNode node)
@@ -39,6 +44,38 @@ public static class ResourceTree
         foreach (var child in node.Children)
             foreach (var descendant in Walk(child))
                 yield return descendant;
+    }
+
+    public static ResourceScope? SharedScope(ResourceNode node) => node.Kind switch
+    {
+        ResourceKind.System => new(),
+        ResourceKind.Host => new(node.Host),
+        ResourceKind.VirtualMachine or ResourceKind.GuestCpuDistribution when node.Target is string target =>
+            new(node.Host, target, PathComparer.Equals(target, node.Machine) ? null : node.Machine),
+        _ => null
+    };
+
+    public static ResourceNode ResolveScope(ResourceNode root, ResourceScope scope, bool disk)
+    {
+        if (scope.Host == null) return root;
+        var host = root.Children.FirstOrDefault(node => node.Kind == ResourceKind.Host && PathComparer.Equals(node.Host, scope.Host));
+        var hostRoot = host ?? root;
+        if (scope.Target == null)
+            return host ?? new((disk ? "disk/" : "cpu/") + scope.Host, scope.Host, null, ResourceKind.Host,
+                PathComparer.Equals(root.Host, scope.Host) ? root.Reading : default,
+                PathComparer.Equals(root.Host, scope.Host) ? root.Children : [], scope.Host);
+        var guest = Walk(hostRoot).FirstOrDefault(node => (!disk || node.Disk == null) && SharedScope(node) is { } candidate &&
+            PathComparer.Equals(candidate.Host, scope.Host) && PathComparer.Equals(candidate.Target, scope.Target) &&
+            PathComparer.Equals(candidate.Machine, scope.Machine));
+        if (guest != null) return guest;
+
+        var files = disk ? Walk(hostRoot).Where(node => node.Kind == ResourceKind.VirtualDisk &&
+            PathComparer.Equals(node.Host, scope.Host) && PathComparer.Equals(node.Target ?? node.Machine, scope.Target) &&
+            (scope.Machine == null || PathComparer.Equals(node.Machine, scope.Machine))).ToArray() : [];
+        var id = (disk ? "disk-scope/" : "cpu-scope/") + scope.Host + "/" + scope.Target +
+            (scope.Machine == null ? "" : "/" + scope.Machine);
+        return new(id, scope.Name!, null, ResourceKind.VirtualMachine, files.Length > 0 ? DiskTotal(files) : default, files,
+            scope.Host, Target: scope.Target, Machine: scope.Machine, HostShare: Sum(files.Select(file => file.HostShare)));
     }
 
     private static ResourceNode CpuHost(PerformanceWindow frame, Func<string, string, bool> includesGuest, bool showLogicalProcessors)
@@ -182,7 +219,8 @@ public static class ResourceTree
                 var files = machine.ToArray();
                 return new ResourceNode(parentId + "/vm/" + machine.Key.ToUpperInvariant(), machine.Key,
                     machine.All(file => file.Target == "WSL") ? "WSL distribution" : "Hyper-V virtual machine",
-                    ResourceKind.VirtualMachine, DiskTotal(files), files, host, number, Machine: machine.Key,
+                    ResourceKind.VirtualMachine, DiskTotal(files), files, host, number,
+                    Target: files.Select(file => file.Target).OfType<string>().FirstOrDefault() ?? machine.Key, Machine: machine.Key,
                     HostShare: Sum(files.Select(file => file.HostShare)));
             }).Concat(disks.Where(disk => disk.Machine == null)).ToArray();
     }
