@@ -119,6 +119,7 @@
     private ResourceDetailTable Data => data!;
     private bool Loading => data == null;
     private int request;
+    protected override void OnInitialized() => Paths = Disk;
     protected override Task OnParametersSetAsync() => Refresh();
     private Task Show(bool paths)
     {
