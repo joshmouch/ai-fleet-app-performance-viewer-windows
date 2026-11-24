@@ -8,7 +8,8 @@ public readonly record struct ResourceReading(double? Active = null, double? Rea
 
 public sealed record ResourceNode(string Id, string Name, string? Type, ResourceKind Kind, ResourceReading Reading,
     ResourceNode[] Children, string? Host = null, int? Disk = null, string? BackingPath = null,
-    string? Target = null, string? Machine = null, string? Device = null, double? HostShare = null);
+    string? Target = null, string? Machine = null, string? Device = null, double? HostShare = null,
+    DateTimeOffset? MeasuredAt = null);
 
 public static class ResourceTree
 {
@@ -55,8 +56,7 @@ public static class ResourceTree
                     "CPU " + p.Id, null, ResourceKind.Processor, new(p.Busy), [], host,
                     HostShare: Share(p.Busy, 100.0 * frame.Cpu.LogicalProcessors))).ToArray(), host,
                 HostShare: Share(busy, 100)));
-        var cluster = frame.Guests?.Cpu?.Sample;
-        if (cluster != null)
+        if (frame.Guests?.Cpu is { Sample: { } cluster } guestSample)
         {
             var processesByTarget = cluster.Guests.ToLookup(guest => guest.Target ?? guest.Name, PathComparer);
             var guestNodes = cluster.Coverage
@@ -74,16 +74,18 @@ public static class ResourceTree
                     {
                         var attributed = GuestProjection.HostPercent(cluster.Host, Sum(guest.Rows.Select(row => row.AttributedCores)));
                         return new ResourceNode(guestId + "/" + guest.Name, guest.Name, "WSL distribution", ResourceKind.GuestCpuDistribution,
-                            new(attributed), [], host, Target: target, Machine: guest.Name, HostShare: Share(attributed, 100));
+                            new(attributed), [], host, Target: target, Machine: guest.Name, HostShare: Share(attributed, 100),
+                            MeasuredAt: guestSample.End);
                     }).ToArray() : [];
                     return new ResourceNode(guestId, target, wsl ? "Shared WSL VM" : "Hyper-V virtual machine", ResourceKind.VirtualMachine,
-                        new(measured, Vmmem: vmmem), distributions, host, Target: target, HostShare: Share(measured, 100));
+                        new(measured, Vmmem: vmmem), distributions, host, Target: target, HostShare: Share(measured, 100),
+                        MeasuredAt: guestSample.End);
                 }).OrderBy(node => node.Name, PathComparer).ToArray();
             if (guestNodes.Length > 0)
             {
-                var guestCpu = counters?.Guests ?? Sum(guestNodes.Select(n => n.Reading.Active));
-                children.Add(new(id + "/guests", "Guests", "Host-equivalent CPU", ResourceKind.CpuGroup,
-                    new(guestCpu), guestNodes, host, HostShare: Share(guestCpu, 100)));
+                var guestCpu = Sum(guestNodes.Select(n => n.Reading.Active));
+                children.Add(new(id + "/guests", "Guests", "Selected guests", ResourceKind.CpuGroup,
+                    new(guestCpu), guestNodes, host, HostShare: Share(guestCpu, 100), MeasuredAt: guestSample.End));
             }
         }
         return new(id, host, "Windows host", ResourceKind.Host, reading, children.ToArray(), host,

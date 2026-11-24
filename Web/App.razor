@@ -12,7 +12,7 @@
 <body>
     <Dashboard @rendermode="new InteractiveServerRenderMode(prerender: true)" />
     <script src="_framework/blazor.web.js"></script>
-    <script src="resource-pane.js"></script>
+    <script src="@Assets["resource-pane.js"]"></script>
     @if (Environment.GetEnvironmentVariable("DOTNET_WATCH") == "1" &&
         string.IsNullOrEmpty(Environment.GetEnvironmentVariable("ViewerSourceCheckout")))
     {

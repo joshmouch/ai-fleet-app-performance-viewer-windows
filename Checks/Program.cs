@@ -118,6 +118,13 @@ var rankedVm = GuestProjection.CpuRows(guestWindow, _ => true).Single(row => row
 Check(vmCard.Reading is { Active: 20, Vmmem: 22.5 } && vmCard.HostShare == .20 &&
     rankedVm is { HostPercent: 5, Row.Process: "worker" },
     "VM card shows the measured host budget even when only a quarter is attributed to a named process");
+var mixedGuestWindow = measured with { Guests = new(new(time.AddSeconds(-12),
+    new(window.Cpu, [partialGuest], [partialCoverage, new("vm-two", .8, 0, false)])), [], null) };
+var scopedGuests = ResourceTree.Build(false, [mixedGuestWindow], (_, guest) => guest == "vm-one", false,
+    showLogicalProcessors: false);
+Check(scopedGuests.Reading.Guests == 9 && scopedGuests.Children.Single() is { Reading.Active: 20 } selectedGuests &&
+    selectedGuests.MeasuredAt == time.AddSeconds(-12) && selectedGuests.Children.Single().MeasuredAt == selectedGuests.MeasuredAt,
+    "selected VM card totals reconcile to their own sample instead of the current all-guest host counter");
 var awaitingGuest = guestWindow with { Guests = guestWindow.Guests with
     { Cpu = new(time, new(window.Cpu, [], [partialCoverage with { AttributedCores = 0, SampleAvailable = false }])) } };
 var awaitingCard = ResourceTree.Walk(ResourceTree.Build(false, [awaitingGuest], (_, _) => true, false))

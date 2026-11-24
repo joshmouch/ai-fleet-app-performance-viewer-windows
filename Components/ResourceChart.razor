@@ -101,7 +101,7 @@
     private static readonly Metric[] CpuMetrics = [
         new("CPU busy", "%", "read", r => r.Active),
         new("Windows CPU", "%", "write", r => r.Windows),
-        new("Guest CPU", "%", "guest", r => r.Guests),
+        new("All guest CPU", "%", "guest", r => r.Guests),
         new("Hypervisor overhead", "%", "active", r => r.Hypervisor)];
     private static readonly Metric[] VmCpuMetrics =
     [
@@ -142,6 +142,9 @@
     {
         ResourceKind.GuestDevice => $"Guest {metric.Label.ToLowerInvariant()}",
         ResourceKind.Disk when Compact => metric.Class == "active" ? "Avg active" : $"Avg {metric.Label.ToLowerInvariant()}",
+        ResourceKind.Disk or ResourceKind.System or ResourceKind.Host
+            when Disk && Breakdown.HasValue && !Stored && metric.Unit != "%" => $"Device {metric.Label.ToLowerInvariant()}",
+        ResourceKind.CpuGroup when Node.MeasuredAt.HasValue => "Host CPU",
         _ => metric.Label
     };
     private Metric[] Current = [], Plotted = [];

@@ -2,6 +2,7 @@
 @using Microsoft.AspNetCore.Components.Web
 
 <article class="resource-card @(Overview ? "resource-overview" : "")" data-selected="@(Selected ? "true" : "false")"
+    data-resource-node="@Node.Id"
     data-expanded="@(GraphOpen || DetailsOpen ? "true" : "false")"
     data-branch="@(Children.Length > 0 ? "true" : "false")" data-processor="@(Node.Kind == ResourceKind.Processor ? "true" : "false")"
     style="@Fill" @onclick="Select" @onclick:stopPropagation="true">
@@ -9,7 +10,7 @@
         <div class="resource-card-summary">
             <div class="resource-card-heading">
                 @Breadcrumb
-                @if (Overview) { <h2 class="resource-name">@Node.Name</h2> }
+                @if (Overview) { <h2 class="resource-name" tabindex="-1">@Node.Name</h2> }
                 else
                 {
                     <button type="button" class="resource-name" title="@Node.BackingPath" aria-pressed="@(Selected ? "true" : "false")"

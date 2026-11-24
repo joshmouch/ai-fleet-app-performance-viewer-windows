@@ -23,14 +23,15 @@
     @if (Data.Rows.Length > 0)
     {
         var labels = Data.LabelColumns;
-        <div class="scroll">
-            <table>
+        <div class="scroll" tabindex="0" role="region" aria-label="@(Paths ? "Path rankings" : "Process rankings")">
+            <table class="@(Paths ? "resource-path-rankings" : null)">
                 <thead><tr>
-                    @foreach (string column in labels) { <th scope="col">@column</th> }
+                    @foreach (string column in labels) { <th scope="col" data-copy-label="@column">@column</th> }
                     @foreach (var metric in Data.Metrics)
                     {
                         bool sorted = Data.SortedBy == metric.Key;
-                        <th scope="col" class="num" aria-sort="@(sorted ? "descending" : null)" title="@metric.Hint">
+                        <th scope="col" class="num" data-copy-label="@metric.Label"
+                            aria-sort="@(sorted ? "descending" : null)" title="@metric.Hint">
                             @if (metric.Sortable)
                             {
                                 <button type="button" class="detail-sort" @onclick="() => SortChanged.InvokeAsync(metric.Key)">
@@ -47,17 +48,27 @@
                     @if (group.Label != null)
                     {
                         <tr class="resource-band" title="Rows grouped by where their cumulative share starts. Subtotals cover the displayed rows.">
-                            <th colspan="@labels.Length" scope="rowgroup">@group.Label</th>
+                            <th colspan="@(Paths ? 2 : labels.Length)" scope="row">@group.Label</th>
+                            @if (Paths) { <td colspan="@(labels.Length - 2)" aria-hidden="true"></td> }
                             @for (int column = 0; column < Data.Metrics.Length; column++)
-                            { <td class="num">@Data.Metrics[column].Display(Subtotal(group.Rows, column))</td> }
+                            { <td class="num">@Data.Metrics[column].Display(Data.Metrics[column].Subtotal(group.Rows, column))</td> }
                         </tr>
                     }
                     @foreach (var row in group.Rows)
                     {
-                        <tr>
-                            @foreach (var label in row.Labels)
+                        var fullPath = Paths && row.Labels[2].Length > 0 ? row.Labels[2] + row.Labels[1] : null;
+                        <tr data-copy-row="" tabindex="@(fullPath == null ? "0" : null)">
+                            @for (int index = 0; index < row.Labels.Length; index++)
                             {
-                                <td class="resource-cell" title="@label">@label</td>
+                                var label = row.Labels[index];
+                                <td class="resource-cell" title="@label">
+                                    @if (index == 1 && fullPath != null)
+                                    {
+                                        <button type="button" class="file-path-button" data-full-path="@fullPath"
+                                            aria-label="@($"Show full path for {label}")" aria-haspopup="dialog">@label</button>
+                                    }
+                                    else { @label }
+                                </td>
                             }
                             @for (int column = 0; column < Data.Metrics.Length; column++)
                             { <td class="num">@Data.Metrics[column].Display(row.Values[column])</td> }
@@ -103,10 +114,5 @@
             return data.Rows.GroupBy(Bucket).Select(g =>
                 new Band($"Starts in {g.Key}–{Math.Min(100, g.Key + BandPercent)}%", g.ToArray())).ToArray();
         }
-    }
-    private static double? Subtotal(ResourceDetailRow[] rows, int column)
-    {
-        var values = rows.Select(row => row.Values[column]).OfType<double>().ToArray();
-        return values.Length == 0 ? null : values.Sum();
     }
 }

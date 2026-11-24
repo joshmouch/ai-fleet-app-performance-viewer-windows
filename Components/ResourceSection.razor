@@ -1,10 +1,12 @@
 @using Microsoft.AspNetCore.Components
 @using Microsoft.AspNetCore.Components.Web
+@using Microsoft.JSInterop
 @using System.Globalization
+@inject IJSRuntime Browser
 
 @if (Visible)
 {
-    <section class="resource-section" aria-label="@(Disk ? "Disk" : "CPU")" @onclick="Clear" @onclick:stopPropagation="true">
+    <section class="resource-section" @ref="section" aria-label="@(Disk ? "Disk" : "CPU")" @onclick="Clear" @onclick:stopPropagation="true">
         @if (Notice is { } notice)
         {
             <MeasurementNotice Title="@notice.Title" Detail="@notice.Detail" Loading="@notice.Loading" />
@@ -51,6 +53,8 @@
         return SavePreferences.InvokeAsync();
     }
     private string? selected;
+    private ElementReference section;
+    private string? scopeFocus;
     private string scopeId = "system";
     private DiskGrouping previousGrouping;
     private string previousHost = "";
@@ -65,10 +69,17 @@
     private sealed record ViewNotice(string Title, string? Detail = null, bool Loading = false);
     private Dictionary<string, ResourceNode> nodes = new(StringComparer.Ordinal);
     private ResourceNode[] Ancestors => PathTo(root, scope.Id).SkipLast(1).ToArray();
-    private string? EmptyCards => Disk && !Archive.Active && scope.Kind is ResourceKind.System or ResourceKind.Host
-        ? scope.Children.Length > 0 ? "No cards match the current activity and search filters."
-            : Preferences.Grouping == DiskGrouping.Vhdx ? "No VHDX measurements yet." : "No per-disk measurements available."
-        : null;
+    private string? EmptyCards
+    {
+        get
+        {
+            if (Archive.Active) return null;
+            if (Filter.Length > 0) return "No cards match the current search and activity filters.";
+            if (!Disk || scope.Kind is not (ResourceKind.System or ResourceKind.Host)) return null;
+            if (scope.Children.Length > 0) return "No cards match the current activity filters.";
+            return Preferences.Grouping == DiskGrouping.Vhdx ? "No VHDX measurements yet." : "No per-disk measurements available.";
+        }
+    }
     private IEnumerable<PerformanceWindow> Frames => Sources.Where(s => s.Selected && s.Frame != null &&
         (Preferences.Host.Length == 0 || string.Equals(Preferences.Host, s.Frame.Host, StringComparison.OrdinalIgnoreCase))).Select(s => s.Frame!);
 
@@ -108,10 +119,11 @@
         scope = nodes.GetValueOrDefault(scopeId) ?? root;
         if (selected != null && !nodes.ContainsKey(selected)) selected = null;
         if (Archive.Active || frames.Length == 0) return;
-        var at = frames.Max(frame => Disk ? frame.DiskPaths.End : frame.CpuEnd);
+        var latest = frames.Max(frame => Disk ? frame.DiskPaths.End : frame.CpuEnd);
         var seconds = frames.Max(frame => frame.Cpu.Seconds);
         foreach (var node in nodes.Values)
         {
+            var at = node.MeasuredAt ?? latest;
             if (!points.TryGetValue(node.Id, out var samples)) points.Add(node.Id, samples = []);
             if (samples.Count > 0 && samples[^1].At > at) samples.Clear();
             var point = new ResourcePoint(at, node.Reading, seconds);
@@ -146,9 +158,19 @@
     private void Clear() => selected = null;
     private void ChangeScope(string id)
     {
+        if (scope.Id == id || !nodes.TryGetValue(id, out var next)) return;
+        bool returning = PathTo(root, scope.Id).Any(node => node.Id == id);
+        scopeFocus = returning ? scope.Id : "";
         scopeId = id;
-        scope = nodes.GetValueOrDefault(id) ?? root;
+        scope = next;
         selected = null;
+    }
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (scopeFocus is not { } focus) return;
+        scopeFocus = null;
+        try { await Browser.InvokeVoidAsync("focusResourceScope", section, focus); }
+        catch (JSDisconnectedException) { }
     }
     private void OpenPane() => closedPanes.Remove(scope.Id);
     private void ClosePane() => closedPanes.Add(scope.Id);
@@ -225,10 +247,11 @@
         bool guests = node.Id.EndsWith("/guests", StringComparison.Ordinal);
         var rows = frames.SelectMany(frame => GuestProjection.CpuRows(frame, target => Preferences.IncludesGuest(frame.Host, target))
             .Where(row => (node.Machine == null || row.Machine == node.Machine) &&
-                (node.Target == null || row.Target == node.Target) && (!guests || row.Target != null)))
+                (node.Target == null || row.Target == node.Target) &&
+                (!guests || row.Target != null && Preferences.IncludesGuest(frame.Host, row.Target)))
             .Select(row => (Eligible: Matches(row.Row.Process) || Matches(row.Machine), Row: new ResourceDetailRow(
                 ResourceDetailTable.Identity(row.Row.Process, row.Row.Pid, row.Machine),
-                [row.HostPercent, 100 * row.Row.GuestCpuShare])));
+                [row.HostPercent, 100 * row.Row.GuestCpuShare], Host: frame.Host, Guest: row.Machine))));
         string? summary = frames.Length == 1 && node.Machine == null ? CpuCoverageSummary(frames[0], node, guests) : null;
         return ResourceDetailTable.Rank(metrics, rows, Sort, Preferences.MaxRows, summary: summary);
     }
