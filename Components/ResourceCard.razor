@@ -17,10 +17,11 @@
                         @onclick="Select" @onclick:stopPropagation="true">@Node.Name</button>
                 }
                 @if (Node.Type is not null) { <span class="resource-type">@Node.Type</span> }
-                @if (Overview && !PaneOpen)
+                @if (Overview)
                 {
-                    <button type="button" class="resource-icon scope-action" aria-label="Open details pane" title="Open details pane"
-                        @onclick="OpenPane" @onclick:stopPropagation="true">≡</button>
+                    <button type="button" class="resource-icon scope-action" aria-label="Details pane"
+                        aria-pressed="@(PaneOpen ? "true" : "false")" title="@(PaneOpen ? "Hide details pane" : "Show details pane")"
+                        @ref="detailsToggle" @onclick="TogglePane" @onclick:stopPropagation="true">≡</button>
                 }
             </div>
             @if (Overview || GraphOpen || MetricsVisible && (!Disk || Node.HostShare > 0 || DiskActivity.HasActivity(ChartNode.Reading)))
@@ -72,7 +73,7 @@
                 <button type="button" class="resource-splitter" data-resource-splitter
                     aria-label="Resize the details pane with the pointer or arrow keys"></button>
             }
-            <ResourceDetails Node="Node" Read="ReadDetails" Disk="Disk" BandPercent="BandPercent" Close="ClosePane"
+            <ResourceDetails Node="Node" Read="ReadDetails" Disk="Disk" BandPercent="BandPercent" Close="CloseFromPane"
                 SortChanged="SortChanged" />
         </div>
     }
@@ -98,6 +99,7 @@
     [Parameter] public int BandPercent { get; set; }
     [Parameter] public EventCallback<string> SortChanged { get; set; }
     [Parameter] public ResourceReading? CardReading { get; set; }
+    private ElementReference detailsToggle;
     private ResourceCardEntry[] Children = [];
     private bool graph, details, metrics = true;
     protected override void OnParametersSet()
@@ -115,6 +117,12 @@
         ? Node with { Reading = reading } : Node;
     private Task Select() => Selection.InvokeAsync(Overview || Selected ? null : Node.Id);
     private Task ScopeCard() => Overview ? Task.CompletedTask : Scope.InvokeAsync(Node.Id);
+    private Task TogglePane() => (PaneOpen ? ClosePane : OpenPane).InvokeAsync();
+    private async Task CloseFromPane()
+    {
+        await ClosePane.InvokeAsync();
+        await detailsToggle.FocusAsync(preventScroll: true);
+    }
     private Task Clear() => Selection.InvokeAsync(null);
     // Give small host shares some contrast without scaling each branch to its hottest child.
     private string Fill => FormattableString.Invariant($"--resource-heat:{58 * Math.Sqrt(Math.Clamp(Node.HostShare ?? 0, 0, 1)):0.##}%");
