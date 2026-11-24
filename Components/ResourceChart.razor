@@ -7,7 +7,7 @@
         <dl class="resource-metrics">
             @foreach (var metric in Current)
             {
-                <div class="@metric.Class"><dt>
+                <div class="@metric.Class" title="@metric.Hint"><dt>
                     @if (GraphVisible && Plotted.Contains(metric))
                     { <span class="metric-key" aria-hidden="true"></span> }
                     @Label(metric)</dt><dd>@Format(metric)</dd></div>
@@ -93,7 +93,7 @@
     private bool Compact => !Controls && !Graph;
     private bool GraphVisible => Controls ? !HideGraph : Graph;
     private bool MetricsVisible => Controls ? !HideMetrics : Metrics;
-    private sealed record Metric(string Label, string Unit, string Class, Func<ResourceReading, double?> Read);
+    private sealed record Metric(string Label, string Unit, string Class, Func<ResourceReading, double?> Read, string? Hint = null);
     private static readonly Metric[] DiskMetrics = [
         new("Read", " MiB/s", "read", r => r.Read),
         new("Write", " MiB/s", "write", r => r.Write),
@@ -103,7 +103,22 @@
         new("Windows CPU", "%", "write", r => r.Windows),
         new("Guest CPU", "%", "guest", r => r.Guests),
         new("Hypervisor overhead", "%", "active", r => r.Hypervisor)];
-    private Metric[] AvailableMetrics => Disk ? DiskMetrics : Node.Kind is ResourceKind.System or ResourceKind.Host ? CpuMetrics : [CpuMetrics[0]];
+    private static readonly Metric[] VmCpuMetrics =
+    [
+        new("Host CPU", "%", "read", r => r.Active, "The whole VM's measured share of host CPU capacity."),
+        new("Windows vmmem", "%", "guest", r => r.Vmmem, "CPU time charged to the Windows vmmem process over the same host interval.")
+    ];
+    private static readonly Metric[] DistroCpuMetrics =
+    [
+        new("Attributed host CPU", "%", "read", r => r.Active, "CPU attributed to sampled processes in this WSL distribution.")
+    ];
+    private Metric[] AvailableMetrics => Disk ? DiskMetrics : Node.Kind switch
+    {
+        ResourceKind.System or ResourceKind.Host => CpuMetrics,
+        ResourceKind.VirtualMachine => VmCpuMetrics,
+        ResourceKind.GuestCpuDistribution => DistroCpuMetrics,
+        _ => [CpuMetrics[0]]
+    };
     private bool HasMetrics => Current.Length > 0 || HostIoShare != null || Breakdown.HasValue;
     private string? HostIoShare => Disk && Node.Kind is not (ResourceKind.System or ResourceKind.Host) && Node.HostShare is double share
         ? FormatShare(share) : null;
@@ -127,7 +142,6 @@
     {
         ResourceKind.GuestDevice => $"Guest {metric.Label.ToLowerInvariant()}",
         ResourceKind.Disk when Compact => metric.Class == "active" ? "Avg active" : $"Avg {metric.Label.ToLowerInvariant()}",
-        ResourceKind.VirtualMachine when !Disk => "Host CPU",
         _ => metric.Label
     };
     private Metric[] Current = [], Plotted = [];

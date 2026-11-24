@@ -221,13 +221,31 @@
         var metrics = ResourceDetailTable.CpuMetrics;
         if (node.Kind == ResourceKind.Processor)
             return new(metrics, [], Note: "Process CPU is measured across the host. Per-processor attribution is unavailable.");
-        var rows = FramesFor(node).SelectMany(w => GuestProjection.CpuRows(w, target => Preferences.IncludesGuest(w.Host, target))
-            .Where(row => node.Machine != null ? row.Machine == node.Machine :
-                !node.Id.EndsWith("/guests", StringComparison.Ordinal) || row.Machine != w.Host))
+        var frames = FramesFor(node).ToArray();
+        bool guests = node.Id.EndsWith("/guests", StringComparison.Ordinal);
+        var rows = frames.SelectMany(frame => GuestProjection.CpuRows(frame, target => Preferences.IncludesGuest(frame.Host, target))
+            .Where(row => (node.Machine == null || row.Machine == node.Machine) &&
+                (node.Target == null || row.Target == node.Target) && (!guests || row.Target != null)))
             .Select(row => (Eligible: Matches(row.Row.Process) || Matches(row.Machine), Row: new ResourceDetailRow(
                 ResourceDetailTable.Identity(row.Row.Process, row.Row.Pid, row.Machine),
                 [row.HostPercent, 100 * row.Row.GuestCpuShare])));
-        return ResourceDetailTable.Rank(metrics, rows, Sort, Preferences.MaxRows);
+        string? summary = frames.Length == 1 && node.Machine == null ? CpuCoverageSummary(frames[0], node, guests) : null;
+        return ResourceDetailTable.Rank(metrics, rows, Sort, Preferences.MaxRows, summary: summary);
+    }
+
+    private string? CpuCoverageSummary(PerformanceWindow frame, ResourceNode node, bool guests)
+    {
+        if (frame.Guests?.Cpu?.Sample is not { } cluster) return null;
+        bool guestScope = guests || node.Target != null;
+        var coverage = cluster.Coverage.Where(guest => guest.HostCores.HasValue &&
+            Preferences.IncludesGuest(frame.Host, guest.Machine) && (node.Target == null || node.Target == guest.Machine) &&
+            (guestScope || GuestProjection.HasAttribution(guest))).ToArray();
+        if (coverage.Length == 0) return null;
+        var attributed = GuestProjection.HostPercent(cluster.Host, coverage.Sum(guest => guest.AttributedCores));
+        var unassigned = GuestProjection.HostPercent(cluster.Host,
+            coverage.Sum(guest => Math.Max(0, guest.HostCores!.Value - guest.AttributedCores)));
+        return attributed.HasValue && unassigned.HasValue
+            ? $"Guest processes {Format(attributed)}% · Unattributed {Format(unassigned)}% of host CPU" : null;
     }
 
     private DiskIoBreakdown? ReadBreakdown()

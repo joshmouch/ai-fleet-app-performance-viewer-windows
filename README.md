@@ -28,6 +28,8 @@ Enable **Settings → Logical processors** to show per-processor CPU cards. This
 
 CPU and Disk details start with Process, PID, Environment, host impact, and guest usage. Click a numeric header to rank by that measurement. Each resource remembers its own sort. Disk Paths adds File and Folder. Throughput and operation counts follow the selected disk scope, including guest reads and writes when scoped to a guest device.
 
+CPU guest cards show the entire VM's measured share of host capacity. Where the VM has a matching Windows `vmmem` process, the card also shows its separately measured CPU time for comparison. Process rows use the guest samples to attribute that VM total, and the CPU details report how much remained unattributed. WSL has one shared measured VM total, with attributed CPU shown separately for sampled distributions.
+
 Use the grouping selector beside Disk to change how its cards are organized:
 
 - **Storage** shows the host mount or disk, the owning VM or WSL distribution, the VHDX, and the guest device.

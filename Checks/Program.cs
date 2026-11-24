@@ -99,6 +99,32 @@ layered = PerformanceWindow.Decode(layered.Encode());
 var projected = GuestProjection.CpuRows(layered, _ => true).ToArray();
 Check(projected.All(r => r.Row.Pid != 222) && projected.Single(r => r.Machine == "WSL / distro").HostPercent == 1, "10% of 10% host CPU");
 Check(GuestProjection.CpuRows(layered, _ => false).Any(r => r.Row.Pid == 222), "toggle restores wrapper");
+var wslCpu = ResourceTree.Walk(ResourceTree.Build(false, [layered], (_, _) => true, false)).ToArray();
+var wslVm = wslCpu.Single(node => node.Kind == ResourceKind.VirtualMachine);
+Check(wslVm.Reading is { Active: 10, Vmmem: 10 } &&
+    wslVm.Children.Single() is { Kind: ResourceKind.GuestCpuDistribution, Reading.Active: 1 },
+    "the WSL card shows its one measured VM budget and each distro only claims attributable process CPU");
+var vmWrapper = new CpuProcessRow(223, "vmmem", 1.8);
+var partialGuest = new CpuMachineProcesses("vm-one", [new(17, "worker", .4, .25, .4)]);
+var partialCoverage = new GuestCpuCoverage("vm-one", 1.6, .4, true, ReplacedRows: [vmWrapper]);
+var guestWindow = layered with
+{
+    Cpu = window.Cpu with { Rows = [..window.Cpu.Rows, vmWrapper] },
+    Guests = layered.Guests with { Cpu = new(time, new(window.Cpu, [partialGuest], [partialCoverage])) }
+};
+var vmCard = ResourceTree.Walk(ResourceTree.Build(false, [guestWindow], (_, _) => true, false))
+    .Single(node => node.Kind == ResourceKind.VirtualMachine);
+var rankedVm = GuestProjection.CpuRows(guestWindow, _ => true).Single(row => row.Target == "vm-one");
+Check(vmCard.Reading is { Active: 20, Vmmem: 22.5 } && vmCard.HostShare == .20 &&
+    rankedVm is { HostPercent: 5, Row.Process: "worker" },
+    "VM card shows the measured host budget even when only a quarter is attributed to a named process");
+var awaitingGuest = guestWindow with { Guests = guestWindow.Guests with
+    { Cpu = new(time, new(window.Cpu, [], [partialCoverage with { AttributedCores = 0, SampleAvailable = false }])) } };
+var awaitingCard = ResourceTree.Walk(ResourceTree.Build(false, [awaitingGuest], (_, _) => true, false))
+    .Single(node => node.Kind == ResourceKind.VirtualMachine);
+Check(awaitingCard.Reading.Active == 20 &&
+    GuestProjection.CpuRows(awaitingGuest, _ => true).Single(row => row.Target == "vm-one").Row.Pid == vmWrapper.Pid,
+    "a measured VM remains available without a guest process sample and retains its Windows wrapper");
 var layeredDisk = GuestProjection.DiskRows(layered, _ => true);
 Check(layeredDisk.Any(r => r.Key.Path == "/repo/a") && DiskIoMerge.Sum(layeredDisk.Select(r => r.Totals)).Equals(window.DiskPaths.Totals()), "guest path replay conserves four totals");
 Check(GuestProjection.DiskRows(layered, _ => false).Single(r => r.Key == backing).Totals.Equals(raw[backing]), "toggle restores backing file");

@@ -8,7 +8,7 @@
         @if (Disk) { <button type="button" aria-pressed="@(Paths ? "true" : "false")" @onclick="() => Show(true)">Paths</button> }
         @if (Data.Summary is string summary)
         {
-            <span class="resource-details-summary" title="Totals for all matching rows in this scope">@summary</span>
+            <span class="resource-details-summary" title="@(Disk ? "Totals for all matching rows in this scope" : "Guest CPU attribution coverage for this scope")">@summary</span>
         }
         @if (Close.HasDelegate)
         {

@@ -1,10 +1,10 @@
 #nullable enable
 
-public enum ResourceKind { System, Host, CpuGroup, Processor, Disk, WindowsIo, UnattributedIo, VirtualMachine, VirtualDisk, GuestDevice }
+public enum ResourceKind { System, Host, CpuGroup, Processor, Disk, WindowsIo, UnattributedIo, VirtualMachine, GuestCpuDistribution, VirtualDisk, GuestDevice }
 public enum DiskGrouping { Storage, Workloads, Vhdx }
 
 public readonly record struct ResourceReading(double? Active = null, double? Read = null, double? Write = null,
-    double? Windows = null, double? Guests = null, double? Hypervisor = null);
+    double? Windows = null, double? Guests = null, double? Hypervisor = null, double? Vmmem = null);
 
 public sealed record ResourceNode(string Id, string Name, string? Type, ResourceKind Kind, ResourceReading Reading,
     ResourceNode[] Children, string? Host = null, int? Disk = null, string? BackingPath = null,
@@ -58,15 +58,26 @@ public static class ResourceTree
         var cluster = frame.Guests?.Cpu?.Sample;
         if (cluster != null)
         {
-            var guestNodes = cluster.Guests
-                .Where(guest => includesGuest(host, guest.Target ?? guest.Name))
-                .Select(guest =>
+            var processesByTarget = cluster.Guests.ToLookup(guest => guest.Target ?? guest.Name, PathComparer);
+            var guestNodes = cluster.Coverage
+                .Where(coverage => includesGuest(host, coverage.Machine))
+                .Select(coverage =>
                 {
-                    string target = guest.Target ?? guest.Name;
-                    double? impact = cluster.Host.LogicalProcessors <= 0 ? null :
-                        guest.Rows.Sum(row => row.AttributedCores ?? 0) * 100 / cluster.Host.LogicalProcessors;
-                    return new ResourceNode(id + "/guest/" + guest.Name, guest.Name, "Guest", ResourceKind.VirtualMachine,
-                        new(impact), [], host, Target: target, Machine: guest.Name, HostShare: Share(impact, 100));
+                    string target = coverage.Machine;
+                    string guestId = id + "/guest/" + target;
+                    bool wsl = PathComparer.Equals(target, "WSL");
+                    // Per-VM accounting measures the whole VM independently of how many guest PIDs were sampled.
+                    var measured = GuestProjection.HostPercent(cluster.Host, coverage.HostCores);
+                    var vmmem = coverage.ReplacedRows is { Length: > 0 } wrappers
+                        ? GuestProjection.HostPercent(cluster.Host, wrappers.Sum(row => row.Cores)) : null;
+                    var distributions = wsl ? processesByTarget[target].Select(guest =>
+                    {
+                        var attributed = GuestProjection.HostPercent(cluster.Host, Sum(guest.Rows.Select(row => row.AttributedCores)));
+                        return new ResourceNode(guestId + "/" + guest.Name, guest.Name, "WSL distribution", ResourceKind.GuestCpuDistribution,
+                            new(attributed), [], host, Target: target, Machine: guest.Name, HostShare: Share(attributed, 100));
+                    }).ToArray() : [];
+                    return new ResourceNode(guestId, target, wsl ? "Shared WSL VM" : "Hyper-V virtual machine", ResourceKind.VirtualMachine,
+                        new(measured, Vmmem: vmmem), distributions, host, Target: target, HostShare: Share(measured, 100));
                 }).OrderBy(node => node.Name, PathComparer).ToArray();
             if (guestNodes.Length > 0)
             {
