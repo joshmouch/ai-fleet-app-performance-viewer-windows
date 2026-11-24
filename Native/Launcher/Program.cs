@@ -1,13 +1,17 @@
+using System.ComponentModel;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Security.Principal;
 using System.Text.Json;
 
 try
 {
-    string mode = args switch
+    var (mode, preview) = args switch
     {
-        ["Source"] => "Source",
-        ["Package"] => "Package",
+        ["Source"] => ("Source", false),
+        ["Package"] => ("Package", false),
+        ["Source", "--pin-preview"] => ("Source", true),
+        ["Package", "--pin-preview"] => ("Package", true),
         _ => throw new InvalidDataException("Open Performance Viewer from the Source or Package shortcut.")
     };
     var settings = Path.Combine(AppContext.BaseDirectory, mode + ".json");
@@ -20,6 +24,26 @@ try
     var start = new ProcessStartInfo(launch.Shell) { WorkingDirectory = Path.GetDirectoryName(launch.Shell)! };
     start.ArgumentList.Add(mode == "Source" ? "--source" : "--package");
     start.ArgumentList.Add(launch.Content);
+    if (preview) start.ArgumentList.Add("--pin-preview");
+    else
+    {
+        using var identity = WindowsIdentity.GetCurrent();
+        if (!new WindowsPrincipal(identity).IsInRole(WindowsBuiltInRole.Administrator))
+        {
+            start.UseShellExecute = true;
+            start.Verb = "runas";
+            try
+            {
+                using var elevated = Process.Start(start);
+                return 0;
+            }
+            catch (Win32Exception error) when (error.NativeErrorCode == 1223) // UAC declined.
+            {
+                start.UseShellExecute = false;
+                start.Verb = "";
+            }
+        }
+    }
     using var child = Process.Start(start);
     return 0;
 }

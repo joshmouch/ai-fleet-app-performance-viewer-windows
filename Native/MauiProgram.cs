@@ -17,6 +17,11 @@ internal sealed class ViewerApp : Application
         var args = Environment.GetCommandLineArgs()[1..];
         bool source = args.Contains("--source", StringComparer.Ordinal);
         var window = new Window(page) { Title = source ? "Performance Viewer (Source)" : "Performance Viewer (Package)" };
+        if (args.LastOrDefault() == "--pin-preview")
+        {
+            status.Text = window.Title;
+            return window;
+        }
         var lifetime = new CancellationTokenSource();
         var stop = lifetime.Token;
         bool started = false;
@@ -35,7 +40,7 @@ internal sealed class ViewerApp : Application
             status.Text = source ? "Building the viewer from source…" : "Starting the local viewer server…";
             try
             {
-                using var server = await Task.Run(() => LocalViewerServer.Start(args), stop).ConfigureAwait(false);
+                using var server = await Task.Run(() => LocalViewerServer.Start(args, stop), stop).ConfigureAwait(false);
                 WebView? browser = null;
                 await server.Watch((address, message) => page.Dispatcher.Dispatch(() =>
                 {

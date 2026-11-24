@@ -44,7 +44,16 @@ $existing = @(Get-ViewerWindows)
 $viewer = $existing | Where-Object MainWindowTitle -eq $title | Select-Object -First 1
 $launched = !$viewer
 try {
-    if ($launched) { Start-Process -FilePath $Shortcut }
+    if ($launched) {
+        $link = (New-Object -ComObject WScript.Shell).CreateShortcut($Shortcut)
+        $launcherVersion = [Diagnostics.FileVersionInfo]::GetVersionInfo($link.TargetPath)
+        $version = [version]::new($launcherVersion.FileMajorPart, $launcherVersion.FileMinorPart, $launcherVersion.FileBuildPart)
+        if ($version -ge [version]'1.0.1') {
+            Start-Process -FilePath $link.TargetPath -ArgumentList $link.Arguments, '--pin-preview' -WindowStyle Hidden
+        } else {
+            Start-Process -FilePath $Shortcut
+        }
+    }
     $deadline = [DateTime]::UtcNow.AddSeconds(20)
     do {
         if (!$viewer) {

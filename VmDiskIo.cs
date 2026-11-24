@@ -1,13 +1,16 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Management;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Xml.Linq;
 
 internal sealed record VmDisk(string VMName, string Path, string Controller, int Location, bool SingleScsiController,
     string WslDistro = null)
@@ -24,29 +27,10 @@ internal static class VmDiskIo
     /// thread pool.</summary>
     public static async Task<Dictionary<string, VmDiskOwners>> ReadInventory(CancellationToken cancellation, VolumePathIndex paths)
     {
-        const string script = """
-            $ErrorActionPreference = 'Stop'
-            [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
-            $rows = foreach ($vm in (Get-VM)) {
-                $one = @(Get-VMScsiController -VM $vm).Count -eq 1
-                foreach ($drive in (Get-VMHardDiskDrive -VM $vm)) {
-                    if (!$drive.Path) { continue }
-                    $path = $drive.Path
-                    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-                    while ($path -and $seen.Add($path)) {
-                        [pscustomobject]@{ VMName = $vm.Name; Path = $path; Controller = [string]$drive.ControllerType;
-                            Location = [int]$drive.ControllerLocation; SingleScsiController = $one }
-                        if ([IO.Path]::GetExtension($path) -ine '.avhdx') { break }
-                        $path = (Get-VHD -Path $path -ErrorAction SilentlyContinue).ParentPath
-                    }
-                }
-            }
-            ConvertTo-Json -InputObject @($rows) -Compress
-            """;
         // Registration owns the VHDX identity. Running state can change while the viewer is open.
         var wsl = CpuProcessSampler.ReadWslDistros().Where(distro => distro.Vhdx != null).ToArray();
         VmDisk[] hyperV;
-        try { hyperV = await ReadHyperV<VmDisk[]>(script, cancellation).ConfigureAwait(false); }
+        try { hyperV = await Task.Run(() => ReadHyperV(cancellation), cancellation).ConfigureAwait(false); }
         catch (Exception) when (!cancellation.IsCancellationRequested && wsl.Length > 0)
         {
             hyperV = Array.Empty<VmDisk>();
@@ -63,16 +47,75 @@ internal static class VmDiskIo
             }, StringComparer.OrdinalIgnoreCase);
     }
 
-    private static async Task<T> ReadHyperV<T>(string script, CancellationToken cancellation) where T : class
+    private static VmDisk[] ReadHyperV(CancellationToken cancellation)
     {
-        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
-        deadline.CancelAfter(TimeSpan.FromSeconds(15));
-        string executable = Path.Combine(Environment.SystemDirectory, "WindowsPowerShell", "v1.0", "powershell.exe");
-        var result = await Run(executable, new[] { "-NoProfile", "-NonInteractive", "-EncodedCommand",
-            Convert.ToBase64String(Encoding.Unicode.GetBytes(script)) }, null, deadline.Token).ConfigureAwait(false);
-        if (result.ExitCode != 0)
-            throw new InvalidOperationException("Hyper-V inventory unavailable.");
-        return Deserialize<T>(result.Output, "Hyper-V inventory unavailable.");
+        const string scsi = "Microsoft:Hyper-V:Synthetic SCSI Controller";
+        const string component = "Msvm_VirtualSystemSettingDataComponent";
+        var scope = new ManagementScope(@"root\virtualization\v2");
+        var options = new System.Management.EnumerationOptions { Timeout = TimeSpan.FromSeconds(5) };
+        using var query = new ManagementObjectSearcher(scope, new ObjectQuery(
+            "SELECT * FROM Msvm_VirtualSystemSettingData WHERE VirtualSystemType = 'Microsoft:Hyper-V:System:Realized'"), options);
+        using var configurations = query.Get();
+        var result = new List<VmDisk>();
+        foreach (ManagementObject configuration in configurations)
+        using (configuration)
+        {
+            cancellation.ThrowIfCancellationRequested();
+            var name = (string)configuration["ElementName"];
+            var resources = new Dictionary<string, (string Type, string Parent, string Slot)>(StringComparer.OrdinalIgnoreCase);
+            using var allocations = configuration.GetRelated("Msvm_ResourceAllocationSettingData", component, null, null, null, null, false, options);
+            foreach (ManagementObject allocation in allocations)
+            using (allocation)
+                resources[allocation.Path.RelativePath] = ((string)allocation["ResourceSubType"],
+                    (string)allocation["Parent"], (string)allocation["AddressOnParent"]);
+
+            bool one = resources.Values.Count(resource => resource.Type == scsi) == 1;
+            using var disks = configuration.GetRelated("Msvm_StorageAllocationSettingData", component, null, null, null, null, false, options);
+            foreach (ManagementObject disk in disks)
+            using (disk)
+            {
+                cancellation.ThrowIfCancellationRequested();
+                if ((string)disk["ResourceSubType"] != "Microsoft:Hyper-V:Virtual Hard Disk" ||
+                    disk["HostResource"] is not string[] { Length: > 0 } paths)
+                    continue;
+                resources.TryGetValue(new ManagementPath((string)disk["Parent"]).RelativePath, out var drive);
+                string controller = drive.Parent != null &&
+                    resources.TryGetValue(new ManagementPath(drive.Parent).RelativePath, out var parent) && parent.Type == scsi
+                    ? "SCSI" : "";
+                int slot = int.TryParse(drive.Slot, NumberStyles.None, CultureInfo.InvariantCulture, out int parsed) ? parsed : -1;
+                var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                for (string path = paths[0]; !string.IsNullOrEmpty(path) && seen.Add(path); path = ReadParentDisk(scope, path))
+                {
+                    result.Add(new VmDisk(name, path, controller, slot, one));
+                    if (!Path.GetExtension(path).Equals(".avhdx", StringComparison.OrdinalIgnoreCase)) break;
+                    cancellation.ThrowIfCancellationRequested();
+                }
+            }
+        }
+        return result.ToArray();
+    }
+
+    private static string ReadParentDisk(ManagementScope scope, string path)
+    {
+        try
+        {
+            using var serviceClass = new ManagementClass(scope, new ManagementPath("Msvm_ImageManagementService"), null);
+            using var services = serviceClass.GetInstances(new System.Management.EnumerationOptions { Timeout = TimeSpan.FromSeconds(5) });
+            foreach (ManagementObject service in services)
+            using (service)
+            {
+                using var input = service.GetMethodParameters("GetVirtualHardDiskSettingData");
+                input["Path"] = path;
+                using var output = service.InvokeMethod("GetVirtualHardDiskSettingData", input,
+                    new InvokeMethodOptions { Timeout = TimeSpan.FromSeconds(5) });
+                return (uint)output["ReturnValue"] == 0 && output["SettingData"] is string settings
+                    ? XDocument.Parse(settings).Descendants("PROPERTY").FirstOrDefault(p => (string)p.Attribute("NAME") == "ParentPath")?.Element("VALUE")?.Value
+                    : null;
+            }
+        }
+        catch (Exception error) when (error is ManagementException or UnauthorizedAccessException or
+            System.Runtime.InteropServices.COMException or System.Xml.XmlException) { }
+        return null;
     }
 
     /// <summary>The one reader of the JSON the guest and Hyper-V scripts print: text that is not the promised JSON, or is

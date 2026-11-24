@@ -29,7 +29,7 @@ internal sealed class LocalViewerServer : IDisposable
         { BaseAddress = address, Timeout = TimeSpan.FromSeconds(1) };
     }
 
-    public static LocalViewerServer Start(string[] args)
+    public static LocalViewerServer Start(string[] args, CancellationToken stop)
     {
         var address = new UriBuilder("http", "127.0.0.1",
             int.TryParse(Environment.GetEnvironmentVariable("ViewerPort"), out int port) ? port : 5217).Uri;
@@ -92,29 +92,18 @@ internal sealed class LocalViewerServer : IDisposable
         start.Environment["ViewerPort"] = address.Port.ToString(CultureInfo.InvariantCulture);
         var token = Convert.ToHexString(RandomNumberGenerator.GetBytes(32));
         start.Environment["ViewerInstance"] = token;
-        if (IPGlobalProperties.GetIPGlobalProperties().GetActiveTcpListeners().Any(endpoint =>
-            endpoint.Port == address.Port && (IPAddress.IsLoopback(endpoint.Address) || endpoint.Address.Equals(IPAddress.Any))))
-            throw new InvalidOperationException($"Port {address.Port} already has a server. Close the other viewer before switching modes.");
-#if WINDOWS
-        ViewerJob.JoinBeforeLaunchingChildren();
-#endif
         Directory.CreateDirectory(leaseDirectory);
-        FileStream lease;
-        try
-        {
-            lease = File.Open(Path.Combine(leaseDirectory, $"viewer-{address.Port}.lock"), FileMode.OpenOrCreate,
-                FileAccess.ReadWrite, FileShare.None);
-        }
-        catch (IOException error)
-        {
-            throw new InvalidOperationException("Another viewer window is already starting. Use that window or close it to switch modes.", error);
-        }
+        var lease = AcquireLease(Path.Combine(leaseDirectory, $"viewer-{address.Port}.lock"), stop);
         var child = new Process { StartInfo = start };
         var server = new LocalViewerServer(address, child, token, lease, source != null);
         child.OutputDataReceived += (_, e) => server.Remember(e.Data);
         child.ErrorDataReceived += (_, e) => server.Remember(e.Data);
         try
         {
+            WaitForPort(address.Port, stop);
+#if WINDOWS
+            ViewerJob.JoinBeforeLaunchingChildren();
+#endif
             if (!child.Start()) throw new IOException("Couldn't start the local viewer server.");
             child.BeginOutputReadLine();
             child.BeginErrorReadLine();
@@ -125,6 +114,35 @@ internal sealed class LocalViewerServer : IDisposable
             server.Dispose();
             throw;
         }
+    }
+
+    private static FileStream AcquireLease(string path, CancellationToken stop)
+    {
+        var started = Stopwatch.GetTimestamp();
+        while (true)
+        {
+            stop.ThrowIfCancellationRequested();
+            try { return File.Open(path, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None); }
+            catch (IOException error) when (!OperatingSystem.IsWindows() || (error.HResult & 0xffff) is 32 or 33)
+            {
+                if (Stopwatch.GetElapsedTime(started) >= TimeSpan.FromSeconds(8))
+                    throw new InvalidOperationException("Another Performance Viewer window still owns the local server. Close it to switch modes.", error);
+                Task.Delay(150, stop).GetAwaiter().GetResult();
+            }
+        }
+    }
+
+    private static void WaitForPort(int port, CancellationToken stop)
+    {
+        var started = Stopwatch.GetTimestamp();
+        while (IPGlobalProperties.GetIPGlobalProperties().GetActiveTcpListeners().Any(endpoint =>
+            endpoint.Port == port && (IPAddress.IsLoopback(endpoint.Address) || endpoint.Address.Equals(IPAddress.Any))))
+        {
+            if (Stopwatch.GetElapsedTime(started) >= TimeSpan.FromSeconds(2))
+                throw new InvalidOperationException($"Port {port} is already in use. Close its server before opening the viewer.");
+            Task.Delay(100, stop).GetAwaiter().GetResult();
+        }
+        stop.ThrowIfCancellationRequested();
     }
 
     public async Task Watch(Action<Uri?, string> show, CancellationToken stop)
@@ -184,8 +202,9 @@ internal sealed class LocalViewerServer : IDisposable
     public void Dispose()
     {
         if (Interlocked.Exchange(ref disposed, 1) != 0) return;
-        if (process != null)
+        try
         {
+            if (process == null) return;
             try
             {
                 if (!process.HasExited)
@@ -194,13 +213,20 @@ internal sealed class LocalViewerServer : IDisposable
                     request.Headers.Add("X-Viewer-Instance", identity);
                     try { using var response = http.Send(request); }
                     catch (Exception error) when (error is HttpRequestException or OperationCanceledException) { }
-                    if (!process.WaitForExit(2500)) process.Kill(entireProcessTree: true);
+                    if (!process.WaitForExit(2500))
+                    {
+                        process.Kill(entireProcessTree: true);
+                        process.WaitForExit(2000);
+                    }
                 }
             }
             catch (Exception error) when (error is InvalidOperationException or System.ComponentModel.Win32Exception) { }
-            finally { process.Dispose(); }
         }
-        http.Dispose();
-        lease?.Dispose();
+        finally
+        {
+            process?.Dispose();
+            http.Dispose();
+            lease?.Dispose();
+        }
     }
 }

@@ -11,7 +11,7 @@
     <Nullable>enable</Nullable>
     <ApplicationTitle>Cluster Performance Viewer</ApplicationTitle>
     <ApplicationId>agency.open.performanceviewer</ApplicationId>
-    <Version>1.0.1</Version>
+    <Version>1.0.2</Version>
     <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
     <ApplicationDisplayVersion>$(Version)</ApplicationDisplayVersion>
     <ApplicationVersion>1</ApplicationVersion>
