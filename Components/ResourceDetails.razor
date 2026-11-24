@@ -3,29 +3,32 @@
 
 <section class="resource-details" aria-label="@($"{Node.Name} details")" @onclick:stopPropagation="true">
     <div class="resource-details-tabs">
-        @if (Close.HasDelegate) { <h3 class="resource-detail-heading">@Node.Name details</h3> }
-        <button type="button" aria-pressed="@(!Paths ? "true" : "false")" @onclick="() => Show(false)">Processes</button>
-        @if (Disk) { <button type="button" aria-pressed="@(Paths ? "true" : "false")" @onclick="() => Show(true)">Paths</button> }
-        @if (BandPercent > 0 && data?.SortMetric is { } sort && Data.Rows.Length > 0)
-        {
-            <span class="resource-band-coverage"
-                title="Bands use the sorted column's total across all rows in this scope, including rows hidden by search or Top rows. Each row stays whole.">
-                @if (Data.BandIssue is string issue) { @issue }
-                else
-                {
-                    var basis = sort.BandBasis ?? sort.Label;
-                    @if (Data.TotalWeight > 0)
+        <div class="resource-detail-controls">
+            <button type="button" aria-pressed="@(!Paths ? "true" : "false")" @onclick="() => Show(false)">Processes</button>
+            @if (Disk) { <button type="button" aria-pressed="@(Paths ? "true" : "false")" @onclick="() => Show(true)">Paths</button> }
+        </div>
+        <div class="resource-detail-facts">
+            @if (BandPercent > 0 && data?.SortMetric is { } sort && Data.Rows.Length > 0)
+            {
+                <span class="resource-band-coverage"
+                    title="Bands use the sorted column's total across all rows in this scope, including rows hidden by search or Top rows. Each row stays whole.">
+                    @if (Data.BandIssue is string issue) { @issue }
+                    else
                     {
-                        <text>Bands by @basis · @sort.Display(Data.TotalWeight) total · @ResourceDetailTable.FormatShare(Data.ShownShare) shown · @ResourceDetailTable.FormatShare(1 - Data.ShownShare) outside list</text>
+                        var basis = sort.BandBasis ?? sort.Label;
+                        @if (Data.TotalWeight > 0)
+                        {
+                            <text>Bands by @basis · @sort.Display(Data.TotalWeight) total · @ResourceDetailTable.FormatShare(Data.ShownShare) shown · @ResourceDetailTable.FormatShare(1 - Data.ShownShare) outside list</text>
+                        }
+                        else { <text>No @basis values for bands</text> }
                     }
-                    else { <text>No @basis values for bands</text> }
-                }
-            </span>
-        }
-        @if (data?.Summary is string summary)
-        {
-            <span class="resource-details-summary" title="@(Disk ? "Totals for all matching rows in this scope" : "Guest CPU attribution coverage for this scope")">@summary</span>
-        }
+                </span>
+            }
+            @if (data?.Summary is string summary)
+            {
+                <span class="resource-details-summary" title="@(Disk ? "Totals for all matching rows in this scope" : "Guest CPU attribution coverage for this scope")">@summary</span>
+            }
+        </div>
         @if (Close.HasDelegate)
         {
             <button class="resource-icon close-details" type="button" aria-label="Close details pane"

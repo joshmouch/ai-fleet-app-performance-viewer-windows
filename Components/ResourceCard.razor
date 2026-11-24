@@ -10,13 +10,19 @@
         <div class="resource-card-summary">
             <div class="resource-card-heading">
                 @Breadcrumb
-                @if (Overview) { <h2 class="resource-name" tabindex="-1">@Node.Name</h2> }
-                else
+                <div class="resource-identity">
+                    <ResourceKindIcon Node="Node" />
+                    @if (Overview) { <h2 class="resource-name" tabindex="-1">@Node.Name</h2> }
+                    else
+                    {
+                        <button type="button" class="resource-name" title="@Node.BackingPath" aria-pressed="@(Selected ? "true" : "false")"
+                            @onclick="Select" @onclick:stopPropagation="true">@Node.Name</button>
+                    }
+                </div>
+                @if (Node.Kind == ResourceKind.VirtualDisk && Node.Type is string owner)
                 {
-                    <button type="button" class="resource-name" title="@Node.BackingPath" aria-pressed="@(Selected ? "true" : "false")"
-                        @onclick="Select" @onclick:stopPropagation="true">@Node.Name</button>
+                    <span class="resource-owner" title="@($"Owned by {owner}")">@owner</span>
                 }
-                @if (Node.Type is not null) { <span class="resource-type">@Node.Type</span> }
                 @if (Overview)
                 {
                     <button type="button" class="resource-icon scope-action" aria-label="Details pane"
