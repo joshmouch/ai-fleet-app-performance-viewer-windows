@@ -145,6 +145,7 @@ p { margin: .75rem 0; }
 .resource-details-tabs:has(.close-details) { padding-inline-end: 1.85rem; }
 .resource-details-tabs button:not(.resource-icon) { padding: .15rem .35rem; }
 .resource-details-summary { margin: .15rem 0 .15rem auto; font-size: .85em; font-variant-numeric: tabular-nums; }
+.resource-band-coverage { font-size: .85em; font-variant-numeric: tabular-nums; }
 .resource-details .close-details { position: absolute; inset: 0 0 auto auto; }
 .resource-details th, .resource-details td { padding: .14rem .3rem; }
 .resource-details .detail-sort { border: 0; padding: 0; background: transparent; font: inherit; color: inherit; cursor: pointer; }
@@ -178,6 +179,7 @@ p { margin: .75rem 0; }
 .resource-path-dialog h2 { margin: 0 0 .35rem; }
 .resource-path-dialog code { display: block; user-select: text; overflow-wrap: anywhere; margin-bottom: .7rem; }
 .resource-path-rankings .resource-band th { position: sticky; inset-inline-start: 0; z-index: 1; }
+.resource-band th { white-space: normal; }
 .resource-details .resource-band td { font-weight: 600; background: color-mix(in srgb, CanvasText 7%, Canvas); }
 .details-notice { padding: .32rem .45rem; margin: .12rem 0 .25rem; border-radius: .2rem;
     background: color-mix(in srgb, CanvasText 6%, Canvas); }

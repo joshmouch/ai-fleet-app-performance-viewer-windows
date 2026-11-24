@@ -348,7 +348,7 @@
         var table = ResourceDetailTable.Rank(metrics, rows, (row, column) => row.Value(column, guestOnly),
             row => new ResourceDetailRow(ResourceDetailTable.Identity(row.Key.Process, row.Key.Pid, row.Machine, paths ? row.Key : null),
                 Enumerable.Range(0, metrics.Length).Select(column => row.Value(column, guestOnly)).ToArray()), sort, limit,
-            string.IsNullOrEmpty(note) ? null : note, paths: paths, fallback: "guest");
+            string.IsNullOrEmpty(note) ? null : note, paths: paths);
         string? summary = hostSum is { } host ? DiskSummary("Host", host) : null;
         if (guestSum is { } guestTotals)
             summary = summary == null ? DiskSummary("Guest files", guestTotals)

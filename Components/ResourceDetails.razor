@@ -6,6 +6,22 @@
         @if (Close.HasDelegate) { <h3 class="resource-detail-heading">@Node.Name details</h3> }
         <button type="button" aria-pressed="@(!Paths ? "true" : "false")" @onclick="() => Show(false)">Processes</button>
         @if (Disk) { <button type="button" aria-pressed="@(Paths ? "true" : "false")" @onclick="() => Show(true)">Paths</button> }
+        @if (BandPercent > 0 && data?.SortMetric is { } sort && Data.Rows.Length > 0)
+        {
+            <span class="resource-band-coverage"
+                title="Bands use the sorted column's total across all rows in this scope, including rows hidden by search or Top rows. Each row stays whole.">
+                @if (Data.BandIssue is string issue) { @issue }
+                else
+                {
+                    var basis = sort.BandBasis ?? sort.Label;
+                    @if (Data.TotalWeight > 0)
+                    {
+                        <text>Bands by @basis · @sort.Display(Data.TotalWeight) total · @ResourceDetailTable.FormatShare(Data.ShownShare) shown · @ResourceDetailTable.FormatShare(1 - Data.ShownShare) outside list</text>
+                    }
+                    else { <text>No @basis values for bands</text> }
+                }
+            </span>
+        }
         @if (data?.Summary is string summary)
         {
             <span class="resource-details-summary" title="@(Disk ? "Totals for all matching rows in this scope" : "Guest CPU attribution coverage for this scope")">@summary</span>
@@ -47,12 +63,14 @@
                     }
                 </tr></thead>
                 <tbody>
-                @foreach (var group in Bands)
+                @foreach (var group in Data.Bands(BandPercent))
                 {
-                    @if (group.Label != null)
+                    @if (group.Start is int start)
                     {
-                        <tr class="resource-band" title="Rows grouped by where their cumulative share starts. Subtotals cover the displayed rows.">
-                            <th colspan="@(Paths ? 2 : labels.Length)" scope="row">@group.Label</th>
+                        <tr class="resource-band" title="The range shows where these rows start in the running total. The actual share is the sum of these rows divided by the scope total.">
+                            <th colspan="@(Paths ? 2 : labels.Length)" scope="row">
+                                @start–@(Math.Min(100, start + BandPercent))% start · @ResourceDetailTable.FormatShare(group.Weight / Data.TotalWeight) actual
+                            </th>
                             @if (Paths) { <td colspan="@(labels.Length - 2)" aria-hidden="true"></td> }
                             @for (int column = 0; column < Data.Metrics.Length; column++)
                             { <td class="num">@Data.Metrics[column].Display(Data.Metrics[column].Subtotal(group.Rows, column))</td> }
@@ -111,23 +129,5 @@
         int version = ++request;
         var next = await Read(Node, Paths);
         if (version == request) data = next;
-    }
-    private sealed record Band(string? Label, ResourceDetailRow[] Rows);
-    private IEnumerable<Band> Bands
-    {
-        get
-        {
-            var data = Data;
-            if (BandPercent <= 0 || data.TotalWeight <= 0) return [new(null, data.Rows)];
-            double consumed = 0;
-            int Bucket(ResourceDetailRow row)
-            {
-                int start = Math.Min(99, (int)(consumed / data.TotalWeight * 100)) / BandPercent * BandPercent;
-                consumed += row.Weight;
-                return start;
-            }
-            return data.Rows.GroupBy(Bucket).Select(g =>
-                new Band($"Starts in {g.Key}–{Math.Min(100, g.Key + BandPercent)}%", g.ToArray())).ToArray();
-        }
     }
 }
