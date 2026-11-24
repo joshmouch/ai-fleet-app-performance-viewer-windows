@@ -6,7 +6,7 @@
         @if (Close.HasDelegate) { <h3 class="resource-detail-heading">@Node.Name details</h3> }
         <button type="button" aria-pressed="@(!Paths ? "true" : "false")" @onclick="() => Show(false)">Processes</button>
         @if (Disk) { <button type="button" aria-pressed="@(Paths ? "true" : "false")" @onclick="() => Show(true)">Paths</button> }
-        @if (Data.Summary is string summary)
+        @if (data?.Summary is string summary)
         {
             <span class="resource-details-summary" title="@(Disk ? "Totals for all matching rows in this scope" : "Guest CPU attribution coverage for this scope")">@summary</span>
         }
@@ -16,11 +16,15 @@
                 title="Close details pane" @onclick="Close">×</button>
         }
     </div>
-    @if (Data.Note is string note)
+    @if (Loading)
+    {
+        <MeasurementNotice Title="@(Paths ? "Loading paths" : "Loading processes")" Loading="true" />
+    }
+    else if (Data.Note is string note)
     {
         <div class="details-notice" role="status">@note</div>
     }
-    @if (Data.Rows.Length > 0)
+    @if (!Loading && Data.Rows.Length > 0)
     {
         var labels = Data.LabelColumns;
         <div class="scroll" tabindex="0" role="region" aria-label="@(Paths ? "Path rankings" : "Process rankings")">
@@ -79,23 +83,34 @@
             </table>
         </div>
     }
-    else if (Data.Note == null) { <div class="details-notice" role="status">No matching measurements</div> }
+    else if (!Loading && Data.Note == null) { <div class="details-notice" role="status">No matching measurements</div> }
 </section>
 
 @code {
     [Parameter, EditorRequired] public ResourceNode Node { get; set; } = default!;
-    [Parameter, EditorRequired] public Func<ResourceNode, bool, ResourceDetailTable> Read { get; set; } = default!;
+    [Parameter, EditorRequired] public Func<ResourceNode, bool, Task<ResourceDetailTable>> Read { get; set; } = default!;
     [Parameter] public bool Disk { get; set; }
     [Parameter] public int BandPercent { get; set; }
     [Parameter] public EventCallback Close { get; set; }
     [Parameter] public EventCallback<string> SortChanged { get; set; }
     private bool Paths;
-    private ResourceDetailTable Data = new([], []);
-    protected override void OnParametersSet() => Data = Read(Node, Paths);
-    private void Show(bool paths)
+    private ResourceDetailTable? data;
+    private ResourceDetailTable Data => data!;
+    private bool Loading => data == null;
+    private int request;
+    protected override Task OnParametersSetAsync() => Refresh();
+    private Task Show(bool paths)
     {
+        if (Paths == paths) return Task.CompletedTask;
         Paths = paths;
-        Data = Read(Node, Paths);
+        data = null;
+        return Refresh();
+    }
+    private async Task Refresh()
+    {
+        int version = ++request;
+        var next = await Read(Node, Paths);
+        if (version == request) data = next;
     }
     private sealed record Band(string? Label, ResourceDetailRow[] Rows);
     private IEnumerable<Band> Bands

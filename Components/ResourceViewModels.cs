@@ -59,6 +59,11 @@ public sealed record ResourceDetailTable(ResourceDetailMetric[] Metrics, Resourc
 
     public static ResourceDetailTable Rank(ResourceDetailMetric[] metrics, IEnumerable<(bool Eligible, ResourceDetailRow Row)> rows,
         string sort, int limit, string? note = null, string? summary = null, bool paths = false, string? fallback = null)
+        => Rank(metrics, rows, (row, column) => row.Values[column], row => row, sort, limit, note, summary, paths, fallback);
+
+    public static ResourceDetailTable Rank<TRow>(ResourceDetailMetric[] metrics, IEnumerable<(bool Eligible, TRow Row)> rows,
+        Func<TRow, int, double?> value, Func<TRow, ResourceDetailRow> display, string sort, int limit,
+        string? note = null, string? summary = null, bool paths = false, string? fallback = null)
     {
         int column = Array.FindIndex(metrics, metric => metric.Key == sort && metric.Sortable);
         if (column < 0) column = Array.FindIndex(metrics, metric => metric.Sortable);
@@ -66,13 +71,15 @@ public sealed record ResourceDetailTable(ResourceDetailMetric[] Metrics, Resourc
         var weighted = rows.Select(entry =>
         {
             var (eligible, row) = entry;
-            var weight = row.Values[column];
-            if (column == 0 && fallbackColumn >= 0) weight ??= row.Values[fallbackColumn];
-            return (Eligible: eligible, Row: row with { Weight = weight.GetValueOrDefault() });
+            var weight = value(row, column);
+            if (column == 0 && fallbackColumn >= 0) weight ??= value(row, fallbackColumn);
+            return (Eligible: eligible, Row: row, Weight: weight.GetValueOrDefault());
         }).ToArray();
-        var bandTotal = metrics[column].CanAdd(weighted.Select(entry => entry.Row), column)
-            ? weighted.Sum(entry => entry.Row.Weight) : 0;
-        return new(metrics, weighted.Where(entry => entry.Eligible).Select(entry => entry.Row).OrderByDescending(row => row.Weight)
-            .Take(Math.Clamp(limit, 1, 100)).ToArray(), bandTotal, note, summary, paths, metrics[column].Key);
+        var metric = metrics[column];
+        var bandTotal = metric.Denominator == null || metric.CanAdd(weighted.Select(entry => display(entry.Row)), column)
+            ? weighted.Sum(entry => entry.Weight) : 0;
+        var visible = weighted.Where(entry => entry.Eligible).OrderByDescending(entry => entry.Weight)
+            .Take(Math.Clamp(limit, 1, 100)).Select(entry => display(entry.Row) with { Weight = entry.Weight }).ToArray();
+        return new(metrics, visible, bandTotal, note, summary, paths, metric.Key);
     }
 }

@@ -81,7 +81,7 @@
     [Parameter, EditorRequired] public ResourceNode Node { get; set; } = default!;
     [Parameter, EditorRequired] public Func<ResourceNode, ResourceCardEntry[]> VisibleChildren { get; set; } = default!;
     [Parameter, EditorRequired] public Func<string, IReadOnlyList<ResourcePoint>> ReadHistory { get; set; } = default!;
-    [Parameter, EditorRequired] public Func<ResourceNode, bool, ResourceDetailTable> ReadDetails { get; set; } = default!;
+    [Parameter, EditorRequired] public Func<ResourceNode, bool, Task<ResourceDetailTable>> ReadDetails { get; set; } = default!;
     [Parameter] public string? SelectedId { get; set; }
     [Parameter] public EventCallback<string?> Selection { get; set; }
     [Parameter] public EventCallback<string> Scope { get; set; }

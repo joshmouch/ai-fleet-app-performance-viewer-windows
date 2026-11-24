@@ -63,6 +63,8 @@
     private readonly HashSet<string> closedPanes = new(StringComparer.Ordinal);
     private readonly Dictionary<string, List<ResourcePoint>> points = new(StringComparer.Ordinal);
     private readonly Dictionary<string, ResourceCardEntry[]> diskCards = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, DiskProjection> diskProjections = new(StringComparer.Ordinal);
+    private DiskProjectionInput? projectionInput;
     private ResourceNode root = ResourceTree.Build(false, [], (_, _) => false, false);
     private ResourceNode scope = default!;
     private ViewNotice? Notice;
@@ -230,9 +232,12 @@
         return DiskActivity.Average(intervals);
     }
     private IReadOnlyList<ResourcePoint> ReadHistory(string id) => Archive.Active ? [] : points.GetValueOrDefault(id) ?? [];
-    private bool Matches(string? text) => Filter.Length == 0 || text?.Contains(Filter, StringComparison.OrdinalIgnoreCase) == true;
+    private static bool Matches(string? text, string filter) => filter.Length == 0 ||
+        text?.Contains(filter, StringComparison.OrdinalIgnoreCase) == true;
+    private bool Matches(string? text) => Matches(text, Filter);
 
-    private ResourceDetailTable ReadDetails(ResourceNode node, bool paths) => Disk ? ReadDisk(node, paths) : ReadCpu(node);
+    private Task<ResourceDetailTable> ReadDetails(ResourceNode node, bool paths) =>
+        Disk ? ReadDisk(node, paths) : Task.FromResult(ReadCpu(node));
     private IEnumerable<PerformanceWindow> FramesFor(ResourceNode node) => Frames.Where(frame =>
         node.Host == null || string.Equals(frame.Host, node.Host, StringComparison.OrdinalIgnoreCase));
     private static string Format(double? value) => value?.ToString("N2", CultureInfo.CurrentCulture) ?? "—";
@@ -288,31 +293,34 @@
         return combined;
     }
 
-    private ResourceDetailTable ReadDisk(ResourceNode node, bool paths)
+    private async Task<ResourceDetailTable> ReadDisk(ResourceNode node, bool paths)
     {
         bool guestOnly = node.Kind == ResourceKind.GuestDevice || Archive.Active && Archive.Window?.Layer == "guest-logical";
         var metrics = ResourceDetailTable.DiskMetrics(guestOnly);
+        var sort = guestOnly && Sort == "impact" ? "guest" : Sort;
+        var limit = Preferences.MaxRows;
+        var filter = Filter;
+        var note = Archive.Active ? null : string.Join(" · ", FramesFor(node)
+            .Select(frame => frame.DiskPaths.Status).OfType<string>().Where(status => !string.IsNullOrWhiteSpace(status)).Distinct());
+        var files = await ReadDiskProjection(node, paths).ConfigureAwait(false);
         DiskGuestRate? hostSum = null, guestSum = null;
-        var rows = DiskRows(node, paths).Select(row =>
+        var rows = files.Select(row =>
         {
             var (machine, key, physical, guest) = row;
-            bool eligible = Matches(key.Process) || Matches(key.Path) || Matches(machine);
+            bool eligible = Matches(key.Process, filter) || Matches(key.Path, filter) || Matches(machine, filter);
             if (eligible && physical is { } hostRate) hostSum = hostSum.GetValueOrDefault() + hostRate;
             if (eligible && guest is { } guestRate) guestSum = guestSum.GetValueOrDefault() + guestRate;
-            var io = guestOnly ? guest : physical;
-            var values = new ResourceDetailRow(ResourceDetailTable.Identity(key.Process, key.Pid, machine, paths ? key : null),
-                [physical?.Total, guest?.Total, io?.Read, io?.Write, io?.Reads, io?.Writes, io?.Reads + io?.Writes]);
-            return (Eligible: eligible, Row: values);
-        }).ToArray();
+            return (Eligible: eligible, Row: row);
+        });
+        var table = ResourceDetailTable.Rank(metrics, rows, (row, column) => row.Value(column, guestOnly),
+            row => new ResourceDetailRow(ResourceDetailTable.Identity(row.Key.Process, row.Key.Pid, row.Machine, paths ? row.Key : null),
+                Enumerable.Range(0, metrics.Length).Select(column => row.Value(column, guestOnly)).ToArray()), sort, limit,
+            string.IsNullOrEmpty(note) ? null : note, paths: paths, fallback: "guest");
         string? summary = hostSum is { } host ? DiskSummary("Host", host) : null;
         if (guestSum is { } guestTotals)
             summary = summary == null ? DiskSummary("Guest files", guestTotals)
                 : $"{summary} · Guest files {Format(guestTotals.Total)} MiB/s";
-        var note = Archive.Active ? null : string.Join(" · ", FramesFor(node)
-            .Select(frame => frame.DiskPaths.Status).OfType<string>().Where(status => !string.IsNullOrWhiteSpace(status)).Distinct());
-        return ResourceDetailTable.Rank(metrics, rows, guestOnly && Sort == "impact" ? "guest" : Sort, Preferences.MaxRows,
-            string.IsNullOrEmpty(note) ? null : note,
-            summary, paths, fallback: "guest");
+        return table with { Summary = summary };
     }
 
     private static string DiskSummary(string basis, DiskGuestRate rate) =>
@@ -320,12 +328,60 @@
         + $"Write {Format(rate.Write)} MiB/s / {Count(rate.Writes)} ops · "
         + $"Total {Format(rate.Total)} MiB/s / {Count(rate.Reads + rate.Writes)} ops";
 
-    private record FileRow(string Machine, FileIoKey Key, DiskGuestRate? Physical, DiskGuestRate? Guest);
-    private IEnumerable<FileRow> DiskRows(ResourceNode node, bool paths)
+    private sealed record FileRow(string Machine, FileIoKey Key, DiskGuestRate? Physical, DiskGuestRate? Guest)
     {
-        if (Archive.Active)
+        public double? Value(int column, bool guestOnly)
         {
-            if (Archive.Window is { } stored)
+            var io = guestOnly ? Guest : Physical;
+            return column switch
+            {
+                0 => Physical?.Total, 1 => Guest?.Total, 2 => io?.Read, 3 => io?.Write,
+                4 => io?.Reads, 5 => io?.Writes, 6 => io?.Reads + io?.Writes,
+                _ => throw new ArgumentOutOfRangeException(nameof(column))
+            };
+        }
+    }
+
+    private sealed record DiskProjectionInput(SourceWindow[] Sources, PerformanceWindow[] Frames,
+        ViewerPreferences Visibility, HistorySelection Archive);
+    private sealed record DiskBatch(DiskIoRow[] Rows, double? Seconds);
+    private sealed class DiskProjection(Task<DiskBatch[]> batches)
+    {
+        private readonly Lazy<Task<FileRow[]>> paths = new(() => GroupBatches(batches, true));
+        private readonly Lazy<Task<FileRow[]>> processes = new(() => GroupBatches(batches, false));
+        public Task<FileRow[]> Read(bool byPath) => byPath ? paths.Value : processes.Value;
+        private static Task<FileRow[]> GroupBatches(Task<DiskBatch[]> batches, bool byPath) =>
+            Task.Run(async () => (await batches).SelectMany(batch => Group(batch.Rows, batch.Seconds, byPath)).ToArray());
+    }
+
+    private Task<FileRow[]> ReadDiskProjection(ResourceNode node, bool paths)
+    {
+        if (projectionInput is not { } input || !ReferenceEquals(input.Sources, Sources) || input.Archive != Archive ||
+            input.Visibility.Host != Preferences.Host || input.Visibility.AllDisks != Preferences.AllDisks ||
+            input.Visibility.Guests != Preferences.Guests || !input.Visibility.HiddenGuests.SetEquals(Preferences.HiddenGuests))
+        {
+            input = new(Sources, Frames.ToArray(), new ViewerPreferences
+            {
+                Host = Preferences.Host, AllDisks = Preferences.AllDisks, Guests = Preferences.Guests,
+                HiddenGuests = new(Preferences.HiddenGuests)
+            }, Archive);
+            projectionInput = input;
+            diskProjections.Clear();
+        }
+        if (!diskProjections.TryGetValue(node.Id, out var projection))
+        {
+            var snapshot = input;
+            projection = new(Task.Run(() => ReadDiskBatches(snapshot, node).ToArray()));
+            diskProjections.Add(node.Id, projection);
+        }
+        return projection.Read(paths);
+    }
+
+    private static IEnumerable<DiskBatch> ReadDiskBatches(DiskProjectionInput input, ResourceNode node)
+    {
+        if (input.Archive.Active)
+        {
+            if (input.Archive.Window is { } stored)
             {
                 var seconds = stored.DurationSeconds();
                 bool physical = stored.Layer == "physical";
@@ -334,28 +390,30 @@
                     var row = r.ToDiskRow(physical ? stored.Host : stored.Scope);
                     return physical ? row : row with { Guest = DiskGuestRate.From(row.Totals, seconds) };
                 });
-                foreach (var row in Group(entries, physical ? seconds : null, paths)) yield return row;
+                yield return new(entries.ToArray(), physical ? seconds : null);
             }
             yield break;
         }
-        foreach (var frame in FramesFor(node))
+        foreach (var frame in input.Frames.Where(frame => node.Host == null ||
+            string.Equals(frame.Host, node.Host, StringComparison.OrdinalIgnoreCase)))
         {
             if (node.Kind == ResourceKind.GuestDevice)
             {
                 foreach (var guest in ResourceDiskScope.DeviceWindows(frame, node))
-                    foreach (var row in Group(GuestFiles(guest), null, paths)) yield return row;
+                    yield return new(GuestFiles(guest).ToArray(), null);
                 continue;
             }
             if (frame.DiskPaths.Seconds <= 0) continue;
-            var entries = ResourceDiskScope.Rows(frame, node, target => Preferences.IncludesGuest(frame.Host, target), Preferences.AllDisks);
-            foreach (var row in Group(entries, frame.DiskPaths.Seconds, paths)) yield return row;
+            var entries = ResourceDiskScope.Rows(frame, node, target => input.Visibility.IncludesGuest(frame.Host, target),
+                input.Visibility.AllDisks);
+            yield return new(entries, frame.DiskPaths.Seconds);
         }
         // A standalone guest source has no Windows backing-file identity.
         if (node.Kind is not (ResourceKind.System or ResourceKind.Host)) yield break;
-        foreach (var source in Sources.Where(s => s.Selected && s.GuestOf != null && s.GuestDisk != null &&
-            (node.Host == null || node.Host == s.GuestOf) && Preferences.IncludesGuest(s.GuestOf!, s.Name) &&
-            !Frames.Any(w => w.Host == s.GuestOf && (w.Guests?.Disks ?? []).Any(d => d.Target == s.Name && d.Files.Length > 0))))
-            foreach (var row in Group(GuestFiles(source.GuestDisk!), null, paths)) yield return row;
+        foreach (var source in input.Sources.Where(s => s.Selected && s.GuestOf != null && s.GuestDisk != null &&
+            (node.Host == null || node.Host == s.GuestOf) && input.Visibility.IncludesGuest(s.GuestOf!, s.Name) &&
+            !input.Frames.Any(w => w.Host == s.GuestOf && (w.Guests?.Disks ?? []).Any(d => d.Target == s.Name && d.Files.Length > 0))))
+            yield return new(GuestFiles(source.GuestDisk!).ToArray(), null);
     }
     private static IEnumerable<DiskIoRow> GuestFiles(GuestDiskWindow guest) => guest.Seconds <= 0 ? [] : guest.Files.Select(f =>
         new DiskIoRow(f.File, guest.Machine, default, DiskGuestRate.From(f.Totals, guest.Seconds)));
