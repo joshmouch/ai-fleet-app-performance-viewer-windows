@@ -6,9 +6,9 @@
 
 @if (sources.Length > 0)
 {
-    <div class="toolbar">
-        <label>Disk source
-            <select aria-label="Disk source" value="@source" @onchange="Choose">
+    <div class="history-window-controls">
+        <label>Disk sample
+            <select value="@source" @onchange="Choose">
                 <option value="">Live</option>
                 @foreach (var name in sources) { <option value="@name">@name</option> }
             </select>
