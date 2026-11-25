@@ -60,7 +60,6 @@
     private string? localScopeId;
     private (string Host, int Disk, string Path)? folderScope;
     private ResourceScope? appliedScope;
-    private DiskGrouping previousGrouping;
     private string previousHost = "";
     private bool previousAllDisks;
     private bool wasArchived;
@@ -104,13 +103,16 @@
         {
             if (Archive.Active) return null;
             if (Filter.Length > 0) return "No cards match the current search and activity filters.";
-            if (Disk && Preferences.Grouping == DiskGrouping.Folders && scope.Kind is ResourceKind.Disk or ResourceKind.Folder)
+            if (Disk && Preferences.DiskLayout.VirtualDisksOnly)
+                return "No virtual disk files match the current scope and activity filters.";
+            if (Disk && Preferences.DiskLayout.BusyFolders && (scope.Kind == ResourceKind.Folder ||
+                scope.Kind == ResourceKind.Disk && !Preferences.DiskLayout.GuestDisks))
                 return "No folders meet the host I/O cutoff.";
             if (scope.Id == sharedRoot.Id && SharedScope.Target != null && scope.Reading == default && scope.Children.Length == 0)
                 return Disk ? "No disk measurements for this guest yet." : "No CPU measurements for this guest yet.";
             if (!Disk || scope.Kind is not (ResourceKind.System or ResourceKind.Host)) return null;
             if (scope.Children.Length > 0) return "No cards match the current activity filters.";
-            return Preferences.Grouping == DiskGrouping.Vhdx ? "No VHDX measurements yet." : "No per-disk measurements available.";
+            return "No per-disk measurements available.";
         }
     }
     private IEnumerable<PerformanceWindow> Frames => Sources.Where(s => s.Selected && s.Frame != null &&
@@ -121,12 +123,11 @@
         if (!Visible) return;
         bool populationChanged = previousHost != Preferences.Host || Disk && previousAllDisks != Preferences.AllDisks;
         if (populationChanged) points.Clear();
-        if (populationChanged || Disk && (previousGrouping != Preferences.Grouping || wasArchived != Archive.Active) ||
+        if (populationChanged || Disk && wasArchived != Archive.Active ||
             !ReferenceEquals(appliedScope, SharedScope))
         {
             previousHost = Preferences.Host;
             previousAllDisks = Preferences.AllDisks;
-            previousGrouping = Preferences.Grouping;
             wasArchived = Archive.Active;
             appliedScope = SharedScope;
             localScopeId = null;
@@ -139,9 +140,7 @@
     {
         var frames = Frames.ToArray();
         Notice = ReadNotice(frames.Length > 0);
-        var grouping = Preferences.Grouping == DiskGrouping.Folders && SharedScope.Target != null
-            ? DiskGrouping.Storage : Preferences.Grouping;
-        root = ResourceTree.Build(Disk, frames, Preferences.IncludesGuest, Preferences.AllDisks, grouping,
+        root = ResourceTree.Build(Disk, frames, Preferences.IncludesGuest, Preferences.AllDisks, Preferences.DiskLayout,
             Preferences.ShowLogicalProcessors, new(Preferences.MinFolderPercent, Filter, folderScope));
         if (Disk && Archive.Active)
         {
@@ -155,7 +154,11 @@
         nodes.TryAdd(sharedRoot.Id, sharedRoot);
         scope = localScopeId == null ? sharedRoot :
             ResourceTree.Walk(sharedRoot).FirstOrDefault(node => node.Id == localScopeId) ?? sharedRoot;
-        if (scope.Id == sharedRoot.Id) localScopeId = null;
+        if (scope.Id == sharedRoot.Id)
+        {
+            localScopeId = null;
+            folderScope = null;
+        }
         if (selected != null && !nodes.ContainsKey(selected)) selected = null;
         if (Archive.Active || frames.Length == 0) return;
         var latest = frames.Max(frame => Disk ? frame.DiskPaths.End : frame.CpuEnd);
@@ -246,7 +249,8 @@
         (ResourceNode Node, ResourceReading Reading, bool Visible) Visit(ResourceNode node, bool parentMatches)
         {
             bool matches = parentMatches || node.Kind != ResourceKind.System && (Matches(node.Name) || Matches(node.Type));
-            var children = node.Children.Select(child => Visit(child, matches)).Where(child => child.Visible).ToArray();
+            var children = ResourceTree.DiskChildren(node, root, Preferences.DiskLayout)
+                .Select(child => Visit(child, matches)).Where(child => child.Visible).ToArray();
             if (children.Length > 0)
             {
                 diskCards[node.Id] = children.OrderByDescending(child => child.Reading.Active)
@@ -258,7 +262,8 @@
             }
             var reading = node.Reading;
             bool passes = DiskActivity.MeetsCutoffs(reading, Preferences.MinDiskActivity, Preferences.MinRate);
-            return (node, reading, node.Kind == ResourceKind.Folder || children.Length > 0 || passes && matches);
+            bool focusedHost = node.Kind == ResourceKind.Host && Preferences.DiskLayout.VirtualDisksOnly;
+            return (node, reading, node.Kind == ResourceKind.Folder || children.Length > 0 || passes && matches && !focusedHost);
         }
     }
 

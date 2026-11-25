@@ -18,14 +18,10 @@
                     <button type="button" aria-pressed="@Pressed(preferences.ShowCpu)" @onclick="ToggleCpu">CPU</button>
                     <button type="button" aria-pressed="@Pressed(preferences.ShowDisk)" @onclick="ToggleDisk">Disk</button>
                 </div>
-                @if (preferences.ShowDisk)
+                @if (preferences.ShowDisk && !archive.Active)
                 {
-                    <select aria-label="Group Disk cards by" title="Group Disk cards by" @bind="preferences.Grouping" @bind:after="Save">
-                        <option value="@DiskGrouping.Storage">Storage</option>
-                        <option value="@DiskGrouping.Folders">Folders</option>
-                        <option value="@DiskGrouping.Workloads">Workloads</option>
-                        <option value="@DiskGrouping.Vhdx">VHDX</option>
-                    </select>
+                    <button type="button" aria-expanded="@Pressed(diskLayoutOpen)" aria-controls="disk-layout"
+                        @onclick="ToggleDiskLayout">Arrange Disk cards @(diskLayoutOpen ? "▴" : "▾")</button>
                 }
                 <input type="search" aria-label="Filter resources, processes and paths" placeholder="Filter resources, processes, paths"
                     @bind="filter" @bind:event="oninput" />
@@ -41,6 +37,33 @@
                 }
                 <button type="button" aria-expanded="@Pressed(settings)" @onclick="ToggleSettings">Settings @(settings ? "▴" : "▾")</button>
             </div>
+            @if (preferences.ShowDisk && !archive.Active)
+            {
+                <div class="disk-layout" id="disk-layout" hidden="@(!diskLayoutOpen)">
+                    <fieldset disabled="@preferences.DiskLayout.VirtualDisksOnly">
+                        <legend>Start with</legend>
+                        <label><input type="radio" name="disk-hierarchy" checked="@ByVolumes"
+                            @onchange="() => ChangeDiskLayout(preferences.DiskLayout with { Hierarchy = DiskHierarchy.Volumes })" /> Volumes and mounts</label>
+                        <label><input type="radio" name="disk-hierarchy" checked="@(!ByVolumes)"
+                            @onchange="() => ChangeDiskLayout(preferences.DiskLayout with { Hierarchy = DiskHierarchy.Environments })" /> Windows and guests</label>
+                    </fieldset>
+                    <fieldset disabled="@(!ByVolumes || preferences.DiskLayout.VirtualDisksOnly)">
+                        <legend>Inside volumes</legend>
+                        <label><input type="checkbox" checked="@preferences.DiskLayout.BusyFolders"
+                            @onchange="e => ChangeDiskLayout(preferences.DiskLayout with { BusyFolders = (bool)e.Value! })" /> Busy folders</label>
+                        <label><input type="checkbox" checked="@preferences.DiskLayout.GuestDisks"
+                            @onchange="e => ChangeDiskLayout(preferences.DiskLayout with { GuestDisks = (bool)e.Value! })" /> VM and WSL disks</label>
+                    </fieldset>
+                    <fieldset>
+                        <legend>Show cards for</legend>
+                        <label><input type="radio" name="disk-card-filter" checked="@(!preferences.DiskLayout.VirtualDisksOnly)"
+                            @onchange="() => ChangeDiskLayout(preferences.DiskLayout with { VirtualDisksOnly = false })" /> All activity</label>
+                        <label><input type="radio" name="disk-card-filter" checked="@preferences.DiskLayout.VirtualDisksOnly"
+                            @onchange="() => ChangeDiskLayout(preferences.DiskLayout with { VirtualDisksOnly = true })" /> Virtual disk files only</label>
+                    </fieldset>
+                    <p class="disk-layout-preview" aria-live="polite">@DiskLayoutPreview</p>
+                </div>
+            }
             @if (settingsOpened)
             {
                 <div class="toolbar advanced-settings" hidden="@(!settings)">
@@ -66,7 +89,7 @@
                     {
                         <label>Min active % <input type="number" min="0" max="100" @bind="preferences.MinDiskActivity" @bind:after="Save" /></label>
                         <label>Min I/O MiB/s <input type="number" min="0" step="0.1" @bind="preferences.MinRate" @bind:after="Save" /></label>
-                        @if (preferences.Grouping == DiskGrouping.Folders)
+                        @if (ByVolumes && preferences.DiskLayout.BusyFolders)
                         {
                             <label title="Minimum share of this host’s captured reads and writes for a folder card">
                                 Min folder host I/O % <input type="number" min="0" max="100" step="0.1" @bind="preferences.MinFolderPercent" @bind:after="Save" />
@@ -111,12 +134,22 @@
     [Parameter] public SourceWindow[] Sources { get; set; } = [];
     private const string PreferenceKey = "ai-fleet-performance-viewer.preferences.v1";
     private ViewerPreferences preferences = new();
-    private bool ready, settings, settingsOpened, timelines;
+    private bool ready, settings, settingsOpened, timelines, diskLayoutOpen;
     private string? preferenceError;
     private string filter = "";
     private ResourceScope sharedScope = new();
     private HistorySelection archive = new(false, null);
     private bool Combined => preferences.ShowCpu && preferences.ShowDisk;
+    private bool ByVolumes => preferences.DiskLayout.Hierarchy == DiskHierarchy.Volumes;
+    private string DiskLayoutPreview => preferences.DiskLayout switch
+    {
+        { VirtualDisksOnly: true } => "Current scope → Virtual disk file → Guest device",
+        { Hierarchy: DiskHierarchy.Environments } => "Windows files   |   Unattributed I/O   |   Guest → Virtual disk file → Guest device",
+        { BusyFolders: true, GuestDisks: true } => "Volume → Folder → Subfolder   |   Volume → VM or WSL → Virtual disk file → Guest device",
+        { BusyFolders: true } => "Volume → Folder → Subfolder",
+        { GuestDisks: true } => "Volume → VM or WSL → Virtual disk file → Guest device",
+        _ => "Volumes and mounts"
+    };
     private IEnumerable<string> HostNames => Sources.Select(source => source.Frame?.Host ?? source.GuestOf)
         .Append(preferences.Host).OfType<string>().Where(name => name.Length != 0).Distinct(StringComparer.OrdinalIgnoreCase).Order();
     private IEnumerable<ViewerPreferences.Guest> GuestTargets => Sources.Where(source => source.Selected).SelectMany(source =>
@@ -133,11 +166,7 @@
         try
         {
             var json = await Browser.InvokeAsync<string?>("localStorage.getItem", PreferenceKey);
-            if (json != null)
-            {
-                var saved = JsonSerializer.Deserialize<ViewerPreferences>(json);
-                if (saved is { Host: not null, HiddenGuests: not null } && Enum.IsDefined(saved.Grouping)) preferences = saved;
-            }
+            if (json != null && ViewerPreferences.Load(json) is { } saved) preferences = saved;
         }
         catch (JSDisconnectedException) { return; }
         catch (Exception e) when (e is JSException or JsonException) { preferenceError = "Saved settings could not be loaded."; }
@@ -160,7 +189,9 @@
     private Task ToggleDisk() { preferences.ShowDisk = !preferences.ShowDisk; return Save(); }
     private void ChangeScope(ResourceScope scope) => sharedScope = scope;
     private Task ChangeHost() { sharedScope = new(); return Save(); }
-    private void ToggleSettings() { settings = !settings; settingsOpened = true; }
+    private void ToggleSettings() { settings = !settings; settingsOpened = true; diskLayoutOpen = false; }
+    private void ToggleDiskLayout() { diskLayoutOpen = !diskLayoutOpen; settings = false; }
+    private Task ChangeDiskLayout(DiskCardLayout layout) { preferences.DiskLayout = layout; return Save(); }
     private Task SetGuest(ViewerPreferences.Guest target, bool enabled)
     {
         if (enabled) preferences.HiddenGuests.Remove(target); else preferences.HiddenGuests.Add(target);

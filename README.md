@@ -30,11 +30,11 @@ CPU and Disk details start with Process, PID, Environment, host impact, and gues
 
 CPU guest cards show the entire VM's measured share of host capacity. Where the VM has a matching Windows `vmmem` process, the card also shows its separately measured CPU time for comparison. Process rows use the guest samples to attribute that VM total, and the CPU details report how much remained unattributed. WSL has one shared measured VM total, with attributed CPU shown separately for sampled distributions.
 
-Use the grouping selector beside Disk to change how its cards are organized:
+Open **Arrange Disk cards** beside the CPU and Disk buttons to choose a hierarchy and preview it:
 
-- **Storage** shows the host mount or disk, the owning VM or WSL distribution, the VHDX, and the guest device.
-- **Workloads** shows separate cards for named Windows file I/O, unattributed I/O, and each VM or WSL distribution. A guest's VHDX files stay together across host volumes. A VHDX with no known owner stays available as a standalone card.
-- **VHDX** goes directly to the backing files and their guest devices.
+- **Start with → Volumes and mounts** shows host volumes. **Inside volumes** lets you independently show **Busy folders** and **VM and WSL disks**. The guest branch nests the guest owner, then each VHDX and its guest devices.
+- **Start with → Windows and guests** shows separate cards for Windows file I/O, unattributed I/O, and each VM or WSL distribution. A guest's VHDX files stay together across host volumes. A VHDX with no known owner stays available as a standalone card.
+- **Show cards for → Virtual disk files only** shows the backing files and their guest devices directly within the current scope. Overview totals and details retain that scope. Switch back to **All activity** to restore the hierarchy and branches.
 
 All groupings use the same system totals. A VHDX's Processes and Paths include guest activity tied to that backing file. They report guest logical I/O separately from measured Windows read and write rates.
 
@@ -89,7 +89,7 @@ The shell and launcher declare their own versions in their project files. Each m
 - Right-click a process or path row and choose **Copy row** to copy its displayed values with their column labels.
 - On **CPU**, **Host CPU** ranks Windows processes and guests against host CPU capacity. Guest impact is the measured VM CPU budget apportioned by the guest process's share of busy CPU. **Guest CPU share** shows that share on its own. WSL distros share one VM CPU budget. A guest with no usable host budget can still show guest CPU usage. CPU chart segments show Windows, all guests, and hypervisor overhead when Hyper-V counters are available.
 - On **Disk**, live Windows file rates cover the time since the previous sample. The details header shows the sample length, normally about 10 seconds. The graph retains up to 60 sample points. Device counters provide active time and their own rates. **Guest MiB/s** uses the guest's measurement window and includes cached I/O. Read and write rates and operation counts retain unmatched host I/O.
-- Choose **Folders** in **Group Disk cards by** to see busy folders inside their volume cards. Double-click a folder or use its scope button to see its subfolders, timeline, and details. **Min folder host I/O %** defaults to 1%. A folder appears when its captured reads plus writes, including all subfolders, exceed that share of its Windows host's captured bytes in the same sample. **Paths** and **Processes** still rank individual rows and use the configured percentage bands.
+- Enable **Busy folders** under **Inside volumes** to see busy folders inside their volume cards. Double-click a folder or use its scope button to see its subfolders, timeline, and details. **Min folder host I/O %** defaults to 1%. A folder appears when its captured reads plus writes, including all subfolders, exceed that share of its Windows host's captured bytes in the same sample. **Paths** and **Processes** still rank individual rows and use the configured percentage bands.
 - **Disk filters** control which cards are shown and how they are ranked. VHDX cards are on by default. VHDX cards use the transfer threshold because active time is available only for Windows disk counters. Card thresholds apply to the cards. Disk scope applies to the overview and unselected file tables. Mounts + Spaces covers mounted disks and Storage Spaces virtual disks. All disks includes backing-drive requests, which can overlap virtual disk traffic and may have no file key. The status tooltip breaks down unresolved bytes and reports traffic outside the scope.
 
 Publish with the .NET 10 SDK on Windows.

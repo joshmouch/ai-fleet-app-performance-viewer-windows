@@ -1,7 +1,10 @@
 #nullable enable
 
 public enum ResourceKind { System, Host, CpuGroup, Processor, Disk, WindowsIo, UnattributedIo, VirtualMachine, GuestCpuDistribution, VirtualDisk, GuestDevice, Folder }
-public enum DiskGrouping { Storage, Workloads, Vhdx, Folders }
+public enum DiskHierarchy { Volumes, Environments }
+
+public sealed record DiskCardLayout(DiskHierarchy Hierarchy = DiskHierarchy.Volumes, bool BusyFolders = true,
+    bool GuestDisks = true, bool VirtualDisksOnly = false);
 
 public sealed record DiskFolderView(double MinimumPercent = DiskActivity.DefaultFolderCutoff, string Filter = "",
     (string Host, int Disk, string Path)? Open = null);
@@ -24,12 +27,12 @@ public static class ResourceTree
     private static readonly StringComparer PathComparer = StringComparer.OrdinalIgnoreCase;
 
     public static ResourceNode Build(bool disk, IEnumerable<PerformanceWindow> frames,
-        Func<string, string, bool> includesGuest, bool includeAllDisks, DiskGrouping diskGrouping = DiskGrouping.Storage,
+        Func<string, string, bool> includesGuest, bool includeAllDisks, DiskCardLayout? diskLayout = null,
         bool showLogicalProcessors = true, DiskFolderView? folderView = null)
     {
         var sources = frames.OrderBy(w => w.Host, PathComparer).ToArray();
         var hosts = sources.Select(w => disk
-            ? DiskHost(w, includesGuest, includeAllDisks, diskGrouping, folderView)
+            ? DiskHost(w, includesGuest, includeAllDisks, diskLayout ?? new(), folderView)
             : CpuHost(w, includesGuest, showLogicalProcessors)).ToArray();
         var capacity = sources.Select(frame => frame.Cpu.LogicalProcessors).ToArray();
         var reading = disk ? DiskTotal(hosts) : new ResourceReading(
@@ -47,6 +50,24 @@ public static class ResourceTree
         foreach (var child in node.Children)
             foreach (var descendant in Walk(child))
                 yield return descendant;
+    }
+
+    public static IEnumerable<ResourceNode> DiskChildren(ResourceNode node, ResourceNode root, DiskCardLayout layout)
+    {
+        if (!layout.VirtualDisksOnly)
+            return !layout.GuestDisks && node.Kind == ResourceKind.Disk
+                ? node.Children.Where(child => child.Kind == ResourceKind.Folder) : node.Children;
+
+        if (node.Kind is ResourceKind.VirtualDisk or ResourceKind.GuestDevice ||
+            node.Kind == ResourceKind.System && node.Children.Any(child => child.Kind == ResourceKind.Host))
+            return node.Children;
+
+        var files = node.FolderPath is { } folder
+            ? Walk(root).Where(child => child.Disk == node.Disk && PathComparer.Equals(child.Host, node.Host) &&
+                child.BackingPath is { } path && DiskPathHierarchy.Contains(folder, path))
+            : Walk(node);
+        return files.Where(child => child.Kind == ResourceKind.VirtualDisk)
+            .Select(child => child with { Type = child.Machine });
     }
 
     public static ResourceScope? SharedScope(ResourceNode node) => node.Kind switch
@@ -133,7 +154,7 @@ public static class ResourceTree
     }
 
     private static ResourceNode DiskHost(PerformanceWindow frame, Func<string, string, bool> includesGuest,
-        bool includeAll, DiskGrouping grouping, DiskFolderView? folderView)
+        bool includeAll, DiskCardLayout layout, DiskFolderView? folderView)
     {
         string id = "disk/" + frame.Host;
         var sample = frame.Resources;
@@ -158,12 +179,6 @@ public static class ResourceTree
             string diskId = id + "/" + disk.Number;
             var reading = new ResourceReading(disk.Active, disk.ReadMiB, disk.WriteMiB);
             var diskShare = Share(diskBytes[disk.Number], hostBytes);
-            if (grouping == DiskGrouping.Folders)
-            {
-                var folders = FolderCards(frame, disk, diskId, files[disk.Number], hostBytes, folderView ?? new());
-                return new(diskId, disk.Mounts.FirstOrDefault() ?? disk.Name, disk.Kind, ResourceKind.Disk,
-                    reading, folders, frame.Host, disk.Number, HostShare: diskShare);
-            }
             var virtualDisks = virtualFiles[disk.Number].DistinctBy(file => file.Path, PathComparer);
             var perPath = files[disk.Number].Where(row => row.File.Path.Length > 0).ToLookup(row => row.File.Path, PathComparer);
             ResourceNode Vhdx(VirtualDiskMeasurement file)
@@ -185,20 +200,16 @@ public static class ResourceTree
                     devices, frame.Host, disk.Number, file.Path, file.Target, file.Machine, HostShare: backingShare);
             }
 
+            var backingFiles = virtualDisks.Select(Vhdx).ToArray();
+            var volumeChildren = layout.Hierarchy == DiskHierarchy.Environments ? backingFiles :
+                [.. GroupByMachine(backingFiles, frame.Host, diskId, disk.Number),
+                 .. (layout.BusyFolders ? FolderCards(frame, disk, diskId, files[disk.Number], hostBytes, folderView ?? new()) : [])];
             return new ResourceNode(diskId, disk.Mounts.FirstOrDefault() ?? disk.Name, disk.Kind, ResourceKind.Disk,
-                reading, virtualDisks.Select(Vhdx).ToArray(), frame.Host, disk.Number, HostShare: diskShare);
+                reading, volumeChildren, frame.Host, disk.Number, HostShare: diskShare);
         }).ToArray();
-        var vhdx = disks.SelectMany(disk => disk.Children).ToArray();
-        ResourceNode[] children = grouping switch
-        {
-            DiskGrouping.Workloads => [..WindowsWorkloads(), ..GroupByMachine(vhdx, frame.Host, id + "/workloads", null)],
-            DiskGrouping.Vhdx => vhdx.Select(file => file with { Type = file.Machine }).ToArray(),
-            DiskGrouping.Folders => disks,
-            _ => disks.Select(disk => disk with
-            {
-                Children = GroupByMachine(disk.Children, frame.Host, disk.Id, disk.Disk)
-            }).ToArray()
-        };
+        ResourceNode[] children = layout.Hierarchy == DiskHierarchy.Environments
+            ? [.. WindowsWorkloads(), .. GroupByMachine(disks.SelectMany(disk => disk.Children).ToArray(), frame.Host, id + "/workloads", null)]
+            : disks;
         return new(id, frame.Host, null, ResourceKind.Host, DiskTotal(disks), children, frame.Host,
             HostShare: Share(hostBytes, hostBytes));
 
