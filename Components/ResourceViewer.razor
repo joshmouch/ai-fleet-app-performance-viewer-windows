@@ -22,6 +22,7 @@
                 {
                     <select aria-label="Group Disk cards by" title="Group Disk cards by" @bind="preferences.Grouping" @bind:after="Save">
                         <option value="@DiskGrouping.Storage">Storage</option>
+                        <option value="@DiskGrouping.Folders">Folders</option>
                         <option value="@DiskGrouping.Workloads">Workloads</option>
                         <option value="@DiskGrouping.Vhdx">VHDX</option>
                     </select>
@@ -65,6 +66,12 @@
                     {
                         <label>Min active % <input type="number" min="0" max="100" @bind="preferences.MinDiskActivity" @bind:after="Save" /></label>
                         <label>Min I/O MiB/s <input type="number" min="0" step="0.1" @bind="preferences.MinRate" @bind:after="Save" /></label>
+                        @if (preferences.Grouping == DiskGrouping.Folders)
+                        {
+                            <label title="Minimum share of this host’s captured reads and writes for a folder card">
+                                Min folder host I/O % <input type="number" min="0" max="100" step="0.1" @bind="preferences.MinFolderPercent" @bind:after="Save" />
+                            </label>
+                        }
                         <label>All disks <input type="checkbox" @bind="preferences.AllDisks" @bind:after="Save" /></label>
                     }
                     <label>Max cards per level <input type="number" min="1" max="100" @bind="preferences.MaxCards" @bind:after="Save" /></label>

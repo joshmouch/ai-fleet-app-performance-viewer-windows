@@ -16,6 +16,7 @@ public static class ResourceDiskScope
         var backing = BackingPaths(frame, node, includeAll);
         var files = SelectFiles(frame, node.Disk,
             node.Kind is ResourceKind.VirtualDisk or ResourceKind.VirtualMachine ? backing : null, includeAll)
+            .Where(row => node.FolderPath == null || DiskPathHierarchy.Contains(node.FolderPath, row.File.Path))
             .GroupBy(row => row.File).Select(group => new MeasuredFile(group.Key, DiskIoMerge.Sum(group.Select(row => row.Totals))))
             .ToArray();
         var scoped = frame with { DiskPaths = frame.DiskPaths with { Files = files } };

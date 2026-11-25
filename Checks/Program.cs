@@ -35,23 +35,35 @@ Check(measuredDisk.Disk == 2 && owner.Kind == ResourceKind.VirtualMachine && own
     vhdx.BackingPath == backing.Path && vhdx.Type == null, "storage volume contains the owning VM and its VHDX");
 Check(diskTree.Reading is { Active: 46, Read: 8, Write: 12 } && vhdx.Reading.Active == null,
     "device counters exclude backing layers and VHDX active time stays unavailable");
-DiskPathMeasurement[] directoryFixture =
+DiskFileMeasurement[] directoryFixture =
 [
-    new(host, host, new(4, "System", @"D:\Source\one"), new(1, 2, 3, 4), null),
-    new(host, host, new(8, "node", @"d:\source\installed\one"), new(6, 8, 10, 12), null),
-    new(host, host, new(4, "System", @"D:\Source-backup\one"), new(1, 1), null),
-    new(host, host, new(4, "System", ""), new(1, 1), null),
-    new(host, "guest-one", new(4, "system", "/var/app/one"), new(1, 1), new(9, 18)),
-    new(host, "guest-two", new(4, "system", "/var/app/one"), new(1, 1), new(2, 4))
+    new(2, new(4, "System", @"D:\Source\one"), new() { WriteBytes = 25, Writes = 2 }),
+    new(2, new(8, "node", @"d:\source\installed\one"), new() { ReadBytes = 5, WriteBytes = 20, Reads = 2, Writes = 3 }),
+    new(2, new(4, "System", @"D:\Source-backup\one"), new() { WriteBytes = 5, Writes = 1 }),
+    new(2, new(4, "System", ""), new() { WriteBytes = 10, Writes = 1 }),
+    new(11, new(4, "System", @"C:\mnt\ai-fleet\home\services\one"), new() { WriteBytes = 35, Writes = 2 }),
+    new(71, new(4, "System", @"D:\Source\one"), new() { WriteBytes = 500, Writes = 2 })
 ];
-var directories = DiskPathHierarchy.Rows(directoryFixture, null).ToArray();
-var sourceFolder = directories.Single(row => row.Folder?.Path == @"D:\Source\");
-var insideSource = DiskPathHierarchy.Rows(directoryFixture, sourceFolder.Folder).ToArray();
-Check(directories.Length == 5 && insideSource.Length == 2 &&
-    sourceFolder.Measurement.Physical == new DiskGuestRate(7, 10, 13, 16) &&
-    DiskPathMeasurement.Sum(insideSource.Select(row => row.Measurement)).Physical == sourceFolder.Measurement.Physical &&
-    DiskPathMeasurement.Sum(directories.Select(row => row.Measurement)) == DiskPathMeasurement.Sum(directoryFixture),
-    "folder groups keep unresolved rows, preserve totals at each level and keep guest paths separate");
+var directoryFrame = measured with { Resources = measured.Resources with { Files = directoryFixture,
+    Disks = [.. measured.Resources.Disks, new(11, "Home", "Storage Spaces volume",
+        [@"C:\mnt\ai-fleet\home\", @"C:\Users\administrator\.ai-fleet\"], true, 0, 1, 28)] } };
+ResourceNode FolderTree(double cutoff, string search = "", (string Host, int Disk, string Path)? open = null) =>
+    ResourceTree.Build(true, [directoryFrame], (_, _) => true, false, DiskGrouping.Folders,
+        folderView: new(cutoff, search, open));
+var folderTree = FolderTree(10);
+var sourceFolder = folderTree.Children.Single(node => node.Disk == 2).Children.Single();
+Check(sourceFolder.Kind == ResourceKind.Folder && sourceFolder.FolderPath == @"D:\Source\" &&
+    sourceFolder.HostShare == .5 && sourceFolder.Children.Length == 0 &&
+    folderTree.Children.Single(node => node.Disk == 11).Children.Single().Name == "services",
+    "folder cards hang from their own volume and use captured host share excluding backing drives");
+var scopedTotals = DiskIoMerge.Sum(ResourceDiskScope.Rows(directoryFrame, sourceFolder, _ => true, false).Select(row => row.Totals));
+Check(scopedTotals is { ReadBytes: 5, WriteBytes: 45, Reads: 2, Writes: 5 },
+    "folder details preserve totals for descendants and omit similar sibling paths");
+var expandedSource = FolderTree(10, open: (host, 2, sourceFolder.FolderPath)).Children.Single(node => node.Disk == 2).Children.Single();
+Check(expandedSource.Children.Single() is { Name: "installed", HostShare: .25 } &&
+    FolderTree(30, open: (host, 2, sourceFolder.FolderPath)).Children.Single(node => node.Disk == 2).Children.Single().Children.Length == 0 &&
+    FolderTree(10, search: "installed").Children.Single(node => node.Disk == 2).Children.Single().HostShare == .5,
+    "drilling down keeps folders on the host denominator and search keeps ancestor totals");
 Check(!DiskActivity.MeetsCutoffs(new(0, 0, 0), 0, 0) &&
     !DiskActivity.MeetsCutoffs(new(24, 8, 1), 25, 1) &&
     !DiskActivity.MeetsCutoffs(new(40, 0, .5), 25, 1) &&

@@ -1,7 +1,10 @@
 #nullable enable
 
 public enum ResourceKind { System, Host, CpuGroup, Processor, Disk, WindowsIo, UnattributedIo, VirtualMachine, GuestCpuDistribution, VirtualDisk, GuestDevice, Folder }
-public enum DiskGrouping { Storage, Workloads, Vhdx }
+public enum DiskGrouping { Storage, Workloads, Vhdx, Folders }
+
+public sealed record DiskFolderView(double MinimumPercent = DiskActivity.DefaultFolderCutoff, string Filter = "",
+    (string Host, int Disk, string Path)? Open = null);
 
 public sealed record ResourceScope(string? Host = null, string? Target = null, string? Machine = null)
 {
@@ -14,7 +17,7 @@ public readonly record struct ResourceReading(double? Active = null, double? Rea
 public sealed record ResourceNode(string Id, string Name, string? Type, ResourceKind Kind, ResourceReading Reading,
     ResourceNode[] Children, string? Host = null, int? Disk = null, string? BackingPath = null,
     string? Target = null, string? Machine = null, string? Device = null, double? HostShare = null,
-    DateTimeOffset? MeasuredAt = null);
+    DateTimeOffset? MeasuredAt = null, string? FolderPath = null);
 
 public static class ResourceTree
 {
@@ -22,11 +25,11 @@ public static class ResourceTree
 
     public static ResourceNode Build(bool disk, IEnumerable<PerformanceWindow> frames,
         Func<string, string, bool> includesGuest, bool includeAllDisks, DiskGrouping diskGrouping = DiskGrouping.Storage,
-        bool showLogicalProcessors = true)
+        bool showLogicalProcessors = true, DiskFolderView? folderView = null)
     {
         var sources = frames.OrderBy(w => w.Host, PathComparer).ToArray();
         var hosts = sources.Select(w => disk
-            ? DiskHost(w, includesGuest, includeAllDisks, diskGrouping)
+            ? DiskHost(w, includesGuest, includeAllDisks, diskGrouping, folderView)
             : CpuHost(w, includesGuest, showLogicalProcessors)).ToArray();
         var capacity = sources.Select(frame => frame.Cpu.LogicalProcessors).ToArray();
         var reading = disk ? DiskTotal(hosts) : new ResourceReading(
@@ -130,7 +133,7 @@ public static class ResourceTree
     }
 
     private static ResourceNode DiskHost(PerformanceWindow frame, Func<string, string, bool> includesGuest,
-        bool includeAll, DiskGrouping grouping)
+        bool includeAll, DiskGrouping grouping, DiskFolderView? folderView)
     {
         string id = "disk/" + frame.Host;
         var sample = frame.Resources;
@@ -153,6 +156,14 @@ public static class ResourceTree
         var disks = visible.OrderBy(disk => disk.Mounts.FirstOrDefault() ?? disk.Name, PathComparer).Select(disk =>
         {
             string diskId = id + "/" + disk.Number;
+            var reading = new ResourceReading(disk.Active, disk.ReadMiB, disk.WriteMiB);
+            var diskShare = Share(diskBytes[disk.Number], hostBytes);
+            if (grouping == DiskGrouping.Folders)
+            {
+                var folders = FolderCards(frame, disk, diskId, files[disk.Number], hostBytes, folderView ?? new());
+                return new(diskId, disk.Mounts.FirstOrDefault() ?? disk.Name, disk.Kind, ResourceKind.Disk,
+                    reading, folders, frame.Host, disk.Number, HostShare: diskShare);
+            }
             var virtualDisks = virtualFiles[disk.Number].DistinctBy(file => file.Path, PathComparer);
             var perPath = files[disk.Number].Where(row => row.File.Path.Length > 0).ToLookup(row => row.File.Path, PathComparer);
             ResourceNode Vhdx(VirtualDiskMeasurement file)
@@ -175,14 +186,14 @@ public static class ResourceTree
             }
 
             return new ResourceNode(diskId, disk.Mounts.FirstOrDefault() ?? disk.Name, disk.Kind, ResourceKind.Disk,
-                new(disk.Active, disk.ReadMiB, disk.WriteMiB), virtualDisks.Select(Vhdx).ToArray(), frame.Host, disk.Number,
-                HostShare: Share(diskBytes[disk.Number], hostBytes));
+                reading, virtualDisks.Select(Vhdx).ToArray(), frame.Host, disk.Number, HostShare: diskShare);
         }).ToArray();
         var vhdx = disks.SelectMany(disk => disk.Children).ToArray();
         ResourceNode[] children = grouping switch
         {
             DiskGrouping.Workloads => [..WindowsWorkloads(), ..GroupByMachine(vhdx, frame.Host, id + "/workloads", null)],
             DiskGrouping.Vhdx => vhdx.Select(file => file with { Type = file.Machine }).ToArray(),
+            DiskGrouping.Folders => disks,
             _ => disks.Select(disk => disk with
             {
                 Children = GroupByMachine(disk.Children, frame.Host, disk.Id, disk.Disk)
@@ -201,6 +212,52 @@ public static class ResourceTree
             yield return new(id + "/unattributed", "Unattributed I/O", null, ResourceKind.UnattributedIo,
                 new(Read: captured.Unattributed.Read, Write: captured.Unattributed.Write),
                 [], frame.Host, HostShare: Share(captured.Unattributed.Total, hostRate));
+        }
+    }
+
+    private static ResourceNode[] FolderCards(PerformanceWindow frame, DiskResourceMeasurement disk, string diskId,
+        IEnumerable<DiskFileMeasurement> files, long hostBytes, DiskFolderView view)
+    {
+        var open = view.Open is { } selected && PathComparer.Equals(selected.Host, frame.Host) && selected.Disk == disk.Number
+            ? selected.Path : null;
+        var mounts = disk.Mounts.OrderByDescending(path => path.Length).ToArray();
+        var cutoff = Math.Clamp(view.MinimumPercent, 0, 100) / 100;
+        return Children(null);
+
+        string? ChildOf(string path, string? parent) =>
+            DiskPathHierarchy.ChildFolder(path, parent ?? mounts.FirstOrDefault(mount => DiskPathHierarchy.Contains(mount, path)));
+
+        ResourceNode[] Children(string? parent)
+        {
+            var groups = new Dictionary<string, (FileIoTotals Totals, bool Matches)>(PathComparer);
+            foreach (var row in files)
+            {
+                if (ChildOf(row.File.Path, parent) is not { } directory) continue;
+                var group = groups.GetValueOrDefault(directory);
+                group.Totals.Add(row.Totals);
+                group.Matches |= directory.Contains(view.Filter, StringComparison.OrdinalIgnoreCase) ||
+                    row.File.Path.Contains(view.Filter, StringComparison.OrdinalIgnoreCase) ||
+                    row.File.Process?.Contains(view.Filter, StringComparison.OrdinalIgnoreCase) == true ||
+                    frame.Host.Contains(view.Filter, StringComparison.OrdinalIgnoreCase);
+                groups[directory] = group;
+            }
+            var onRoute = open == null ? null : ChildOf(open, parent);
+            if (onRoute != null) groups.TryAdd(onRoute, default);
+
+            var result = new List<ResourceNode>();
+            foreach (var (directory, group) in groups)
+            {
+                bool onOpenRoute = PathComparer.Equals(directory, onRoute);
+                var share = Share(group.Totals.TotalBytes, hostBytes);
+                if (!onOpenRoute && (!group.Matches || share is not double impact || impact <= cutoff))
+                    continue;
+
+                var id = diskId + "/folder/" + Uri.EscapeDataString(directory.ToUpperInvariant());
+                var name = FileName(directory.TrimEnd('\\', '/'));
+                result.Add(new(id, name, "Folder", ResourceKind.Folder, Rate(group.Totals, frame.DiskPaths.Seconds),
+                    onOpenRoute ? Children(directory) : [], frame.Host, disk.Number, HostShare: share, FolderPath: directory));
+            }
+            return result.ToArray();
         }
     }
 

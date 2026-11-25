@@ -13,6 +13,7 @@ public sealed class ViewerPreferences
     public double MinCpuActivity { get; set; }
     public double MinDiskActivity { get; set; } = DiskActivity.DefaultActiveCutoff;
     public double MinRate { get; set; } = DiskActivity.DefaultTransferCutoff;
+    public double MinFolderPercent { get; set; } = DiskActivity.DefaultFolderCutoff;
     public int MaxCards { get; set; } = 12;
     public int MaxRows { get; set; } = 20;
     public int? Band { get; set; } = 10;

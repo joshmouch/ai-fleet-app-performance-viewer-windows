@@ -1,34 +1,18 @@
 #nullable enable
 
-public readonly record struct DiskPathFolder(string Host, string Environment, string Path)
+public static class DiskPathHierarchy
 {
-    public string Id => string.Join("/", Uri.EscapeDataString(Host.ToUpperInvariant()),
-        Uri.EscapeDataString(Environment), Uri.EscapeDataString(IsUnix(Path) ? Path : Path.ToUpperInvariant()));
-    public string Name => new FileIoKey(0, "", Path.TrimEnd(IsUnix(Path) ? '/' : '\\')).Filename;
+    public static bool Contains(string folder, string path) =>
+        path.StartsWith(folder, folder.StartsWith('/') ? StringComparison.Ordinal : StringComparison.OrdinalIgnoreCase);
 
-    public bool Equals(DiskPathFolder other) => StringComparer.OrdinalIgnoreCase.Equals(Host, other.Host) &&
-        Environment == other.Environment && PathComparer.Equals(Path, other.Path);
-
-    public override int GetHashCode() => HashCode.Combine(StringComparer.OrdinalIgnoreCase.GetHashCode(Host),
-        Environment, PathComparer.GetHashCode(Path));
-
-    private StringComparer PathComparer => IsUnix(Path) ? StringComparer.Ordinal : StringComparer.OrdinalIgnoreCase;
-
-    public bool Includes(DiskPathMeasurement file) =>
-        string.Equals(Host, file.Host, StringComparison.OrdinalIgnoreCase) && Environment == file.Environment &&
-        file.File.Path.StartsWith(Path, IsUnix(Path) ? StringComparison.Ordinal : StringComparison.OrdinalIgnoreCase);
-
-    internal static DiskPathFolder? Child(DiskPathMeasurement file, DiskPathFolder? parent)
+    public static string? ChildFolder(string path, string? parent)
     {
-        var path = file.File.Path;
-        if (string.IsNullOrEmpty(path)) return null;
-        char separator = IsUnix(path) ? '/' : '\\';
-        int start = parent?.Path.Length ?? RootLength(path, separator);
+        if (string.IsNullOrEmpty(path) || parent != null && !Contains(parent, path)) return null;
+        char separator = path.StartsWith('/') ? '/' : '\\';
+        int start = parent?.Length ?? RootLength(path, separator);
         int next = path.IndexOf(separator, start);
-        return next > start ? new(file.Host, file.Environment, path[..(next + 1)]) : null;
+        return next > start ? path[..(next + 1)] : null;
     }
-
-    private static bool IsUnix(string path) => path.StartsWith('/');
 
     private static int RootLength(string path, char separator)
     {
@@ -37,7 +21,7 @@ public readonly record struct DiskPathFolder(string Host, string Environment, st
         if (path.Length >= 3 && path[1] == ':' && path[2] == separator) return 3;
         if (!path.StartsWith(@"\\") || path.Length <= 2) return 0;
 
-        // A network share (and the \\?\Volume{…}\ prefix) is a root, like a drive.
+        // Skip the server and share in UNC paths, and the volume device prefix.
         int serverEnd = path.IndexOf(separator, 2);
         if (serverEnd < 0) return path.Length;
         int shareEnd = path.IndexOf(separator, serverEnd + 1);
@@ -57,32 +41,5 @@ public sealed record DiskPathMeasurement(string Host, string Environment, FileIo
             if (file.Guest is { } guestRate) guest = guest.GetValueOrDefault() + guestRate;
         }
         return (physical, guest);
-    }
-}
-
-public static class DiskPathHierarchy
-{
-    // At each level, a measurement belongs to one child folder or remains a
-    // direct file. Unnamed requests stay as rows at the top of their scope.
-    public static IEnumerable<(DiskPathFolder? Folder, DiskPathMeasurement Measurement)> Rows(
-        IEnumerable<DiskPathMeasurement> files, DiskPathFolder? parent)
-    {
-        var groups = new Dictionary<DiskPathFolder, List<DiskPathMeasurement>>();
-        foreach (var file in files)
-        {
-            if (parent is { } scope && !scope.Includes(file)) continue;
-            if (DiskPathFolder.Child(file, parent) is not { } child)
-            {
-                yield return (null, file);
-                continue;
-            }
-            if (!groups.TryGetValue(child, out var group)) groups.Add(child, group = []);
-            group.Add(file);
-        }
-        foreach (var (folder, members) in groups)
-        {
-            var (physical, guest) = DiskPathMeasurement.Sum(members);
-            yield return (folder, new(folder.Host, folder.Environment, new(0, "", folder.Path), physical, guest));
-        }
     }
 }
