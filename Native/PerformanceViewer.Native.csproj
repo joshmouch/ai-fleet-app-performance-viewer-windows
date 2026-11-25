@@ -1,4 +1,4 @@
-<Project Sdk="Microsoft.NET.Sdk.Razor">
+<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <TargetFramework Condition="$([MSBuild]::IsOSPlatform('windows'))">net10.0-windows10.0.19041.0</TargetFramework>
     <TargetFramework Condition="$([MSBuild]::IsOSPlatform('osx'))">net10.0-maccatalyst</TargetFramework>
@@ -11,16 +11,17 @@
     <Nullable>enable</Nullable>
     <ApplicationTitle>Cluster Performance Viewer</ApplicationTitle>
     <ApplicationId>agency.open.performanceviewer</ApplicationId>
-    <ApplicationDisplayVersion>1.0</ApplicationDisplayVersion>
+    <Version>1.0.2</Version>
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
+    <ApplicationDisplayVersion>$(Version)</ApplicationDisplayVersion>
     <ApplicationVersion>1</ApplicationVersion>
     <SupportedOSPlatformVersion Condition="$([MSBuild]::IsOSPlatform('windows'))">10.0.17763.0</SupportedOSPlatformVersion>
     <SupportedOSPlatformVersion Condition="$([MSBuild]::IsOSPlatform('osx'))">15.0</SupportedOSPlatformVersion>
     <TargetPlatformMinVersion Condition="$([MSBuild]::IsOSPlatform('windows'))">10.0.17763.0</TargetPlatformMinVersion>
   </PropertyGroup>
   <ItemGroup>
+    <Compile Remove="Launcher/**" />
     <PackageReference Include="Microsoft.Maui.Controls" Version="$(MauiVersion)" />
-    <PackageReference Include="Microsoft.AspNetCore.Components.WebView.Maui" Version="$(MauiVersion)" />
-    <ProjectReference Include="../Components/PerformanceViewer.Components.csproj" />
     <MauiIcon Include="Resources/appicon.svg" Color="#215D78"/>
     <MauiSplashScreen Include="Resources/appicon.svg" Color="#215D78" BaseSize="96,96"/>
   </ItemGroup>

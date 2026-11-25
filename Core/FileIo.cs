@@ -4,9 +4,13 @@ using System.Text.Json.Serialization;
 public readonly record struct FileIoKey(int Pid, string Process, string Path)
 {
     [JsonIgnore] public FileIoKey ProcessKey => this with { Path = "" };
-    private int LastSeparator => Math.Max(Path.LastIndexOf('\\'), Path.LastIndexOf('/'));
+    private int LastSeparator => Path.StartsWith('/') ? Path.LastIndexOf('/') :
+        Math.Max(Path.LastIndexOf('\\'), Path.LastIndexOf('/'));
     [JsonIgnore] public string Filename => Path[(LastSeparator + 1)..];
     [JsonIgnore] public string Filepath => Path[..(LastSeparator + 1)];
+    public static bool IsVirtualDisk(ReadOnlySpan<char> path) =>
+        path.EndsWith(".vhdx", StringComparison.OrdinalIgnoreCase) ||
+        path.EndsWith(".avhdx", StringComparison.OrdinalIgnoreCase);
 }
 
 public struct FileIoTotals
@@ -25,6 +29,14 @@ public struct FileIoTotals
         Reads += value.Reads;
         Writes += value.Writes;
     }
+
+    public readonly FileIoTotals Minus(FileIoTotals value) => new()
+    {
+        ReadBytes = ReadBytes - value.ReadBytes,
+        WriteBytes = WriteBytes - value.WriteBytes,
+        Reads = Reads - value.Reads,
+        Writes = Writes - value.Writes
+    };
 
     public static void AddTo<TKey>(Dictionary<TKey, FileIoTotals> target, TKey key, FileIoTotals value)
     {

@@ -1,0 +1,15 @@
+@using Microsoft.AspNetCore.Components
+
+<div class="measurement-notice" role="status">
+    @if (Loading) { <span class="measurement-spinner" aria-hidden="true"></span> }
+    <div>
+        <strong>@Title</strong>
+        @if (Detail is { Length: > 0 }) { <div class="quiet">@Detail</div> }
+    </div>
+</div>
+
+@code {
+    [Parameter, EditorRequired] public string Title { get; set; } = "";
+    [Parameter] public string? Detail { get; set; }
+    [Parameter] public bool Loading { get; set; }
+}

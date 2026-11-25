@@ -1,0 +1,254 @@
+@using Microsoft.AspNetCore.Components
+@using Microsoft.AspNetCore.Components.Web
+@using Microsoft.JSInterop
+@using System.Text.Json
+@inject IJSRuntime Browser
+
+<main class="viewer">
+    <h1 class="visually-hidden">AI Fleet Cluster Performance Viewer</h1>
+    @if (!ready)
+    {
+        <MeasurementNotice Title="Opening viewer" Loading="true" />
+    }
+    else
+    {
+        <div class="viewer-controls">
+            <div class="toolbar quick-settings">
+                <div class="switch" role="group" aria-label="Show resources">
+                    <button type="button" aria-pressed="@Pressed(preferences.ShowCpu)" @onclick="ToggleCpu">CPU</button>
+                    <button type="button" aria-pressed="@Pressed(preferences.ShowDisk)" @onclick="ToggleDisk">Disk</button>
+                </div>
+                <button type="button" aria-expanded="@Pressed(settings)" aria-controls="view-settings"
+                    @onclick="ToggleSettings">View settings @(settings ? "▴" : "▾")</button>
+                <input type="search" aria-label="Filter resources, processes and paths" placeholder="Filter resources, processes, paths"
+                    @bind="filter" @bind:event="oninput" />
+                @if (ToolbarStatus is { } status) { <span class="collection-status">@status</span> }
+            </div>
+            <div class="view-settings" id="view-settings" hidden="@(!settings)">
+                @if (settingsOpened)
+                {
+                    var hosts = HostNames.ToArray();
+                    @if (preferences.ShowDisk && !archive.Active)
+                    {
+                        <section class="disk-settings" aria-labelledby="disk-settings-title">
+                            <h2 id="disk-settings-title">Disk cards</h2>
+                            <div class="settings-fields">
+                                <fieldset disabled="@preferences.DiskLayout.VirtualDisksOnly">
+                                    <legend>Group by</legend>
+                                    <label><input type="radio" name="disk-hierarchy" checked="@ByVolumes"
+                                        @onchange="() => ChangeDiskLayout(preferences.DiskLayout with { Hierarchy = DiskHierarchy.Volumes })" /> Volumes and mounts</label>
+                                    <label><input type="radio" name="disk-hierarchy" checked="@(!ByVolumes)"
+                                        @onchange="() => ChangeDiskLayout(preferences.DiskLayout with { Hierarchy = DiskHierarchy.Environments })" /> Windows and guests</label>
+                                </fieldset>
+                                <fieldset disabled="@(!ByVolumes || preferences.DiskLayout.VirtualDisksOnly)">
+                                    <legend>Inside volumes</legend>
+                                    <label><input type="checkbox" checked="@preferences.DiskLayout.BusyFolders"
+                                        @onchange="e => ChangeDiskLayout(preferences.DiskLayout with { BusyFolders = (bool)e.Value! })" /> Busy folders</label>
+                                    <label><input type="checkbox" checked="@preferences.DiskLayout.GuestDisks"
+                                        @onchange="e => ChangeDiskLayout(preferences.DiskLayout with { GuestDisks = (bool)e.Value! })" /> VM and WSL disks</label>
+                                </fieldset>
+                                <fieldset>
+                                    <legend>Card focus</legend>
+                                    <label><input type="radio" name="disk-card-filter" checked="@(!preferences.DiskLayout.VirtualDisksOnly)"
+                                        @onchange="() => ChangeDiskLayout(preferences.DiskLayout with { VirtualDisksOnly = false })" /> Use disk grouping</label>
+                                    <label><input type="radio" name="disk-card-filter" checked="@preferences.DiskLayout.VirtualDisksOnly"
+                                        @onchange="() => ChangeDiskLayout(preferences.DiskLayout with { VirtualDisksOnly = true })" /> Virtual disk files only</label>
+                                </fieldset>
+                                <p class="disk-layout-preview" aria-live="polite">@DiskLayoutPreview</p>
+                            </div>
+                            <div class="settings-fields disk-thresholds">
+                                <label title="Minimum busy time on volumes with device counters">Min disk active % <input type="number" min="0" max="100"
+                                    disabled="@preferences.DiskLayout.VirtualDisksOnly" @bind="preferences.MinDiskActivity" @bind:after="Save" /></label>
+                                <label>Min disk MiB/s <input type="number" min="0" step="0.1" @bind="preferences.MinRate" @bind:after="Save" /></label>
+                                @if (ByVolumes && preferences.DiskLayout.BusyFolders && !preferences.DiskLayout.VirtualDisksOnly)
+                                {
+                                    <label title="Minimum share of this host’s captured reads and writes for a folder card">
+                                        Min folder share of host I/O % <input type="number" min="0" max="100" step="0.1" @bind="preferences.MinFolderPercent" @bind:after="Save" />
+                                    </label>
+                                }
+                                <label title="Include unmounted and backing disks alongside mounted volumes"><input type="checkbox" @bind="preferences.AllDisks" @bind:after="Save" /> Include all disks</label>
+                            </div>
+                        </section>
+                    }
+                    @if (preferences.ShowCpu)
+                    {
+                        <section aria-labelledby="cpu-settings-title">
+                            <h2 id="cpu-settings-title">CPU cards</h2>
+                            <div class="settings-fields">
+                                <label><input type="checkbox" @bind="preferences.ShowLogicalProcessors" @bind:after="Save" /> Logical processors</label>
+                                <label>Min CPU % <input type="number" min="0" max="100" @bind="preferences.MinCpuActivity" @bind:after="Save" /></label>
+                            </div>
+                        </section>
+                    }
+                    <section aria-labelledby="display-settings-title">
+                        <h2 id="display-settings-title">Display limits</h2>
+                        <div class="settings-fields">
+                            <label>Cards per level <input type="number" min="1" max="100" @bind="preferences.MaxCards" @bind:after="Save" /></label>
+                            <label>Detail rows <input type="number" min="1" max="100" @bind="preferences.MaxRows" @bind:after="Save" /></label>
+                            <label>Table band % <input type="number" min="1" max="100" @bind="preferences.Band" @bind:after="Save" /></label>
+                        </div>
+                    </section>
+                    <section aria-labelledby="scope-settings-title">
+                        <h2 id="scope-settings-title">Hosts and guests</h2>
+                        <div class="settings-fields">
+                            @if (hosts.Length > 1 || hosts.Length == 1 && preferences.Host.Length > 0)
+                            {
+                                <label>Show activity from <select @bind="preferences.Host" @bind:after="ChangeHost">
+                                    <option value="">All hosts</option>
+                                    @foreach (var name in hosts) { <option value="@name">@name</option> }
+                                </select></label>
+                            }
+                            <label title="Show guest devices, processes and files. Host totals and backing disks stay visible.">
+                                <input type="checkbox" @bind="preferences.Guests" @bind:after="Save" /> Show activity inside guests
+                            </label>
+                            @if (preferences.Guests)
+                            {
+                                @foreach (var target in GuestTargets)
+                                {
+                                    <label @key="target"><input type="checkbox" checked="@preferences.IncludesGuest(target.Host, target.Target)"
+                                        @onchange="e => SetGuest(target, (bool)e.Value!)" /> @(hosts.Length > 1 ? $"{target.Host} / {target.Target}" : target.Target)</label>
+                                }
+                            }
+                        </div>
+                    </section>
+                    @if (preferences.ShowCpu || preferences.ShowDisk || archive.Active)
+                    {
+                        <section aria-labelledby="history-settings-title" hidden="@(!preferences.ShowCpu && !preferences.ShowDisk)">
+                            <h2 id="history-settings-title">History</h2>
+                            <div class="settings-fields">
+                                @if (preferences.ShowDisk || archive.Active)
+                                {
+                                    <div hidden="@(!preferences.ShowDisk)"><HistoryPicker Changed="value => archive = value" /></div>
+                                }
+                                <button type="button" aria-expanded="@Pressed(timelines)" @onclick="() => timelines = !timelines">Stored timelines</button>
+                            </div>
+                        </section>
+                    }
+                    @if (Sources.Length > 1 || Sources.Any(source => !IsReady(source) || source.Status != null))
+                    {
+                        <section aria-labelledby="source-settings-title">
+                            <h2 id="source-settings-title">Data sources</h2>
+                            <ul class="source-status-list">
+                                @foreach (var source in Sources)
+                                {
+                                    <li><strong>@source.Name</strong> · @SourceMode(source)@if (!string.IsNullOrWhiteSpace(source.Status)) { <span> · @source.Status</span> }</li>
+                                }
+                            </ul>
+                        </section>
+                    }
+                    @if (settings && timelines)
+                    {
+                        @if (preferences.ShowCpu) { <ResourceHistory Disk="false" /> }
+                        @if (preferences.ShowDisk) { <ResourceHistory Disk="true" /> }
+                    }
+                }
+            </div>
+            @if (preferenceError != null) { <p class="preference-error" role="status">@preferenceError</p> }
+        </div>
+        @if (!preferences.ShowCpu && !preferences.ShowDisk)
+        {
+            <MeasurementNotice Title="Turn on CPU or Disk to view activity" />
+        }
+        <div class="viewer-sections @(Combined ? "viewer-combined" : "")">
+            <ResourceSection Sources="Sources" Preferences="preferences" Visible="preferences.ShowCpu" Combined="Combined" Filter="@filter"
+                SavePreferences="Save" SharedScope="sharedScope" SharedScopeChanged="ChangeScope" />
+            <ResourceSection Sources="Sources" Preferences="preferences" Visible="preferences.ShowDisk" Combined="Combined" Filter="@filter"
+                Disk="true" Archive="archive" SavePreferences="Save" SharedScope="sharedScope" SharedScopeChanged="ChangeScope" />
+        </div>
+    }
+</main>
+
+@code {
+    [Parameter] public SourceWindow[] Sources { get; set; } = [];
+    private const string PreferenceKey = "ai-fleet-performance-viewer.preferences.v1";
+    private ViewerPreferences preferences = new();
+    private bool ready, settings, settingsOpened, timelines;
+    private string? preferenceError;
+    private string filter = "";
+    private ResourceScope sharedScope = new();
+    private HistorySelection archive = new(false, null);
+    private bool Combined => preferences.ShowCpu && preferences.ShowDisk;
+    private bool ByVolumes => preferences.DiskLayout.Hierarchy == DiskHierarchy.Volumes;
+    private string DiskLayoutPreview => preferences.DiskLayout switch
+    {
+        { VirtualDisksOnly: true } => "Current scope → Virtual disk file → Guest device",
+        { Hierarchy: DiskHierarchy.Environments } => "Windows files   |   Unattributed I/O   |   Guest → Virtual disk file → Guest device",
+        { BusyFolders: true, GuestDisks: true } => "Volume → Folder → Subfolder   |   Volume → VM or WSL → Virtual disk file → Guest device",
+        { BusyFolders: true } => "Volume → Folder → Subfolder",
+        { GuestDisks: true } => "Volume → VM or WSL → Virtual disk file → Guest device",
+        _ => "Volumes and mounts"
+    };
+    private IEnumerable<string> HostNames => Sources.Select(source => source.Frame?.Host ?? source.GuestOf)
+        .Append(preferences.Host).OfType<string>().Where(name => name.Length != 0).Distinct(StringComparer.OrdinalIgnoreCase).Order();
+    private IEnumerable<ViewerPreferences.Guest> GuestTargets => Sources.Where(source => source.Selected).SelectMany(source =>
+        source.Frame is { } frame
+            ? (frame.Guests?.Cpu?.Sample.Coverage.Select(row => row.Machine) ?? [])
+                .Concat(frame.Guests?.Disks.Select(row => row.Target) ?? []).Select(target => new ViewerPreferences.Guest(frame.Host, target))
+            : source.GuestOf is { } host ? [new(host, source.Name)] : [])
+        .Where(guest => preferences.Host.Length == 0 || string.Equals(guest.Host, preferences.Host, StringComparison.OrdinalIgnoreCase))
+        .Distinct();
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (!firstRender) return;
+        try
+        {
+            var json = await Browser.InvokeAsync<string?>("localStorage.getItem", PreferenceKey);
+            if (json != null && ViewerPreferences.Load(json) is { } saved) preferences = saved;
+        }
+        catch (JSDisconnectedException) { return; }
+        catch (Exception e) when (e is JSException or JsonException) { preferenceError = "Saved settings could not be loaded."; }
+        ready = true;
+        StateHasChanged();
+    }
+
+    private async Task Save()
+    {
+        try
+        {
+            await Browser.InvokeVoidAsync("localStorage.setItem", PreferenceKey, JsonSerializer.Serialize(preferences));
+            preferenceError = null;
+        }
+        catch (JSDisconnectedException) { }
+        catch (JSException) { preferenceError = "Settings could not be saved."; }
+    }
+
+    private Task ToggleCpu() { preferences.ShowCpu = !preferences.ShowCpu; return Save(); }
+    private Task ToggleDisk() { preferences.ShowDisk = !preferences.ShowDisk; return Save(); }
+    private void ChangeScope(ResourceScope scope) => sharedScope = scope;
+    private Task ChangeHost() { sharedScope = new(); return Save(); }
+    private void ToggleSettings() { settings = !settings; settingsOpened = true; }
+    private Task ChangeDiskLayout(DiskCardLayout layout) { preferences.DiskLayout = layout; return Save(); }
+    private Task SetGuest(ViewerPreferences.Guest target, bool enabled)
+    {
+        if (enabled) preferences.HiddenGuests.Remove(target); else preferences.HiddenGuests.Add(target);
+        return Save();
+    }
+    private static string Pressed(bool value) => value ? "true" : "false";
+    private string? ToolbarStatus
+    {
+        get
+        {
+            if (archive.Active && preferences.ShowDisk && !preferences.ShowCpu) return "Disk history";
+            var selectedHost = preferences.Host;
+            var sources = selectedHost.Length == 0 ? Sources : Sources
+                .Where(source => string.Equals(source.Frame?.Host ?? source.GuestOf, selectedHost, StringComparison.OrdinalIgnoreCase)).ToArray();
+            string? live = sources.Length switch
+            {
+                0 => selectedHost.Length == 0 ? null : $"{selectedHost} · Unavailable",
+                1 => $"{SourceName(sources[0])} · {SourceMode(sources[0])}",
+                _ => $"{sources.Count(IsReady)}/{sources.Length} sources ready"
+            };
+            return archive.Active && preferences.ShowDisk
+                ? live == null ? "Disk history" : $"{live} | Disk history"
+                : live;
+        }
+    }
+    private static string SourceName(SourceWindow source) => source.Frame?.Host ?? source.GuestOf ?? source.Name;
+    private static bool IsReady(SourceWindow source) => source.Selected && !source.Stale &&
+        (source.Frame != null || source.GuestDisk != null);
+    private static string SourceMode(SourceWindow source) =>
+        source.Loading ? "Sampling" : source.Stale ? "Stale" :
+        source.Frame == null && source.GuestDisk == null ? (source.Status == null ? "Waiting" : "Unavailable") :
+        !source.Selected ? "Alternate" : source.Replay ? "Replay" : "Live";
+}

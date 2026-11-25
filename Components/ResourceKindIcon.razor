@@ -1,0 +1,72 @@
+@using Microsoft.AspNetCore.Components
+
+<span class="resource-kind-icon" role="img" aria-label="@Label" title="@Label">
+    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"
+        stroke-linejoin="round" aria-hidden="true" focusable="false">
+        @switch (Node.Kind)
+        {
+            case ResourceKind.System:
+                <path d="M2 2h5v5H2z M9 2h5v5H9z M2 9h5v5H2z M9 9h5v5H9z" />
+                break;
+            case ResourceKind.Host:
+                <rect x="2" y="2.5" width="12" height="8.5" rx="1" />
+                <path d="M8 11v2.5m-3 0h6" />
+                break;
+            case ResourceKind.CpuGroup when Node.MeasuredAt.HasValue:
+                <rect x="2" y="2" width="8" height="7" rx="1" />
+                <rect x="6" y="7" width="8" height="7" rx="1" fill="Canvas" />
+                break;
+            case ResourceKind.CpuGroup:
+            case ResourceKind.Processor:
+                <rect x="4" y="4" width="8" height="8" rx="1" />
+                <path d="M6 2v2m4-2v2m-4 8v2m4-2v2M2 6h2m-2 4h2m8-4h2m-2 4h2" />
+                <rect x="6.5" y="6.5" width="3" height="3" rx=".3" />
+                break;
+            case ResourceKind.Disk:
+                <path d="M3.5 3h9l2 6v3.5a1 1 0 0 1-1 1h-11a1 1 0 0 1-1-1V9z M2 9h12m-4 2.5h2.5" />
+                break;
+            case ResourceKind.VirtualMachine when Node.Target == "WSL":
+            case ResourceKind.GuestCpuDistribution:
+                <rect x="2" y="3" width="12" height="10" rx="1" />
+                <path d="m5 6 2 2-2 2m4 0h2" />
+                break;
+            case ResourceKind.VirtualMachine:
+                <path d="M8 1.75 13.5 5v6L8 14.25 2.5 11V5z M2.5 5 8 8.25 13.5 5 M8 8.25v6" />
+                break;
+            case ResourceKind.GuestDevice:
+                <path d="M5.5 2v3m5-3v3M4 5h8v2a4 4 0 0 1-8 0zm4 6v3" />
+                break;
+            case ResourceKind.VirtualDisk:
+                <path d="M4 1.75h5.5L13 5.25v9H4z M9.5 1.75v3.5H13 M6 8h5m-5 3h5" />
+                break;
+            case ResourceKind.UnattributedIo:
+                <circle cx="8" cy="8" r="6" />
+                <path d="M6 6a2 2 0 1 1 3 1.7c-.7.4-1 .8-1 1.3m0 2.25h.01" />
+                break;
+            default:
+                <path d="M2 4h4l1.5 1.5H14v7H2z" />
+                break;
+        }
+    </svg>
+</span>
+
+@code {
+    [Parameter, EditorRequired] public ResourceNode Node { get; set; } = default!;
+
+    private string Label => Node.Kind switch
+    {
+        ResourceKind.System => "System",
+        ResourceKind.Host => Node.Type ?? "Host",
+        ResourceKind.Processor => "Logical processor",
+        ResourceKind.Disk => Node.Type ?? "Disk volume",
+        ResourceKind.VirtualDisk => "Virtual disk file",
+        ResourceKind.VirtualMachine when Node.Target == "WSL" => Node.Type ?? (Node.Machine == null ? "Shared WSL VM" : "WSL distribution"),
+        ResourceKind.VirtualMachine => Node.Type ?? "Virtual machine",
+        ResourceKind.GuestCpuDistribution => Node.Type ?? "WSL distribution",
+        ResourceKind.GuestDevice => Node.Type ?? "Guest device",
+        ResourceKind.WindowsIo => "Host file I/O",
+        ResourceKind.UnattributedIo => "Unattributed I/O",
+        ResourceKind.Folder => "Folder",
+        _ => Node.Type ?? "CPU group"
+    };
+}

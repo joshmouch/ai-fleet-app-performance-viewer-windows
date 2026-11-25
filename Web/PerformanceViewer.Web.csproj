@@ -8,4 +8,10 @@
     <EmbeddedResource Include="../GuestDiskIo.py" LogicalName="GuestDiskIo.py" />
     <ProjectReference Include="../Components/PerformanceViewer.Components.csproj" />
   </ItemGroup>
+  <ItemGroup Condition="'$(ViewerSourceCheckout)' != ''">
+    <Watch Include="../*.cs;../*.py;../*.sh;../PerformanceViewer.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <Compile Include="../Native/ViewerStartupProtocol.cs" Link="ViewerStartupProtocol.cs" />
+  </ItemGroup>
 </Project>

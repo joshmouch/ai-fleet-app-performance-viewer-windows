@@ -7,10 +7,16 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <base href="/" />
     <title>Cluster Performance Viewer</title>
-    <link rel="stylesheet" href="_content/PerformanceViewer.Components/viewer.css" />
+    <link rel="stylesheet" href="@Assets["_content/PerformanceViewer.Components/viewer.css"]" />
 </head>
 <body>
-    <Dashboard @rendermode="new InteractiveServerRenderMode(prerender: false)" />
+    <Dashboard @rendermode="new InteractiveServerRenderMode(prerender: true)" />
     <script src="_framework/blazor.web.js"></script>
+    <script src="@Assets["resource-pane.js"]"></script>
+    @if (Environment.GetEnvironmentVariable("DOTNET_WATCH") == "1" &&
+        string.IsNullOrEmpty(Environment.GetEnvironmentVariable("ViewerSourceCheckout")))
+    {
+        <script src="_framework/aspnetcore-browser-refresh.js"></script>
+    }
 </body>
 </html>

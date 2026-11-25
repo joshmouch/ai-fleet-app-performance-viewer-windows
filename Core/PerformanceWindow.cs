@@ -12,11 +12,11 @@ public sealed record DiskPathWindow(DateTimeOffset End, double Seconds, int? Dis
     public FileIoTotals Totals() => DiskIoMerge.Sum(Files.Select(row => row.Totals));
 }
 
-// Disk paths use the native sampler's rolling window. CPU covers the interval between
-// process snapshots. Consumers replace the previous frame rather than summing rolling windows.
+// CPU covers the time between samples. Disk measurements carry their own duration,
+// so readers can handle both disjoint intervals and rolling windows.
 public sealed record PerformanceWindow(string Schema, string Host, DateTimeOffset? Boot,
     Guid Capture, long Sequence, DateTimeOffset CpuEnd, CpuProcessSample Cpu, DiskPathWindow DiskPaths, GuestWindow Guests = null,
-    string CpuStatus = null)
+    string CpuStatus = null, ResourceMeasurements Resources = null)
 {
     public const string CurrentSchema = "performance-viewer/window/v1";
     private static readonly JsonSerializerOptions Options = new(JsonSerializerDefaults.Web)

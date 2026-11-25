@@ -5,6 +5,7 @@ using System.Diagnostics;
 using System.Drawing;
 using System.Linq;
 using System.Runtime.InteropServices;
+using System.Security.Principal;
 using System.Text;
 using System.Threading.Tasks;
 using System.Windows.Forms;
@@ -102,7 +103,9 @@ internal sealed class VolumeFileIo : IDisposable
     private readonly object lifecycle = new();
     private readonly object samples = new();
     private readonly Queue<Bucket> buckets = new();
+    private readonly bool frameIntervals;
     private Bucket currentBucket;
+    private long previousFrame;
     private readonly Dictionary<int, string> processes = new();
     // Kernel-File creates name an individual open. A later filesystem event gives that
     // open's stream key, which Kernel-Disk reports in its FileObject field.
@@ -188,11 +191,12 @@ internal sealed class VolumeFileIo : IDisposable
     public sealed record Snapshot(Dictionary<FileIoKey, FileIoTotals> Entries,
         long DiskBytes, long NamedBytes, double Seconds, string Status, int EventsLost,
         long KeylessBytes, long OutsideScopeBytes,
-        DateTimeOffset End, Dictionary<FileIoKey, FileIoTotals> VirtualPaths = null);
+        DateTimeOffset End, Dictionary<FileIoKey, FileIoTotals> VirtualPaths = null, DiskFileMeasurement[] DiskFiles = null);
     public sealed record VirtualSnapshot(VirtualDiskIo[] Entries, double Seconds, string Status, int EventsLost);
 
-    public VolumeFileIo(bool details, int[] virtualDisks, VolumePathIndex index)
+    public VolumeFileIo(bool details, int[] virtualDisks, VolumePathIndex index, bool frameIntervals = false)
     {
+        this.frameIntervals = frameIntervals;
         scope = new TraceScope(details, virtualDisks, index);
         detailStarted = virtualStarted = Stopwatch.GetTimestamp();
         // Run blocks for the whole trace, so it gets its own thread rather than pinning a thread-pool thread.
@@ -321,7 +325,10 @@ internal sealed class VolumeFileIo : IDisposable
         }
         catch (UnauthorizedAccessException)
         {
-            status = "Windows denied access to file I/O tracing. Open the viewer as administrator.";
+            using var identity = WindowsIdentity.GetCurrent();
+            status = new WindowsPrincipal(identity).IsInRole(WindowsBuiltInRole.Administrator)
+                ? "Windows denied the file I/O trace even though the collector is elevated."
+                : "Windows denied access to file I/O tracing. Open the viewer as administrator.";
         }
         catch (Exception e)
         {
@@ -445,7 +452,7 @@ internal sealed class VolumeFileIo : IDisposable
         }
         if (path.IsEmpty)
             return;
-        bool isVirtual = IsVirtualDisk(path);
+        bool isVirtual = FileIoKey.IsVirtualDisk(path);
         // A full rundown contains millions of entries. Keep names for observed file keys
         // and VHDX attachments, which can stay open for the lifetime of a VM.
         if (file == null && !isVirtual && (!scope.Details || kind == 2))
@@ -503,10 +510,6 @@ internal sealed class VolumeFileIo : IDisposable
             requests[irp] = new DiskRequest(e.ProcessID, e.ThreadID, time, processes.GetValueOrDefault(e.ProcessID));
     }
 
-    private static bool IsVirtualDisk(ReadOnlySpan<char> path) =>
-        path.EndsWith(".vhdx", StringComparison.OrdinalIgnoreCase) ||
-        path.EndsWith(".avhdx", StringComparison.OrdinalIgnoreCase);
-
     private void RecordManifestEvent(TraceEvent e, ETWTraceEventSource source)
     {
         int id = (int)e.ID;
@@ -531,7 +534,7 @@ internal sealed class VolumeFileIo : IDisposable
             {
                 if (fileObject == 0) return;
                 manifestOpens.Remove(fileObject);
-                if (e.PayloadByName("FileName") is string { Length: > 0 } name && (scope.Details || IsVirtualDisk(name)))
+                if (e.PayloadByName("FileName") is string { Length: > 0 } name && (scope.Details || FileIoKey.IsVirtualDisk(name)))
                     manifestOpens.Remember(fileObject, new OpenFile(name));
                 return;
             }
@@ -592,7 +595,7 @@ internal sealed class VolumeFileIo : IDisposable
         }
 
         string name = file?.Path;
-        bool isVirtual = attachment != null || name != null && IsVirtualDisk(name);
+        bool isVirtual = attachment != null || name != null && FileIoKey.IsVirtualDisk(name);
         if (fileKey != 0 && file != null && attachment == null)
         {
             if (isVirtual)
@@ -626,8 +629,8 @@ internal sealed class VolumeFileIo : IDisposable
         {
             if (selection != scope)
                 return;
-            Trim(now);
-            if (currentBucket == null || currentBucket.Second != second)
+            if (!frameIntervals) Trim(now);
+            if (currentBucket == null || !frameIntervals && currentBucket.Second != second)
             {
                 eventsLost = source.EventsLost;
                 currentBucket = new Bucket(second);
@@ -660,12 +663,14 @@ internal sealed class VolumeFileIo : IDisposable
             buckets.Dequeue();
     }
 
-    public Snapshot Read(bool byPath, int? disk, string virtualDisk, bool includeVirtualPaths, HashSet<int> diskScope = null)
+    public Snapshot Read(bool byPath, int? disk, string virtualDisk, bool includeVirtualPaths, HashSet<int> diskScope = null,
+        bool includeDiskFiles = false)
     {
         var entries = new Dictionary<FileIoKey, FileIoTotals>();
         var virtualPaths = includeVirtualPaths ? new Dictionary<FileIoKey, FileIoTotals>() : null;
         var processTotals = new Dictionary<FileIoKey, FileIoTotals>();
         var namedTotals = new Dictionary<FileIoKey, FileIoTotals>();
+        var diskFiles = includeDiskFiles ? new Dictionary<(int Disk, FileIoKey File), FileIoTotals>() : null;
         var pathBuckets = new List<Dictionary<DiskPathKey, FileIoTotals>>();
         var readPaths = byPath || virtualPaths != null || virtualDisk != null;
         long diskBytes = 0, namedBytes = 0;
@@ -683,25 +688,36 @@ internal sealed class VolumeFileIo : IDisposable
             long traceStart = System.Threading.Volatile.Read(ref started);
             long start = traceStart == 0 ? 0 : Math.Max(traceStart, detailStarted);
             long bucketEdge = (now - WindowSeconds) / BucketSeconds * BucketSeconds;
-            long floor = Math.Max(start, bucketEdge * Stopwatch.Frequency);
+            long floor = Math.Max(start, frameIntervals ? previousFrame : bucketEdge * Stopwatch.Frequency);
             seconds = start == 0 ? 0 : Math.Max(0, Stopwatch.GetElapsedTime(floor, timestamp).TotalSeconds);
-            Trim(now);
+            if (!frameIntervals) Trim(now);
             foreach (var bucket in buckets)
             {
                 if (virtualDisk == null)
                 {
                     foreach (var entry in bucket.Processes)
                         if (Includes(entry.Key.Disk))
+                        {
                             FileIoTotals.AddTo(processTotals, entry.Key.Process, entry.Value);
+                            if (diskFiles != null) FileIoTotals.AddTo(diskFiles, entry.Key, entry.Value);
+                        }
                         else if (!disk.HasValue)
                             outsideScope += entry.Value.TotalBytes;
                 }
                 // Closed buckets are no longer written. Copy only the live one so
                 // path resolution and aggregation don't block the trace consumer.
                 if (readPaths && bucket.Paths.Count > 0)
-                    pathBuckets.Add(bucket == currentBucket ? new(bucket.Paths) : bucket.Paths);
+                    pathBuckets.Add(!frameIntervals && bucket == currentBucket ? new(bucket.Paths) : bucket.Paths);
                 if (byPath && virtualDisk == null)
                     keyless += bucket.KeylessBytes.Where(entry => Includes(entry.Key)).Sum(entry => entry.Value);
+            }
+            if (frameIntervals)
+            {
+                // The next completion opens a new interval. File names and request
+                // identities stay alive so an open file can span multiple frames.
+                previousFrame = timestamp;
+                currentBucket = null;
+                buckets.Clear();
             }
         }
         var pending = queryOpenFiles && readPaths ? new Dictionary<int, long>() : null;
@@ -716,7 +732,7 @@ internal sealed class VolumeFileIo : IDisposable
                     int pid = entry.Key.File.Pid;
                     pending[pid] = pending.GetValueOrDefault(pid) + entry.Value.TotalBytes;
                 }
-                if (string.IsNullOrEmpty(path) || ((!byPath || virtualDisk != null) && !IsVirtualDisk(path)))
+                if (string.IsNullOrEmpty(path) || ((!byPath || virtualDisk != null) && !FileIoKey.IsVirtualDisk(path)))
                     continue;
                 path = pathIndex.Resolve(path, entry.Key.Disk) ?? pathIndex.Resolve(path, null) ?? path;
                 var process = entry.Key.File.ProcessKey;
@@ -731,8 +747,14 @@ internal sealed class VolumeFileIo : IDisposable
                 {
                     FileIoTotals.AddTo(entries, file, entry.Value);
                     FileIoTotals.AddTo(namedTotals, process, entry.Value);
+                    if (diskFiles != null)
+                    {
+                        var key = (entry.Key.Disk, process);
+                        diskFiles[key] = diskFiles.GetValueOrDefault(key).Minus(entry.Value);
+                        FileIoTotals.AddTo(diskFiles, (entry.Key.Disk, file), entry.Value);
+                    }
                 }
-                if (virtualPaths != null && IsVirtualDisk(path))
+                if (virtualPaths != null && FileIoKey.IsVirtualDisk(path))
                     FileIoTotals.AddTo(virtualPaths, file, entry.Value);
             }
         foreach (var entry in processTotals)
@@ -742,19 +764,14 @@ internal sealed class VolumeFileIo : IDisposable
                 continue;
             var named = namedTotals.GetValueOrDefault(entry.Key);
             namedBytes += named.TotalBytes;
-            var missing = new FileIoTotals
-            {
-                ReadBytes = entry.Value.ReadBytes - named.ReadBytes,
-                WriteBytes = entry.Value.WriteBytes - named.WriteBytes,
-                Reads = entry.Value.Reads - named.Reads,
-                Writes = entry.Value.Writes - named.Writes
-            };
+            var missing = entry.Value.Minus(named);
             if (missing.Operations > 0)
                 entries.Add(entry.Key, missing);
         }
         if (pending != null) fileNameQueries.Resolve(pending);
         return new Snapshot(byPath ? entries : processTotals, diskBytes, namedBytes, seconds, status,
-            eventsLost, keyless, outsideScope, end, virtualPaths);
+            eventsLost, keyless, outsideScope, end, virtualPaths, diskFiles?.Where(pair => pair.Value.Operations > 0)
+                .Select(pair => new DiskFileMeasurement(pair.Key.Disk, pair.Key.File, pair.Value)).ToArray());
     }
 
     private string VirtualPath(string path) => VmDiskIo.Normalize(scope.Paths.Resolve(path, null) ?? path);

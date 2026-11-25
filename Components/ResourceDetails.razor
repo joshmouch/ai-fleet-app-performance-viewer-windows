@@ -1,0 +1,137 @@
+@using Microsoft.AspNetCore.Components
+@using Microsoft.AspNetCore.Components.Web
+
+<section class="resource-details" aria-label="@($"{Node.Name} details")" @onclick:stopPropagation="true">
+    <div class="resource-details-tabs">
+        <div class="resource-detail-controls">
+            <button type="button" aria-pressed="@(!Paths ? "true" : "false")" @onclick="() => Show(false)">Processes</button>
+            @if (Disk) { <button type="button" aria-pressed="@(Paths ? "true" : "false")" @onclick="() => Show(true)">Paths</button> }
+        </div>
+        <div class="resource-detail-facts">
+            @if (BandPercent > 0 && data?.SortMetric is { } sort && Data.Rows.Length > 0)
+            {
+                <span class="resource-band-coverage"
+                    title="Bands use the sorted column's total across all rows in this scope, including rows hidden by search or Top rows. Each row stays whole.">
+                    @if (Data.BandIssue is string issue) { @issue }
+                    else
+                    {
+                        var basis = sort.BandBasis ?? sort.Label;
+                        @if (Data.TotalWeight > 0)
+                        {
+                            <text>Bands by @basis · @sort.Display(Data.TotalWeight) total · @ResourceDetailTable.FormatShare(Data.ShownShare) shown · @ResourceDetailTable.FormatShare(1 - Data.ShownShare) outside list</text>
+                        }
+                        else { <text>No @basis values for bands</text> }
+                    }
+                </span>
+            }
+            @if (data?.Summary is string summary)
+            {
+                <span class="resource-details-summary" title="@(Disk ? "Totals for all matching rows in this scope" : "Guest CPU attribution coverage for this scope")">@summary</span>
+            }
+        </div>
+        @if (Close.HasDelegate)
+        {
+            <button class="resource-icon close-details" type="button" aria-label="Close details pane"
+                title="Close details pane" @onclick="Close">×</button>
+        }
+    </div>
+    @if (Loading)
+    {
+        <MeasurementNotice Title="@(Paths ? "Loading paths" : "Loading processes")" Loading="true" />
+    }
+    else if (Data.Note is string note)
+    {
+        <div class="details-notice" role="status">@note</div>
+    }
+    @if (!Loading && Data.Rows.Length > 0)
+    {
+        var labels = Data.LabelColumns;
+        <div class="scroll" tabindex="0" role="region" aria-label="@(Paths ? "Path rankings" : "Process rankings")">
+            <table class="@(Paths ? "resource-path-rankings" : null)">
+                <thead><tr>
+                    @foreach (string column in labels) { <th scope="col" data-copy-label="@column">@column</th> }
+                    @foreach (var metric in Data.Metrics)
+                    {
+                        bool sorted = Data.SortedBy == metric.Key;
+                        <th scope="col" class="num" data-copy-label="@metric.Label"
+                            aria-sort="@(sorted ? "descending" : null)" title="@metric.Hint">
+                            @if (metric.Sortable)
+                            {
+                                <button type="button" class="detail-sort" @onclick="() => SortChanged.InvokeAsync(metric.Key)">
+                                    @metric.Label @if (sorted) { <span aria-hidden="true">▼</span> }
+                                </button>
+                            }
+                            else { @metric.Label }
+                        </th>
+                    }
+                </tr></thead>
+                <tbody>
+                @foreach (var group in Data.Bands(BandPercent))
+                {
+                    @if (group.Start is int start)
+                    {
+                        <tr class="resource-band" title="The range shows where these rows start in the running total. The actual share is the sum of these rows divided by the scope total.">
+                            <th colspan="@(Paths ? 2 : labels.Length)" scope="row">
+                                @start–@(Math.Min(100, start + BandPercent))% start · @ResourceDetailTable.FormatShare(group.Weight / Data.TotalWeight) actual
+                            </th>
+                            @if (Paths) { <td colspan="@(labels.Length - 2)" aria-hidden="true"></td> }
+                            @for (int column = 0; column < Data.Metrics.Length; column++)
+                            { <td class="num">@Data.Metrics[column].Display(Data.Metrics[column].Subtotal(group.Rows, column))</td> }
+                        </tr>
+                    }
+                    @foreach (var row in group.Rows)
+                    {
+                        var fullPath = Paths && row.Labels[2].Length > 0 ? row.Labels[2] + row.Labels[1] : null;
+                        <tr data-copy-row="" tabindex="@(fullPath == null ? "0" : null)">
+                            @for (int index = 0; index < row.Labels.Length; index++)
+                            {
+                                var label = row.Labels[index];
+                                <td class="resource-cell" title="@label">
+                                    @if (index == 1 && fullPath != null)
+                                    {
+                                        <button type="button" class="file-path-button" data-full-path="@fullPath"
+                                            aria-label="@($"Show full path for {label}")" aria-haspopup="dialog">@label</button>
+                                    }
+                                    else { @label }
+                                </td>
+                            }
+                            @for (int column = 0; column < Data.Metrics.Length; column++)
+                            { <td class="num">@Data.Metrics[column].Display(row.Values[column])</td> }
+                        </tr>
+                    }
+                }
+                </tbody>
+            </table>
+        </div>
+    }
+    else if (!Loading && Data.Note == null) { <div class="details-notice" role="status">No matching measurements</div> }
+</section>
+
+@code {
+    [Parameter, EditorRequired] public ResourceNode Node { get; set; } = default!;
+    [Parameter, EditorRequired] public Func<ResourceNode, bool, Task<ResourceDetailTable>> Read { get; set; } = default!;
+    [Parameter] public bool Disk { get; set; }
+    [Parameter] public int BandPercent { get; set; }
+    [Parameter] public EventCallback Close { get; set; }
+    [Parameter] public EventCallback<string> SortChanged { get; set; }
+    private bool Paths;
+    private ResourceDetailTable? data;
+    private ResourceDetailTable Data => data!;
+    private bool Loading => data == null;
+    private int request;
+    protected override void OnInitialized() => Paths = Disk;
+    protected override Task OnParametersSetAsync() => Refresh();
+    private Task Show(bool paths)
+    {
+        if (Paths == paths) return Task.CompletedTask;
+        Paths = paths;
+        data = null;
+        return Refresh();
+    }
+    private async Task Refresh()
+    {
+        int version = ++request;
+        var next = await Read(Node, Paths);
+        if (version == request) data = next;
+    }
+}

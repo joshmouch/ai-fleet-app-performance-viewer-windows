@@ -18,6 +18,8 @@ internal sealed class WindowsGuestSamples : IAsyncDisposable
     private Task<GuestCpuWindow> pendingCpu;
     private GuestCpuWindow lastCpu;
 
+    internal VmDiskOwners FindOwner(string path) => disks?.GetValueOrDefault(VmDiskIo.Normalize(path));
+
     public WindowsGuestSamples(VolumePathIndex paths)
     {
         this.paths = paths;

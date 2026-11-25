@@ -1,0 +1,191 @@
+@using Microsoft.AspNetCore.Components
+@using Microsoft.AspNetCore.Components.Web
+
+<div class="resource-chart @(Compact ? "resource-chart-compact" : "")" title="@MeasurementHint">
+    @if (MetricsVisible && (Current.Length > 0 || HostIoShare != null))
+    {
+        <dl class="resource-metrics">
+            @foreach (var metric in Current)
+            {
+                <div class="@metric.Class" title="@metric.Hint"><dt>
+                    @if (GraphVisible && Plotted.Contains(metric))
+                    { <span class="metric-key" aria-hidden="true"></span> }
+                    @Label(metric)</dt><dd>@Format(metric)</dd></div>
+            }
+            @if (HostIoShare is string share)
+            {
+                <div><dt>@(Node.Kind == ResourceKind.GuestDevice ? "Backing I/O" : "Host I/O")</dt><dd>@share</dd></div>
+            }
+        </dl>
+    }
+    @if (MetricsVisible && Breakdown is { } captured)
+    {
+        <table class="disk-breakdown" aria-label="Captured disk I/O by workload in MiB per second"
+            title="Captured host file I/O. These rates use the trace window. The timeline also shows device-counter measurements.">
+            <thead>
+                <tr><th scope="col">Captured MiB/s</th><th class="num" scope="col">Read</th><th class="num" scope="col">Write</th></tr>
+            </thead>
+            <tbody>
+                <tr><th scope="row">Windows files</th><td class="num">@FormatRate(captured.WindowsFiles.Read)</td><td class="num">@FormatRate(captured.WindowsFiles.Write)</td></tr>
+                <tr><th scope="row" title="VHDX and AVHDX files">VM/WSL disk files</th><td class="num">@FormatRate(captured.BackingFiles.Read)</td><td class="num">@FormatRate(captured.BackingFiles.Write)</td></tr>
+                <tr><th scope="row" title="Captured requests without a file path">Unattributed I/O</th><td class="num">@FormatRate(captured.Unattributed.Read)</td><td class="num">@FormatRate(captured.Unattributed.Write)</td></tr>
+            </tbody>
+            <tfoot><tr><th scope="row">Total</th><td class="num">@FormatRate(captured.Total.Read)</td><td class="num">@FormatRate(captured.Total.Write)</td></tr></tfoot>
+        </table>
+    }
+    @if (GraphVisible && Plotted.Length > 0)
+    {
+        <div class="resource-plot">
+            <div class="chart-scales">
+                @if (Plotted.Any(metric => metric.Unit != "%")) { <span>0–@RateMaximum.ToString("0.#") MiB/s</span> }
+                @if (Plotted.Any(metric => metric.Unit == "%")) { <span class="percent-scale">0–100%</span> }
+            </div>
+            <svg viewBox="0 0 320 65" preserveAspectRatio="none" role="img" aria-label="@($"{Node.Name} history")">
+                <path class="chart-grid" d="M0 1H320 M0 32H320 M0 64H320" />
+                @foreach (var metric in Plotted)
+                {
+                    <path class="@metric.Class" d="@PathFor(metric)" vector-effect="non-scaling-stroke" />
+                }
+            </svg>
+            <div class="chart-times"><span>@History[0].At.ToLocalTime().ToString("HH:mm:ss")</span><span>@History[^1].At.ToLocalTime().ToString("HH:mm:ss")</span></div>
+        </div>
+    }
+    else if (GraphVisible)
+    {
+        <div class="resource-plot resource-plot-status">
+            @{
+                bool collecting = !Stored && Current.Length > 0;
+            }
+            <MeasurementNotice Title="@(Stored ? "Stored measurement window" : collecting ? "Collecting timeline" : "Timeline unavailable")"
+                Detail="@(Stored ? "A stored window supplies totals for one interval." : collecting ? "Waiting for a second measurement." : null)"
+                Loading="collecting" />
+        </div>
+    }
+    else if (Compact && MetricsVisible && Current.Length == 0)
+    {
+        <span class="quiet">No measurements</span>
+    }
+    @if (Controls)
+    {
+        <div class="resource-actions" aria-label="Graph and metrics">
+            <button type="button" class="resource-icon" aria-label="@(HideGraph ? "Show graph" : "Hide graph")"
+                title="@(HideGraph ? "Show graph" : "Hide graph")" aria-pressed="@(!HideGraph ? "true" : "false")" @onclick="() => HideGraph = !HideGraph" @onclick:stopPropagation="true">∿</button>
+            @if (HasMetrics)
+            {
+                <button type="button" class="resource-icon" aria-label="@(HideMetrics ? "Show metrics" : "Hide metrics")"
+                    title="@(HideMetrics ? "Show metrics" : "Hide metrics")" aria-pressed="@(!HideMetrics ? "true" : "false")" @onclick="() => HideMetrics = !HideMetrics" @onclick:stopPropagation="true">№</button>
+            }
+        </div>
+    }
+</div>
+
+@code {
+    [Parameter, EditorRequired] public ResourceNode Node { get; set; } = default!;
+    [Parameter] public bool Disk { get; set; }
+    [Parameter] public bool Controls { get; set; }
+    [Parameter] public bool Graph { get; set; }
+    [Parameter] public bool Metrics { get; set; } = true;
+    [Parameter] public bool Stored { get; set; }
+    [Parameter] public DiskIoBreakdown? Breakdown { get; set; }
+    [Parameter] public IReadOnlyList<ResourcePoint> History { get; set; } = [];
+
+    private bool HideGraph, HideMetrics;
+    private bool Compact => !Controls && !Graph;
+    private bool GraphVisible => Controls ? !HideGraph : Graph;
+    private bool MetricsVisible => Controls ? !HideMetrics : Metrics;
+    private sealed record Metric(string Label, string Unit, string Class, Func<ResourceReading, double?> Read, string? Hint = null);
+    private static readonly Metric[] DiskMetrics = [
+        new("Read", " MiB/s", "read", r => r.Read),
+        new("Write", " MiB/s", "write", r => r.Write),
+        new("Peak active time", "%", "active", r => r.Active)];
+    private static readonly Metric[] CpuMetrics = [
+        new("CPU busy", "%", "read", r => r.Active),
+        new("Windows CPU", "%", "write", r => r.Windows),
+        new("All guest CPU", "%", "guest", r => r.Guests),
+        new("Hypervisor overhead", "%", "active", r => r.Hypervisor)];
+    private static readonly Metric[] VmCpuMetrics =
+    [
+        new("Host CPU", "%", "read", r => r.Active, "The whole VM's measured share of host CPU capacity."),
+        new("Windows vmmem", "%", "guest", r => r.Vmmem, "CPU time charged to the Windows vmmem process over the same host interval.")
+    ];
+    private static readonly Metric[] DistroCpuMetrics =
+    [
+        new("Attributed host CPU", "%", "read", r => r.Active, "CPU attributed to sampled processes in this WSL distribution.")
+    ];
+    private Metric[] AvailableMetrics => Disk ? DiskMetrics : Node.Kind switch
+    {
+        ResourceKind.System or ResourceKind.Host => CpuMetrics,
+        ResourceKind.VirtualMachine => VmCpuMetrics,
+        ResourceKind.GuestCpuDistribution => DistroCpuMetrics,
+        _ => [CpuMetrics[0]]
+    };
+    private bool HasMetrics => Current.Length > 0 || HostIoShare != null || Breakdown.HasValue;
+    private string? HostIoShare => Disk && Node.Kind is not (ResourceKind.System or ResourceKind.Host) && Node.HostShare is double share
+        ? FormatShare(share) : null;
+    private static string FormatShare(double share) => share is > 0 and < .0001 ? $"<{.0001:P2}" : $"{share:P2}";
+    private string? MeasurementHint
+    {
+        get
+        {
+            if (Node.HostShare is double share)
+            {
+                if (!Disk) return $"{FormatShare(share)} of {Node.Host} CPU capacity.";
+                var hint = $"{FormatShare(share)} of {Node.Host} captured read and write bytes.";
+                if (Node.Kind == ResourceKind.GuestDevice) return $"{hint} Guest file rates include cached I/O.";
+                return hint;
+            }
+            return Node.Kind == ResourceKind.GuestDevice ? "Guest file rates include cached I/O. Host share is unavailable." : null;
+        }
+    }
+    private string Label(Metric metric) => Node.Kind switch
+    {
+        ResourceKind.GuestDevice => $"Guest {metric.Label.ToLowerInvariant()}",
+        ResourceKind.Disk when metric.Class == "active" => "Active time",
+        ResourceKind.Disk or ResourceKind.System or ResourceKind.Host
+            when Disk && Breakdown.HasValue && !Stored && metric.Unit != "%" => $"Device {metric.Label.ToLowerInvariant()}",
+        ResourceKind.CpuGroup when Node.MeasuredAt.HasValue => "Host CPU",
+        _ => metric.Label
+    };
+    private Metric[] Current = [], Plotted = [];
+    protected override void OnParametersSet()
+    {
+        var metrics = AvailableMetrics;
+        Current = metrics.Where(metric => Known(metric.Read(Node.Reading))).ToArray();
+        Plotted = !Compact && !Stored
+            ? metrics.Where(metric => HasTrend(metric)).ToArray() : [];
+    }
+    private static bool Known(double? value) => value is double number && double.IsFinite(number);
+    private bool HasTrend(Metric metric)
+    {
+        for (int i = 1; i < History.Count; i++)
+            if (History[i - 1].At < History[i].At && Known(metric.Read(History[i - 1].Reading)) &&
+                Known(metric.Read(History[i].Reading))) return true;
+        return false;
+    }
+    private string Format(Metric metric)
+    {
+        if (metric.Read(Node.Reading) is not double value) return "—";
+        return Disk && value is > 0 and < .005 ? $"<{.01:0.00}{metric.Unit}" : $"{value:0.##}{metric.Unit}";
+    }
+    private static string FormatRate(double value) => value is > 0 and < .005 ? $"<{.01:0.00}" : $"{value:0.##}";
+    private double RateMaximum => Math.Max(1, Math.Max(Math.Max(Node.Reading.Read ?? 0, Node.Reading.Write ?? 0),
+        History.Select(point => Math.Max(point.Reading.Read ?? 0, point.Reading.Write ?? 0)).DefaultIfEmpty().Max()));
+
+    private string PathFor(Metric metric)
+    {
+        if (History.Count == 0) return "";
+        double maximum = metric.Unit == "%" ? 100 : RateMaximum;
+        double seconds = Math.Max(1, (History[^1].At - History[0].At).TotalSeconds);
+        var path = new System.Text.StringBuilder();
+        bool connected = false;
+        foreach (var point in History)
+        {
+            if (metric.Read(point.Reading) is not double value || !double.IsFinite(value)) { connected = false; continue; }
+            var x = 320 * (point.At - History[0].At).TotalSeconds / seconds;
+            var y = 63 - 61 * Math.Clamp(value / maximum, 0, 1);
+            path.Append(FormattableString.Invariant($"{(connected ? 'L' : 'M')}{x:0.##} {y:0.##} "));
+            connected = true;
+        }
+        return path.ToString();
+    }
+}

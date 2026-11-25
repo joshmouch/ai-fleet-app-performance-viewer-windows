@@ -193,10 +193,10 @@ internal sealed class Timeline : Form
     private const int PaddingSize = 16;
     private const int CardGap = 6;
     private const int CardsTop = ChartTop + OverallPanelHeight + CardGap;
-    private const double DiskActivityWindow = 60;
+    private const double DiskActivityWindow = DiskActivity.WindowSeconds;
     private const double MinimumDiskCoverage = 20;
-    private const int DefaultDiskCutoff = 25;
-    private const int DefaultTransferCutoff = 1;
+    private const int DefaultDiskCutoff = DiskActivity.DefaultActiveCutoff;
+    private const int DefaultTransferCutoff = DiskActivity.DefaultTransferCutoff;
     private const string UpdateLabel = "Update every";
     private const string DiskCutoffLabel = "Min active";
     private const string TransferCutoffLabel = "Min I/O";
@@ -517,6 +517,8 @@ internal sealed class Timeline : Form
         diskGrid.AutoScroll = true;
         diskGrid.Visible = false;
         diskGrid.SizeChanged += delegate { ResizeDiskCards(); };
+        diskGrid.MouseClick += ClearDiskSelectionOnBackgroundClick;
+        MouseClick += ClearDiskSelectionOnBackgroundClick;
         Controls.Add(diskGrid);
         diskIoDetails.LayoutChanged += delegate
         {
@@ -1051,10 +1053,11 @@ internal sealed class Timeline : Form
         {
             DiskSummary disk = active[i];
             cards[i].Tag = disk;
+            const string selectionHelp = "Click to show details. Click the selected card again to clear.";
             if (disk.VirtualDisk != null)
             {
                 cards[i].AccessibleName = System.IO.Path.GetFileName(disk.VirtualDisk.Path) + ", " + VirtualDiskLabel(disk);
-                string tip = disk.VirtualDisk.Path + Environment.NewLine + VirtualDiskLabel(disk);
+                string tip = string.Join(Environment.NewLine, disk.VirtualDisk.Path, VirtualDiskLabel(disk), selectionHelp);
                 if (diskCardTips.GetToolTip(cards[i]) != tip)
                     diskCardTips.SetToolTip(cards[i], tip);
                 cards[i].Invalidate();
@@ -1075,6 +1078,7 @@ internal sealed class Timeline : Form
                     lines.Add(identity.Name);
                 lines.Add(identity.Kind + " | " + label);
                 cards[i].AccessibleName = string.Join(", ", lines);
+                lines.Add(selectionHelp);
                 string tip = string.Join(Environment.NewLine, lines);
                 if (diskCardTips.GetToolTip(cards[i]) != tip)
                     diskCardTips.SetToolTip(cards[i], tip);
@@ -1082,7 +1086,8 @@ internal sealed class Timeline : Form
             else
             {
                 cards[i].AccessibleName = label;
-                diskCardTips.SetToolTip(cards[i], null);
+                if (diskCardTips.GetToolTip(cards[i]) != selectionHelp)
+                    diskCardTips.SetToolTip(cards[i], selectionHelp);
             }
             cards[i].Invalidate();
         }
@@ -1092,8 +1097,20 @@ internal sealed class Timeline : Form
         ? Environment.MachineName + " disks"
         : disk.VirtualOwner?.Label is string owner ? owner + " VHDX files" : "VHDX files";
 
+    private void ClearDiskSelectionOnBackgroundClick(object sender, MouseEventArgs e)
+    {
+        if (e.Button == MouseButtons.Left && showingDisks && diskIoDetails.HasSelection)
+            diskIoDetails.SelectAllDisks();
+    }
+
     private void SelectDiskCard(DiskSummary picked)
     {
+        if (selectedDisk == picked.Id)
+        {
+            diskIoDetails.SelectAllDisks();
+            return;
+        }
+
         selectedDisk = picked.Id;
         selectedVirtualDisk = picked.VirtualDisk == null ? null : picked;
         if (picked.VirtualDisk != null)
@@ -1225,15 +1242,10 @@ internal sealed class Timeline : Form
         using (var grid = new Pen(ForeColor))
         using (var line = new Pen(lineColor, 1.5f))
         {
-            var selected = latest?.GetDisk(selectedDisk);
-            string name = selectedVirtualDisk != null ? System.IO.Path.GetFileName(selectedVirtualDisk.VirtualDisk.Path) :
-                selected is { } disk && diskIdentities.TryGetValue(disk.Number, out var identity)
-                    ? identity.AccessPaths?.FirstOrDefault() ?? DiskLabel(selectedDisk)
-                    : selectedDisk == null ? DiskScopeLabel(ActiveDiskScope) : DiskLabel(selectedDisk);
             var diskCards = diskGrid.Controls.OfType<Button>().Select(button => (DiskSummary)button.Tag).ToArray();
             int virtualCount = diskCards.Count(disk => disk.VirtualDisk != null);
             string detail = showingDisks
-                ? diskError ?? (name + (selected.HasValue ? "  ·  " + Percent(selected.Value.Active) + " active" : "") +
+                ? diskError ?? ("Windows disk I/O  |  " + DiskScopeLabel(ActiveDiskScope) +
                     "  |  " + (diskCards.Length - virtualCount) + " disk cards  |  " + DiskActivityWindow + " s average" +
                     (virtualCount > 0 ? "  |  " + virtualCount + " VHDX files" : "") +
                     (diskCards.Length == 0 ? "  |  No cards meet the filters yet" : "") +
@@ -1250,7 +1262,7 @@ internal sealed class Timeline : Form
             grid.Color = Blend(card.Color, ForeColor, 0.22);
             if (showingDisks)
             {
-                DrawDiskDetail(g, latest, muted, grid, line, width, range);
+                DrawDiskOverview(g, latest, muted, grid, line, width, range);
                 return;
             }
 
@@ -1445,65 +1457,46 @@ internal sealed class Timeline : Form
             base.OnMouseWheel(e);
     }
 
-    private void DrawDiskDetail(Graphics g, Sample latest, SolidBrush muted, Pen grid, Pen line, int width, HistoryRange range)
+    private void DrawDiskOverview(Graphics g, Sample latest, SolidBrush muted, Pen grid, Pen line, int width, HistoryRange range)
     {
-        bool virtualDisk = selectedVirtualDisk != null;
-        var historyRows = history.Skip(range.FirstSample).Select(ReadOverviewDisk).ToArray();
-        var current = ReadOverviewDisk(latest);
-        if (virtualDisk && latest != null && current == null && !selectedVirtualDisk.BelowFilter)
-            current = VirtualReading(selectedVirtualDisk);
-        double maxRate = Math.Max(1, Math.Ceiling(Math.Max(Math.Max(current?.Read ?? 0, current?.Write ?? 0),
-            historyRows.Select(row => Math.Max(row?.Read ?? 0, row?.Write ?? 0)).DefaultIfEmpty().Max())));
-        double maxSecondary = virtualDisk ? Math.Max(1, Math.Ceiling(Math.Max(current?.Secondary ?? 0,
-            historyRows.Select(row => row?.Secondary ?? 0).DefaultIfEmpty().Max()))) : 100;
-        string secondaryLabel = virtualDisk ? "Operations/s" : selectedDisk == null ? "Peak active time" : "Active time";
-        string secondaryUnit = virtualDisk ? " ops/s" : "%";
+        var current = ReadHostDisks(latest);
+        double maxRate = Math.Max(1, Math.Ceiling(history.Skip(range.FirstSample).Select(ReadHostDisks)
+            .Select(row => Math.Max(row?.ReadMiB ?? 0, row?.WriteMiB ?? 0)).DefaultIfEmpty().Max()));
         static string Number(double? value) => value?.ToString("0.#") ?? "—";
-        string secondary = Number(current?.Secondary) + (virtualDisk || current == null ? "" : "%");
+        string active = current is { } reading ? Number(reading.Active) + "%" : "—";
         using var writeLine = new Pen(writeLineColor, line.Width);
-        using var secondaryLine = new Pen(muted.Color) { DashStyle = System.Drawing.Drawing2D.DashStyle.Dot };
-        float statsWidth = DrawOverviewStats(g, muted, ("Read MiB/s", Number(current?.Read), Number(maxRate), line.Color),
-            ("Write MiB/s", Number(current?.Write), Number(maxRate), writeLine.Color),
-            (secondaryLabel, secondary, Number(maxSecondary) + (virtualDisk ? "" : "%"), null));
+        using var activeLine = new Pen(muted.Color) { DashStyle = System.Drawing.Drawing2D.DashStyle.Dot };
+        float statsWidth = DrawOverviewStats(g, muted, ("Read MiB/s", Number(current?.ReadMiB), Number(maxRate), line.Color),
+            ("Write MiB/s", Number(current?.WriteMiB), Number(maxRate), writeLine.Color),
+            ("Peak active time", active, "100%", null));
         var chart = OverviewChart(width, statsWidth, g.MeasureString(Number(maxRate), Font).Width + 16,
-            g.MeasureString(Number(maxSecondary) + secondaryUnit, Font).Width + 14);
+            g.MeasureString("100%", Font).Width + 14);
         DrawChartGrid(g, chart, grid);
-        DrawHistory(g, chart, line, range, sample => ReadOverviewDisk(sample)?.Read, maxRate);
-        DrawHistory(g, chart, writeLine, range, sample => ReadOverviewDisk(sample)?.Write, maxRate);
-        DrawHistory(g, chart, secondaryLine, range, sample => ReadOverviewDisk(sample)?.Secondary, maxSecondary);
+        DrawHistory(g, chart, line, range, sample => ReadHostDisks(sample)?.ReadMiB, maxRate);
+        DrawHistory(g, chart, writeLine, range, sample => ReadHostDisks(sample)?.WriteMiB, maxRate);
+        DrawHistory(g, chart, activeLine, range, sample => ReadHostDisks(sample)?.Active);
         DrawAxes(g, chart, muted, range.Duration, maxRate, "");
-        DrawAxisValues(g, chart, muted, maxSecondary, secondaryUnit, right: true);
+        DrawAxisValues(g, chart, muted, 100, "%", right: true);
     }
 
-    private (double Read, double Write, double Secondary)? ReadOverviewDisk(Sample sample)
+    private DiskReading? ReadHostDisks(Sample sample)
     {
-        if (sample == null)
+        if (sample?.Disks == null)
             return null;
-        if (selectedVirtualDisk != null)
-            return sample.VirtualDisks?.GetValueOrDefault(selectedDisk) is { } disk ? VirtualReading(disk) : null;
-        var reading = ReadChartDisk(sample);
-        return reading is { } physical ? (physical.ReadMiB, physical.WriteMiB, physical.Active) : null;
-    }
 
-    private static (double Read, double Write, double Secondary) VirtualReading(DiskSummary disk) =>
-        (disk.Latest.ReadMiB, disk.Latest.WriteMiB, disk.VirtualDisk.Totals.Operations / disk.Coverage);
-
-    private DiskReading? ReadChartDisk(Sample sample)
-    {
-        if (selectedDisk != null)
-            return sample.GetDisk(selectedDisk);
-        if (sample.Disks is not { Count: > 0 } disks)
-            return null;
         var scope = ActiveDiskScope;
-        var included = disks.Values.Where(disk => IncludesDisk(scope, disk.Number)).ToArray();
-        if (included.Length == 0)
-            return null;
-        return new DiskReading
+        var total = new DiskReading();
+        bool hasDisks = false;
+        foreach (var disk in sample.Disks.Values)
         {
-            Active = included.Max(disk => disk.Active),
-            ReadMiB = included.Sum(disk => disk.ReadMiB),
-            WriteMiB = included.Sum(disk => disk.WriteMiB)
-        };
+            if (!IncludesDisk(scope, disk.Number))
+                continue;
+            hasDisks = true;
+            total.Active = Math.Max(total.Active, disk.Active);
+            total.ReadMiB += disk.ReadMiB;
+            total.WriteMiB += disk.WriteMiB;
+        }
+        return hasDisks ? total : null;
     }
 
     private void DrawDiskCard(object sender, PaintEventArgs e)
@@ -1609,9 +1602,18 @@ internal sealed class Timeline : Form
             Font, row, ForeColor, flags);
         row.Offset(0, 18);
         TextRenderer.DrawText(g, TransferRates(disk.Latest), Font, row, ForeColor, flags);
-        row.Offset(0, 18);
+        row.Offset(0, 30);
         TextRenderer.DrawText(g, $"{disk.VirtualDisk.Totals.Operations:N0} operations in {disk.Coverage:0} s",
             Font, row, ForeColor, flags);
+        var chart = new RectangleF(8, 80, card.Width - 16, 12);
+        var range = VisibleHistory();
+        DiskReading? ReadRate(Sample sample) => sample.VirtualDisks?.GetValueOrDefault(disk.Id)?.Latest;
+        double maxRate = Math.Max(1, history.Skip(range.FirstSample).Select(ReadRate)
+            .Select(reading => Math.Max(reading?.ReadMiB ?? 0, reading?.WriteMiB ?? 0)).DefaultIfEmpty().Max());
+        using var readLine = new Pen(lineColor);
+        using var writeLine = new Pen(writeLineColor);
+        DrawHistory(g, chart, readLine, range, sample => ReadRate(sample)?.ReadMiB, maxRate);
+        DrawHistory(g, chart, writeLine, range, sample => ReadRate(sample)?.WriteMiB, maxRate);
         g.DrawRectangle(outline, 1, 1, card.Width - 3, card.Height - 3);
         if (card.Focused)
             ControlPaint.DrawFocusRectangle(g, Rectangle.Inflate(card.ClientRectangle, -4, -4));

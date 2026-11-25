@@ -16,25 +16,35 @@ internal sealed class SourceConfig
 
 internal sealed class WindowSources : BackgroundService
 {
-    private sealed class Source(SourceConfig config)
+    private sealed class Source(SourceConfig config, string? checkout = null)
     {
         public SourceConfig Config { get; } = config;
+        public string? Checkout { get; } = checkout;
         public PerformanceWindow? Frame;
         public GuestDiskWindow? Guest;
         public DateTimeOffset? GuestEnd;
         public string? Status = "Waiting for first sample";
+        public bool Loading = true;
     }
 
     private readonly Source[] sources;
     private readonly object gate = new();
     private readonly IHostApplicationLifetime lifetime;
+    private readonly string? sourceRuntime;
 
     public WindowSources(IConfiguration configuration, IHostApplicationLifetime lifetime)
     {
         this.lifetime = lifetime;
+        sourceRuntime = configuration["ViewerSourceRuntime"];
         var configured = configuration.GetSection("Sources").Get<SourceConfig[]>();
+        if (configured == null && OperatingSystem.IsWindows() && configuration["ViewerSourceCheckout"] is { Length: > 0 } checkout)
+        {
+            sources = [new(new SourceConfig { Name = "Windows checkout", Arguments = ["--collect", "--guests", "--resources", "--interval-windows"] }, checkout)];
+            return;
+        }
         if (configured == null && OperatingSystem.IsWindows())
-            configured = [new() { Name = "Local Windows", Command = "aifleet-performance-viewer.exe", Arguments = ["--collect", "--guests"] }];
+            configured = [new() { Name = "Local Windows", Command = configuration["ViewerCollector"] ?? "aifleet-performance-viewer.exe",
+                Arguments = configuration["ViewerCollector"] == null ? ["--collect", "--guests"] : ["--collect", "--guests", "--resources", "--interval-windows"] }];
         sources = (configured ?? []).Select(c =>
         {
             if (string.IsNullOrWhiteSpace(c.Name) || c.StaleAfterSeconds < 1 ||
@@ -64,7 +74,7 @@ internal sealed class WindowSources : BackgroundService
                 bool scoped = s.Frame != null && s.Frame.DiskPaths.Scope != "host";
                 bool selected = !scoped && !stale && (s.Guest != null || (s.Frame != null && claimed.Add(s.Frame.Host)));
                 return new SourceWindow(s.Config.Name, s.Frame, scoped ? "Process-scoped capture; excluded from host aggregate" : s.Status,
-                    replay, stale, selected, s.Config.GuestOf, s.Guest, s.GuestEnd);
+                    replay, stale, selected, s.Config.GuestOf, s.Guest, s.GuestEnd, s.Loading);
             }).ToArray();
             if (last == null || !last.Windows.SequenceEqual(windows))
                 last = new(windows, $"\"{Guid.NewGuid():N}\"");
@@ -83,6 +93,24 @@ internal sealed class WindowSources : BackgroundService
 
     private async Task Run(Source source, CancellationToken stop)
     {
+        var command = source.Config.Command;
+        if (source.Checkout is string checkout)
+        {
+            lock (gate) source.Status = "Building the Windows collector from the checkout…";
+            try
+            {
+                if (sourceRuntime == null || !Path.IsPathFullyQualified(sourceRuntime))
+                    throw new InvalidDataException("Update the installed Source shell to build and run the checkout collector.");
+                command = await WindowsCheckoutCollector.Build(checkout, sourceRuntime, stop);
+                lock (gate) source.Status = "Waiting for the first checkout sample";
+            }
+            catch (OperationCanceledException) when (stop.IsCancellationRequested) { return; }
+            catch (Exception error) when (error is IOException or UnauthorizedAccessException or Win32Exception or InvalidDataException)
+            {
+                lock (gate) { source.Status = error.Message; source.Loading = false; }
+                return; // The source watcher will restart the server on the next source edit.
+            }
+        }
         while (!stop.IsCancellationRequested)
         {
             try
@@ -91,11 +119,16 @@ internal sealed class WindowSources : BackgroundService
                 {
                     using var reader = File.OpenText(path);
                     await ReadFrames(source, reader, stop);
-                    lock (gate) source.Status = source.Frame == null && source.Guest == null ? source.Status ?? "Empty replay" : "Replay complete";
+                    lock (gate)
+                    {
+                        if (source.Loading) source.Status = "No samples in this replay.";
+                        else if (source.Status == null) source.Status = "Replay complete";
+                        source.Loading = false;
+                    }
                     return;
                 }
 
-                var start = new ProcessStartInfo(source.Config.Command!)
+                var start = new ProcessStartInfo(command!)
                 {
                     UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true,
                     RedirectStandardInput = source.Config.GuestOf != null
@@ -112,7 +145,7 @@ internal sealed class WindowSources : BackgroundService
                     }
                     await ReadFrames(source, process.StandardOutput, stop);
                     await process.WaitForExitAsync(stop);
-                    lock (gate) source.Status = $"Collector exited ({process.ExitCode})";
+                    lock (gate) { source.Status = $"Collector exited ({process.ExitCode})"; source.Loading = false; }
                 }
                 finally
                 {
@@ -136,7 +169,7 @@ internal sealed class WindowSources : BackgroundService
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or Win32Exception or
                 System.Text.Json.JsonException or InvalidDataException)
             {
-                lock (gate) source.Status = ex.Message;
+                lock (gate) { source.Status = ex.Message; source.Loading = false; }
                 if (source.Config.ReplayFile != null) return;
             }
             await Task.Delay(TimeSpan.FromSeconds(5), stop);
@@ -154,7 +187,7 @@ internal sealed class WindowSources : BackgroundService
                     throw new InvalidDataException("Expected a guest disk sample.");
                 if (sample.Errors.TryGetValue("root", out var error))
                 {
-                    lock (gate) { source.Guest = null; source.GuestEnd = null; source.Status = error; }
+                    lock (gate) { source.Guest = null; source.GuestEnd = null; source.Status = error; source.Loading = false; }
                     continue;
                 }
                 if (!sample.Samples.TryGetValue("root", out var root) || root?.Rows == null || root.Seconds <= 0)
@@ -174,6 +207,7 @@ internal sealed class WindowSources : BackgroundService
                     source.Guest = guest;
                     source.GuestEnd = sample.End ?? DateTimeOffset.UtcNow;
                     source.Status = null;
+                    source.Loading = false;
                 }
                 continue;
             }
@@ -184,6 +218,7 @@ internal sealed class WindowSources : BackgroundService
                 if (previous?.Capture == frame.Capture && previous.Sequence >= frame.Sequence) continue;
                 source.Frame = frame;
                 source.Status = null;
+                source.Loading = false;
             }
         }
     }
