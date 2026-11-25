@@ -132,8 +132,7 @@
                 if (!Disk) return $"{FormatShare(share)} of {Node.Host} CPU capacity.";
                 var hint = $"{FormatShare(share)} of {Node.Host} captured read and write bytes.";
                 if (Node.Kind == ResourceKind.GuestDevice) return $"{hint} Guest file rates include cached I/O.";
-                return Compact && Node.Kind == ResourceKind.Disk
-                    ? $"{hint} Physical rates and active time are averaged over up to {DiskActivity.WindowSeconds}s." : hint;
+                return hint;
             }
             return Node.Kind == ResourceKind.GuestDevice ? "Guest file rates include cached I/O. Host share is unavailable." : null;
         }
@@ -141,7 +140,7 @@
     private string Label(Metric metric) => Node.Kind switch
     {
         ResourceKind.GuestDevice => $"Guest {metric.Label.ToLowerInvariant()}",
-        ResourceKind.Disk when Compact => metric.Class == "active" ? "Avg active" : $"Avg {metric.Label.ToLowerInvariant()}",
+        ResourceKind.Disk when metric.Class == "active" => "Active time",
         ResourceKind.Disk or ResourceKind.System or ResourceKind.Host
             when Disk && Breakdown.HasValue && !Stored && metric.Unit != "%" => $"Device {metric.Label.ToLowerInvariant()}",
         ResourceKind.CpuGroup when Node.MeasuredAt.HasValue => "Host CPU",

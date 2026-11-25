@@ -54,7 +54,8 @@
     </div>
     @if (DetailsOpen)
     {
-        <ResourceDetails Node="Node" Read="ReadDetails" Disk="Disk" BandPercent="BandPercent" SortChanged="SortChanged" />
+        <ResourceDetails Node="Node" Read="ReadDetails" Disk="Disk" BandPercent="BandPercent" SortChanged="SortChanged"
+            FolderSelected="FolderSelected" />
     }
     @if (Children.Length > 0)
     {
@@ -63,7 +64,7 @@
             {
                 <ResourceCard @key="child.Node.Id" Node="child.Node" Disk="Disk" SelectedId="@SelectedId" VisibleChildren="VisibleChildren"
                     ReadHistory="ReadHistory" ReadDetails="ReadDetails" BandPercent="BandPercent" Selection="Selection" Scope="Scope"
-                    CardReading="child.Reading" SortChanged="SortChanged" />
+                    CardReading="child.Reading" SortChanged="SortChanged" FolderSelected="FolderSelected" />
             }
         </div>
     }
@@ -80,7 +81,7 @@
                     aria-label="Resize the details pane with the pointer or arrow keys"></button>
             }
             <ResourceDetails Node="Node" Read="ReadDetails" Disk="Disk" BandPercent="BandPercent" Close="CloseFromPane"
-                SortChanged="SortChanged" />
+                SortChanged="SortChanged" FolderSelected="FolderSelected" />
         </div>
     }
 </article>
@@ -89,10 +90,11 @@
     [Parameter, EditorRequired] public ResourceNode Node { get; set; } = default!;
     [Parameter, EditorRequired] public Func<ResourceNode, ResourceCardEntry[]> VisibleChildren { get; set; } = default!;
     [Parameter, EditorRequired] public Func<string, IReadOnlyList<ResourcePoint>> ReadHistory { get; set; } = default!;
-    [Parameter, EditorRequired] public Func<ResourceNode, bool, Task<ResourceDetailTable>> ReadDetails { get; set; } = default!;
+    [Parameter, EditorRequired] public Func<ResourceNode, ResourceDetailView, DiskPathFolder?, Task<ResourceDetailTable>> ReadDetails { get; set; } = default!;
     [Parameter] public string? SelectedId { get; set; }
     [Parameter] public EventCallback<string?> Selection { get; set; }
     [Parameter] public EventCallback<string> Scope { get; set; }
+    [Parameter] public EventCallback<(ResourceNode Node, DiskPathFolder Folder)> FolderSelected { get; set; }
     [Parameter] public bool Disk { get; set; }
     [Parameter] public bool Overview { get; set; }
     [Parameter] public bool Stored { get; set; }

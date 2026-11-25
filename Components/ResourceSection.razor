@@ -16,6 +16,7 @@
             if (Disk) { BuildDiskCards(scope); }
             <ResourceCard @key="scope.Id" Node="scope" Disk="Disk" Overview="true" Stored="Archive.Active" SelectedId="@selected"
                 VisibleChildren="ReadChildren" ReadHistory="ReadHistory" ReadDetails="ReadDetails"
+                FolderSelected="ChangeFolderScope"
                 EmptyCards="@EmptyCards" Breakdown="@ReadBreakdown()"
                 BandPercent="@Math.Clamp(Preferences.Band ?? 0, 0, 100)" Selection="Select" Scope="ChangeScope"
                 SortChanged="ChangeSort"
@@ -58,6 +59,10 @@
     private ElementReference section;
     private string? scopeFocus;
     private string? localScopeId;
+    private DiskPathFolder? folderScope;
+    private ResourceNode? folderOrigin;
+    private ResourceNode? folderNode;
+    private int folderRequest;
     private ResourceScope? appliedScope;
     private DiskGrouping previousGrouping;
     private string previousHost = "";
@@ -94,7 +99,9 @@
                         yield return host;
                 }
             }
-            foreach (var parent in PathTo(sharedRoot, scope.Id).SkipLast(1)) yield return parent;
+            var baseId = folderOrigin?.Id ?? scope.Id;
+            var path = PathTo(sharedRoot, baseId).ToArray();
+            foreach (var parent in folderScope.HasValue ? path : path.SkipLast(1)) yield return parent;
         }
     }
     private string? EmptyCards
@@ -113,7 +120,7 @@
     private IEnumerable<PerformanceWindow> Frames => Sources.Where(s => s.Selected && s.Frame != null &&
         (Preferences.Host.Length == 0 || string.Equals(Preferences.Host, s.Frame.Host, StringComparison.OrdinalIgnoreCase))).Select(s => s.Frame!);
 
-    protected override void OnParametersSet()
+    protected override async Task OnParametersSetAsync()
     {
         if (!Visible) return;
         bool populationChanged = previousHost != Preferences.Host || Disk && previousAllDisks != Preferences.AllDisks;
@@ -128,8 +135,10 @@
             appliedScope = SharedScope;
             localScopeId = null;
             selected = null;
+            ClearFolderScope();
         }
         Refresh();
+        await RefreshFolderScope();
     }
     private void Refresh()
     {
@@ -150,25 +159,70 @@
         scope = localScopeId == null ? sharedRoot :
             ResourceTree.Walk(sharedRoot).FirstOrDefault(node => node.Id == localScopeId) ?? sharedRoot;
         if (scope.Id == sharedRoot.Id) localScopeId = null;
+        if (folderNode != null)
+        {
+            scope = folderNode;
+            nodes[scope.Id] = scope;
+        }
         if (selected != null && !nodes.ContainsKey(selected)) selected = null;
         if (Archive.Active || frames.Length == 0) return;
         var latest = frames.Max(frame => Disk ? frame.DiskPaths.End : frame.CpuEnd);
-        var seconds = frames.Max(frame => frame.Cpu.Seconds);
+        var seconds = frames.Max(frame => Disk ? frame.DiskPaths.Seconds : frame.Cpu.Seconds);
         foreach (var node in nodes.Values)
-        {
-            var at = node.MeasuredAt ?? latest;
-            if (!points.TryGetValue(node.Id, out var samples)) points.Add(node.Id, samples = []);
-            if (samples.Count > 0 && samples[^1].At > at) samples.Clear();
-            var point = new ResourcePoint(at, node.Reading, seconds);
-            if (samples.Count > 0 && samples[^1].At == at) samples[^1] = point;
-            else
-            {
-                if (samples.Count == 60) samples.RemoveAt(0);
-                samples.Add(point);
-            }
-        }
+            if (node.Kind != ResourceKind.Folder) TrackPoint(node, latest, seconds);
         foreach (var key in points.Keys.Where(key => !nodes.ContainsKey(key)).ToArray())
             points.Remove(key);
+    }
+    private void TrackPoint(ResourceNode node, DateTimeOffset latest, double seconds)
+    {
+        var at = node.MeasuredAt ?? latest;
+        if (!points.TryGetValue(node.Id, out var samples)) points.Add(node.Id, samples = []);
+        if (samples.Count > 0 && samples[^1].At > at) samples.Clear();
+        var point = new ResourcePoint(at, node.Reading, seconds);
+        if (samples.Count > 0 && samples[^1].At == at) samples[^1] = point;
+        else
+        {
+            if (samples.Count == 60) samples.RemoveAt(0);
+            samples.Add(point);
+        }
+    }
+    private void ClearFolderScope()
+    {
+        folderRequest++;
+        if (folderNode != null) points.Remove(folderNode.Id);
+        folderNode = null;
+        folderScope = null;
+        folderOrigin = null;
+    }
+    private Task ChangeFolderScope((ResourceNode Node, DiskPathFolder Folder) selection)
+    {
+        folderOrigin = selection.Node.Kind == ResourceKind.Folder ? folderOrigin : selection.Node;
+        if (folderNode != null) points.Remove(folderNode.Id);
+        folderScope = selection.Folder;
+        selected = null;
+        scopeFocus = "";
+        return RefreshFolderScope();
+    }
+    private async Task RefreshFolderScope()
+    {
+        if (folderScope is not { } folder || folderOrigin is not { } origin) return;
+        int request = ++folderRequest;
+        origin = nodes.GetValueOrDefault(origin.Id) ?? origin;
+        folderOrigin = origin;
+        var files = await ReadDiskProjection(origin, paths: true);
+        if (request != folderRequest) return;
+        var totals = DiskPathMeasurement.Sum(files.Where(folder.Includes));
+        var rate = totals.Physical ?? totals.Guest;
+        var frame = Frames.FirstOrDefault(frame => frame.Host.Equals(folder.Host, StringComparison.OrdinalIgnoreCase));
+        var hostRate = frame != null ? ResourceDiskScope.Breakdown(frame, null, Preferences.AllDisks)?.Total.Total : null;
+        double? share = totals.Physical is { } physical && hostRate > 0 ? Math.Clamp(physical.Total / hostRate.Value, 0, 1) : null;
+        var reading = rate is { } measured ? new ResourceReading(Read: measured.Read, Write: measured.Write) :
+            frame?.DiskPaths is { Seconds: > 0, Status: null } ? new ResourceReading(Read: 0, Write: 0) : default;
+        folderNode = new("folder/" + origin.Id + "/" + folder.Id, folder.Path, folder.Environment, ResourceKind.Folder,
+            reading, [], folder.Host, origin.Disk, Machine: folder.Environment, HostShare: share);
+        scope = folderNode;
+        nodes[scope.Id] = scope;
+        if (!Archive.Active && frame != null) TrackPoint(scope, frame.DiskPaths.End, frame.DiskPaths.Seconds);
     }
     private ViewNotice? ReadNotice(bool hasFrames)
     {
@@ -195,6 +249,7 @@
         bool returning = Ancestors.Any(node => node.Id == id);
         scopeFocus = returning ? scope.Id : "";
         selected = null;
+        ClearFolderScope();
         if (ResourceTree.SharedScope(next) is { } shared) return SharedScopeChanged.InvokeAsync(shared);
         localScopeId = id;
         scope = next;
@@ -245,32 +300,19 @@
                     .Select(child => new ResourceCardEntry(child.Node, child.Reading))
                     .ToArray();
             }
-            var reading = node.Kind is ResourceKind.Host or ResourceKind.Disk ? AverageDiskCounters(node) : node.Reading;
+            var reading = node.Reading;
             bool passes = DiskActivity.MeetsCutoffs(reading, Preferences.MinDiskActivity, Preferences.MinRate);
             return (node, reading, children.Length > 0 || passes && matches);
         }
     }
 
-    private ResourceReading AverageDiskCounters(ResourceNode node)
-    {
-        var history = ReadHistory(node.Id);
-        if (history.Count == 0) return node.Reading;
-        var cutoff = history[^1].At.AddSeconds(-DiskActivity.WindowSeconds);
-        var intervals = history.Select((point, i) =>
-        {
-            var start = point.At.AddSeconds(-Math.Clamp(point.Seconds, 0, DiskActivity.WindowSeconds));
-            if (i > 0 && start < history[i - 1].At) start = history[i - 1].At;
-            return (point.Reading, (point.At - (start < cutoff ? cutoff : start)).TotalSeconds);
-        });
-        return DiskActivity.Average(intervals);
-    }
     private IReadOnlyList<ResourcePoint> ReadHistory(string id) => Archive.Active ? [] : points.GetValueOrDefault(id) ?? [];
     private static bool Matches(string? text, string filter) => filter.Length == 0 ||
         text?.Contains(filter, StringComparison.OrdinalIgnoreCase) == true;
     private bool Matches(string? text) => Matches(text, Filter);
 
-    private Task<ResourceDetailTable> ReadDetails(ResourceNode node, bool paths) =>
-        Disk ? ReadDisk(node, paths) : Task.FromResult(ReadCpu(node));
+    private Task<ResourceDetailTable> ReadDetails(ResourceNode node, ResourceDetailView view, DiskPathFolder? branch) =>
+        Disk ? ReadDisk(node, view, branch) : Task.FromResult(ReadCpu(node));
     private IEnumerable<PerformanceWindow> FramesFor(ResourceNode node) => Frames.Where(frame =>
         node.Host == null || string.Equals(frame.Host, node.Host, StringComparison.OrdinalIgnoreCase));
     private static string Format(double? value) => value?.ToString("N2", CultureInfo.CurrentCulture) ?? "—";
@@ -326,34 +368,49 @@
         return combined;
     }
 
-    private async Task<ResourceDetailTable> ReadDisk(ResourceNode node, bool paths)
+    private async Task<ResourceDetailTable> ReadDisk(ResourceNode node, ResourceDetailView view, DiskPathFolder? branch)
     {
-        bool guestOnly = node.Kind == ResourceKind.GuestDevice || Archive.Active && Archive.Window?.Layer == "guest-logical";
+        var origin = node.Kind == ResourceKind.Folder ? folderOrigin ?? node : node;
+        var folder = node.Kind == ResourceKind.Folder ? folderScope : null;
+        bool guestOnly = origin.Kind == ResourceKind.GuestDevice || Archive.Active && Archive.Window?.Layer == "guest-logical";
+        bool paths = view != ResourceDetailView.Processes;
         var metrics = ResourceDetailTable.DiskMetrics(guestOnly);
         var sort = guestOnly && Sort == "impact" ? "guest" : Sort;
         var limit = Preferences.MaxRows;
         var filter = Filter;
-        var note = Archive.Active ? null : string.Join(" · ", FramesFor(node)
+        var frames = FramesFor(node).ToArray();
+        var note = Archive.Active ? null : string.Join(" · ", frames
             .Select(frame => frame.DiskPaths.Status).OfType<string>().Where(status => !string.IsNullOrWhiteSpace(status)).Distinct());
-        var files = await ReadDiskProjection(node, paths).ConfigureAwait(false);
-        DiskGuestRate? hostSum = null, guestSum = null;
-        var rows = files.Select(row =>
-        {
-            var (machine, key, physical, guest) = row;
-            bool eligible = Matches(key.Process, filter) || Matches(key.Path, filter) || Matches(machine, filter);
-            if (eligible && physical is { } hostRate) hostSum = hostSum.GetValueOrDefault() + hostRate;
-            if (eligible && guest is { } guestRate) guestSum = guestSum.GetValueOrDefault() + guestRate;
-            return (Eligible: eligible, Row: row);
-        });
-        var table = ResourceDetailTable.Rank(metrics, rows, (row, column) => row.Value(column, guestOnly),
-            row => new ResourceDetailRow(ResourceDetailTable.Identity(row.Key.Process, row.Key.Pid, row.Machine, paths ? row.Key : null),
-                Enumerable.Range(0, metrics.Length).Select(column => row.Value(column, guestOnly)).ToArray()), sort, limit,
-            string.IsNullOrEmpty(note) ? null : note, paths: paths);
-        string? summary = hostSum is { } host ? DiskSummary("Host", host) : null;
-        if (guestSum is { } guestTotals)
-            summary = summary == null ? DiskSummary("Guest files", guestTotals)
-                : $"{summary} · Guest files {Format(guestTotals.Total)} MiB/s";
-        return table with { Summary = summary };
+        IEnumerable<DiskPathMeasurement> files = await ReadDiskProjection(origin, paths || folder.HasValue).ConfigureAwait(false);
+        var within = branch ?? folder;
+        if (within is { } scope) files = files.Where(scope.Includes);
+        if (!paths && folder.HasValue)
+            files = files.GroupBy(file => (file.Host, file.Environment, Key: file.File.ProcessKey)).Select(group =>
+            {
+                var total = DiskPathMeasurement.Sum(group);
+                return new DiskPathMeasurement(group.Key.Host, group.Key.Environment, group.Key.Key, total.Physical, total.Guest);
+            });
+        bool Eligible(DiskPathMeasurement row) => Matches(row.File.Process, filter) ||
+            Matches(row.File.Path, filter) || Matches(row.Environment, filter);
+        var matched = files.Where(Eligible).ToArray();
+        var totals = DiskPathMeasurement.Sum(matched);
+        var rows = view == ResourceDetailView.Folders
+            ? DiskPathHierarchy.Rows(matched, within).Select(row => (Eligible: true, Row: row))
+            : files.Select(file => (Eligible: Eligible(file), Row: (Folder: (DiskPathFolder?)null, Measurement: file)));
+        var table = ResourceDetailTable.Rank(metrics, rows, (row, column) => DiskValue(row.Measurement, column, guestOnly),
+            row => new ResourceDetailRow(row.Folder is { } directory
+                    ? ["", directory.Name, directory.Path, "", directory.Environment]
+                    : ResourceDetailTable.Identity(row.Measurement.File.Process, row.Measurement.File.Pid, row.Measurement.Environment,
+                        paths ? row.Measurement.File : null),
+                Enumerable.Range(0, metrics.Length).Select(column => DiskValue(row.Measurement, column, guestOnly)).ToArray(),
+                Folder: row.Folder), sort, limit, string.IsNullOrEmpty(note) ? null : note, paths: paths);
+        var seconds = Archive.Window?.DurationSeconds() ?? frames.Select(frame => frame.DiskPaths.Seconds).DefaultIfEmpty().Max();
+        var hostSummary = totals.Physical is { } host ? DiskSummary("Host", host) : null;
+        var guestSummary = totals.Guest is { } guest ? hostSummary == null ? DiskSummary("Guest files", guest)
+            : $"Guest files {Format(guest.Total)} MiB/s" : null;
+        var summary = string.Join(" · ", new[] { seconds > 0 && totals.Physical.HasValue ? $"{seconds:0.#} s sample" : null,
+            hostSummary, guestSummary }.OfType<string>());
+        return table with { Summary = summary.Length == 0 ? null : summary };
     }
 
     private static string DiskSummary(string basis, DiskGuestRate rate) =>
@@ -361,33 +418,30 @@
         + $"Write {Format(rate.Write)} MiB/s / {Count(rate.Writes)} ops · "
         + $"Total {Format(rate.Total)} MiB/s / {Count(rate.Reads + rate.Writes)} ops";
 
-    private sealed record FileRow(string Machine, FileIoKey Key, DiskGuestRate? Physical, DiskGuestRate? Guest)
+    private static double? DiskValue(DiskPathMeasurement row, int column, bool guestOnly)
     {
-        public double? Value(int column, bool guestOnly)
+        var io = guestOnly ? row.Guest : row.Physical;
+        return column switch
         {
-            var io = guestOnly ? Guest : Physical;
-            return column switch
-            {
-                0 => Physical?.Total, 1 => Guest?.Total, 2 => io?.Read, 3 => io?.Write,
-                4 => io?.Reads, 5 => io?.Writes, 6 => io?.Reads + io?.Writes,
-                _ => throw new ArgumentOutOfRangeException(nameof(column))
-            };
-        }
+            0 => row.Physical?.Total, 1 => row.Guest?.Total, 2 => io?.Read, 3 => io?.Write,
+            4 => io?.Reads, 5 => io?.Writes, 6 => io?.Reads + io?.Writes,
+            _ => throw new ArgumentOutOfRangeException(nameof(column))
+        };
     }
 
     private sealed record DiskProjectionInput(SourceWindow[] Sources, PerformanceWindow[] Frames,
         ViewerPreferences Visibility, HistorySelection Archive);
-    private sealed record DiskBatch(DiskIoRow[] Rows, double? Seconds);
+    private sealed record DiskBatch(string Host, DiskIoRow[] Rows, double? Seconds);
     private sealed class DiskProjection(Task<DiskBatch[]> batches)
     {
-        private readonly Lazy<Task<FileRow[]>> paths = new(() => GroupBatches(batches, true));
-        private readonly Lazy<Task<FileRow[]>> processes = new(() => GroupBatches(batches, false));
-        public Task<FileRow[]> Read(bool byPath) => byPath ? paths.Value : processes.Value;
-        private static Task<FileRow[]> GroupBatches(Task<DiskBatch[]> batches, bool byPath) =>
-            Task.Run(async () => (await batches).SelectMany(batch => Group(batch.Rows, batch.Seconds, byPath)).ToArray());
+        private readonly Lazy<Task<DiskPathMeasurement[]>> paths = new(() => GroupBatches(batches, true));
+        private readonly Lazy<Task<DiskPathMeasurement[]>> processes = new(() => GroupBatches(batches, false));
+        public Task<DiskPathMeasurement[]> Read(bool byPath) => byPath ? paths.Value : processes.Value;
+        private static Task<DiskPathMeasurement[]> GroupBatches(Task<DiskBatch[]> batches, bool byPath) =>
+            Task.Run(async () => (await batches).SelectMany(batch => Group(batch, byPath)).ToArray());
     }
 
-    private Task<FileRow[]> ReadDiskProjection(ResourceNode node, bool paths)
+    private Task<DiskPathMeasurement[]> ReadDiskProjection(ResourceNode node, bool paths)
     {
         if (projectionInput is not { } input || !ReferenceEquals(input.Sources, Sources) || input.Archive != Archive ||
             input.Visibility.Host != Preferences.Host || input.Visibility.AllDisks != Preferences.AllDisks ||
@@ -423,7 +477,7 @@
                     var row = r.ToDiskRow(physical ? stored.Host : stored.Scope);
                     return physical ? row : row with { Guest = DiskGuestRate.From(row.Totals, seconds) };
                 });
-                yield return new(entries.ToArray(), physical ? seconds : null);
+                yield return new(stored.Host, entries.ToArray(), physical ? seconds : null);
             }
             yield break;
         }
@@ -433,34 +487,34 @@
             if (node.Kind == ResourceKind.GuestDevice)
             {
                 foreach (var guest in ResourceDiskScope.DeviceWindows(frame, node))
-                    yield return new(GuestFiles(guest).ToArray(), null);
+                    yield return new(frame.Host, GuestFiles(guest).ToArray(), null);
                 continue;
             }
             if (frame.DiskPaths.Seconds <= 0) continue;
             var entries = ResourceDiskScope.Rows(frame, node, target => input.Visibility.IncludesGuest(frame.Host, target),
                 input.Visibility.AllDisks);
-            yield return new(entries, frame.DiskPaths.Seconds);
+            yield return new(frame.Host, entries, frame.DiskPaths.Seconds);
         }
         // A standalone guest source has no Windows backing-file identity.
         if (node.Kind is not (ResourceKind.System or ResourceKind.Host)) yield break;
         foreach (var source in input.Sources.Where(s => s.Selected && s.GuestOf != null && s.GuestDisk != null &&
             (node.Host == null || node.Host == s.GuestOf) && input.Visibility.IncludesGuest(s.GuestOf!, s.Name) &&
             !input.Frames.Any(w => w.Host == s.GuestOf && (w.Guests?.Disks ?? []).Any(d => d.Target == s.Name && d.Files.Length > 0))))
-            yield return new(GuestFiles(source.GuestDisk!).ToArray(), null);
+            yield return new(source.GuestOf!, GuestFiles(source.GuestDisk!).ToArray(), null);
     }
     private static IEnumerable<DiskIoRow> GuestFiles(GuestDiskWindow guest) => guest.Seconds <= 0 ? [] : guest.Files.Select(f =>
         new DiskIoRow(f.File, guest.Machine, default, DiskGuestRate.From(f.Totals, guest.Seconds)));
 
-    private static IEnumerable<FileRow> Group(IEnumerable<DiskIoRow> rows, double? seconds, bool paths)
+    private static IEnumerable<DiskPathMeasurement> Group(DiskBatch batch, bool paths)
     {
-        foreach (var g in rows.GroupBy(row => (row.Machine, Key: paths ? row.Key : row.Key.ProcessKey)))
+        foreach (var g in batch.Rows.GroupBy(row => (row.Machine, Key: paths ? row.Key : row.Key.ProcessKey)))
         {
-            var physical = seconds.HasValue ? DiskGuestRate.From(DiskIoMerge.Sum(g.Select(row => row.Totals)), seconds.Value)
+            var physical = batch.Seconds is double seconds ? DiskGuestRate.From(DiskIoMerge.Sum(g.Select(row => row.Totals)), seconds)
                 : (DiskGuestRate?)null;
             DiskGuestRate? guest = null;
             foreach (var row in g)
                 if (row.Guest is { } rate) guest = guest.GetValueOrDefault() + rate;
-            yield return new(g.Key.Machine, g.Key.Key, physical, guest);
+            yield return new(batch.Host, g.Key.Machine, g.Key.Key, physical, guest);
         }
     }
 }

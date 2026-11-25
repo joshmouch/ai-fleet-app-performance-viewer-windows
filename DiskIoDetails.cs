@@ -103,7 +103,9 @@ internal sealed class VolumeFileIo : IDisposable
     private readonly object lifecycle = new();
     private readonly object samples = new();
     private readonly Queue<Bucket> buckets = new();
+    private readonly bool frameIntervals;
     private Bucket currentBucket;
+    private long previousFrame;
     private readonly Dictionary<int, string> processes = new();
     // Kernel-File creates name an individual open. A later filesystem event gives that
     // open's stream key, which Kernel-Disk reports in its FileObject field.
@@ -192,8 +194,9 @@ internal sealed class VolumeFileIo : IDisposable
         DateTimeOffset End, Dictionary<FileIoKey, FileIoTotals> VirtualPaths = null, DiskFileMeasurement[] DiskFiles = null);
     public sealed record VirtualSnapshot(VirtualDiskIo[] Entries, double Seconds, string Status, int EventsLost);
 
-    public VolumeFileIo(bool details, int[] virtualDisks, VolumePathIndex index)
+    public VolumeFileIo(bool details, int[] virtualDisks, VolumePathIndex index, bool frameIntervals = false)
     {
+        this.frameIntervals = frameIntervals;
         scope = new TraceScope(details, virtualDisks, index);
         detailStarted = virtualStarted = Stopwatch.GetTimestamp();
         // Run blocks for the whole trace, so it gets its own thread rather than pinning a thread-pool thread.
@@ -626,8 +629,8 @@ internal sealed class VolumeFileIo : IDisposable
         {
             if (selection != scope)
                 return;
-            Trim(now);
-            if (currentBucket == null || currentBucket.Second != second)
+            if (!frameIntervals) Trim(now);
+            if (currentBucket == null || !frameIntervals && currentBucket.Second != second)
             {
                 eventsLost = source.EventsLost;
                 currentBucket = new Bucket(second);
@@ -685,9 +688,9 @@ internal sealed class VolumeFileIo : IDisposable
             long traceStart = System.Threading.Volatile.Read(ref started);
             long start = traceStart == 0 ? 0 : Math.Max(traceStart, detailStarted);
             long bucketEdge = (now - WindowSeconds) / BucketSeconds * BucketSeconds;
-            long floor = Math.Max(start, bucketEdge * Stopwatch.Frequency);
+            long floor = Math.Max(start, frameIntervals ? previousFrame : bucketEdge * Stopwatch.Frequency);
             seconds = start == 0 ? 0 : Math.Max(0, Stopwatch.GetElapsedTime(floor, timestamp).TotalSeconds);
-            Trim(now);
+            if (!frameIntervals) Trim(now);
             foreach (var bucket in buckets)
             {
                 if (virtualDisk == null)
@@ -704,9 +707,17 @@ internal sealed class VolumeFileIo : IDisposable
                 // Closed buckets are no longer written. Copy only the live one so
                 // path resolution and aggregation don't block the trace consumer.
                 if (readPaths && bucket.Paths.Count > 0)
-                    pathBuckets.Add(bucket == currentBucket ? new(bucket.Paths) : bucket.Paths);
+                    pathBuckets.Add(!frameIntervals && bucket == currentBucket ? new(bucket.Paths) : bucket.Paths);
                 if (byPath && virtualDisk == null)
                     keyless += bucket.KeylessBytes.Where(entry => Includes(entry.Key)).Sum(entry => entry.Value);
+            }
+            if (frameIntervals)
+            {
+                // The next completion opens a new interval. File names and request
+                // identities stay alive so an open file can span multiple frames.
+                previousFrame = timestamp;
+                currentBucket = null;
+                buckets.Clear();
             }
         }
         var pending = queryOpenFiles && readPaths ? new Dictionary<int, long>() : null;

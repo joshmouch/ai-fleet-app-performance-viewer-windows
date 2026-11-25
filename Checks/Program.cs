@@ -35,8 +35,23 @@ Check(measuredDisk.Disk == 2 && owner.Kind == ResourceKind.VirtualMachine && own
     vhdx.BackingPath == backing.Path && vhdx.Type == null, "storage volume contains the owning VM and its VHDX");
 Check(diskTree.Reading is { Active: 46, Read: 8, Write: 12 } && vhdx.Reading.Active == null,
     "device counters exclude backing layers and VHDX active time stays unavailable");
-var average = DiskActivity.Average([(new(60, 3, 9), 20), (new(30, null, 0), 40)]);
-Check(average is { Active: 40, Read: 3, Write: 3 }, "disk average weights elapsed time and preserves missing rates");
+DiskPathMeasurement[] directoryFixture =
+[
+    new(host, host, new(4, "System", @"D:\Source\one"), new(1, 2, 3, 4), null),
+    new(host, host, new(8, "node", @"d:\source\installed\one"), new(6, 8, 10, 12), null),
+    new(host, host, new(4, "System", @"D:\Source-backup\one"), new(1, 1), null),
+    new(host, host, new(4, "System", ""), new(1, 1), null),
+    new(host, "guest-one", new(4, "system", "/var/app/one"), new(1, 1), new(9, 18)),
+    new(host, "guest-two", new(4, "system", "/var/app/one"), new(1, 1), new(2, 4))
+];
+var directories = DiskPathHierarchy.Rows(directoryFixture, null).ToArray();
+var sourceFolder = directories.Single(row => row.Folder?.Path == @"D:\Source\");
+var insideSource = DiskPathHierarchy.Rows(directoryFixture, sourceFolder.Folder).ToArray();
+Check(directories.Length == 5 && insideSource.Length == 2 &&
+    sourceFolder.Measurement.Physical == new DiskGuestRate(7, 10, 13, 16) &&
+    DiskPathMeasurement.Sum(insideSource.Select(row => row.Measurement)).Physical == sourceFolder.Measurement.Physical &&
+    DiskPathMeasurement.Sum(directories.Select(row => row.Measurement)) == DiskPathMeasurement.Sum(directoryFixture),
+    "folder groups keep unresolved rows, preserve totals at each level and keep guest paths separate");
 Check(!DiskActivity.MeetsCutoffs(new(0, 0, 0), 0, 0) &&
     !DiskActivity.MeetsCutoffs(new(24, 8, 1), 25, 1) &&
     !DiskActivity.MeetsCutoffs(new(40, 0, .5), 25, 1) &&

@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 
 internal sealed class WindowsResourceCounters : IDisposable
@@ -8,6 +9,7 @@ internal sealed class WindowsResourceCounters : IDisposable
     private readonly CpuCounters cpu = TryOpen(() => new CpuCounters());
     private readonly DiskCounters disks = TryOpen(() => new DiskCounters());
     private readonly HyperVHostCounters hypervisor = TryOpen(() => new HyperVHostCounters());
+    private readonly Dictionary<(int Number, string Path), long> virtualDisks = new();
 
     public WindowsResourceCounters(Dictionary<int, DiskIdentity> inventory) => this.inventory = inventory;
 
@@ -41,8 +43,13 @@ internal sealed class WindowsResourceCounters : IDisposable
             return new DiskResourceMeasurement(number, identity?.Name ?? $"Disk {number}", identity?.Kind,
                 identity?.AccessPaths ?? [], identity?.IsStorageSpaces ?? false, rate?.ReadMiB, rate?.WriteMiB, rate?.Active);
         }).ToArray();
-        var backing = files.Where(row => FileIoKey.IsVirtualDisk(row.File.Path))
-            .Select(row => (row.Number, Path: VmDiskIo.Normalize(row.File.Path))).Distinct()
+        var now = Stopwatch.GetTimestamp();
+        foreach (var row in files)
+            if (FileIoKey.IsVirtualDisk(row.File.Path))
+                virtualDisks[(row.Number, VmDiskIo.Normalize(row.File.Path))] = now;
+        foreach (var old in virtualDisks.Where(x => Stopwatch.GetElapsedTime(x.Value, now).TotalSeconds >= VolumeFileIo.WindowSeconds).ToArray())
+            virtualDisks.Remove(old.Key);
+        var backing = virtualDisks.Keys
             .Select(row =>
             {
                 var owner = guests?.FindOwner(row.Path);

@@ -4,6 +4,7 @@ namespace PerformanceViewer.Components;
 
 public sealed record ResourcePoint(DateTimeOffset At, ResourceReading Reading, double Seconds);
 public sealed record ResourceCardEntry(ResourceNode Node, ResourceReading Reading);
+public enum ResourceDetailView { Processes, Paths, Folders }
 public sealed record ResourceDetailMetric(string Key, string Label, string Format, string Suffix = "", string? Hint = null,
     bool Sortable = true, Func<ResourceDetailRow, object?>? Denominator = null, string? BandBasis = null,
     string? RequiredScope = null)
@@ -22,7 +23,8 @@ public sealed record ResourceDetailMetric(string Key, string Label, string Forma
     }
 }
 
-public sealed record ResourceDetailRow(string[] Labels, double?[] Values, double Weight = 0, string? Host = null, string? Guest = null);
+public sealed record ResourceDetailRow(string[] Labels, double?[] Values, double Weight = 0, string? Host = null, string? Guest = null,
+    DiskPathFolder? Folder = null);
 public sealed record ResourceDetailBand(int? Start, ResourceDetailRow[] Rows)
 {
     public double Weight => Rows.Sum(row => row.Weight);

@@ -4,7 +4,8 @@ using System.Text.Json.Serialization;
 public readonly record struct FileIoKey(int Pid, string Process, string Path)
 {
     [JsonIgnore] public FileIoKey ProcessKey => this with { Path = "" };
-    private int LastSeparator => Math.Max(Path.LastIndexOf('\\'), Path.LastIndexOf('/'));
+    private int LastSeparator => Path.StartsWith('/') ? Path.LastIndexOf('/') :
+        Math.Max(Path.LastIndexOf('\\'), Path.LastIndexOf('/'));
     [JsonIgnore] public string Filename => Path[(LastSeparator + 1)..];
     [JsonIgnore] public string Filepath => Path[..(LastSeparator + 1)];
     public static bool IsVirtualDisk(ReadOnlySpan<char> path) =>

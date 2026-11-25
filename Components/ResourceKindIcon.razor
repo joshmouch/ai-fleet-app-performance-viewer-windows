@@ -66,6 +66,7 @@
         ResourceKind.GuestDevice => Node.Type ?? "Guest device",
         ResourceKind.WindowsIo => "Host file I/O",
         ResourceKind.UnattributedIo => "Unattributed I/O",
+        ResourceKind.Folder => "Folder",
         _ => Node.Type ?? "CPU group"
     };
 }

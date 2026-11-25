@@ -15,13 +15,14 @@ internal static class WindowsSampleStream
     {
         int interval = 10;
         int? disk = null, count = null;
-        bool collectGuests = false, collectResources = false;
+        bool collectGuests = false, collectResources = false, frameIntervals = false;
         string archiveDirectory = null;
         for (int i = 0; i < args.Length; i++)
         {
             string option = args[i];
             if (option == "--guests") { collectGuests = true; continue; }
             if (option == "--resources") { collectResources = true; continue; }
+            if (option == "--interval-windows") { frameIntervals = true; continue; }
             if (option == "--archive" && i + 1 < args.Length && !string.IsNullOrWhiteSpace(args[i + 1]) && !args[i + 1].StartsWith("--"))
             {
                 archiveDirectory = args[++i];
@@ -61,7 +62,7 @@ internal static class WindowsSampleStream
             DateTimeOffset? boot = ReadBoot();
             await using var guestSamples = collectGuests ? new WindowsGuestSamples(index) : null;
             using var resourceCounters = collectResources ? new WindowsResourceCounters(disks) : null;
-            using var capture = new VolumeFileIo(true, Array.Empty<int>(), index);
+            using var capture = new VolumeFileIo(true, Array.Empty<int>(), index, frameIntervals);
             using var output = new StreamWriter(Console.OpenStandardOutput(), new UTF8Encoding(false));
             for (long sequence = 1; !count.HasValue || sequence <= count; sequence++)
             {
@@ -110,7 +111,7 @@ internal static class WindowsSampleStream
 
     private static int Usage()
     {
-        Console.Error.WriteLine("Usage: --collect [--guests] [--resources] [--archive DIRECTORY] [--interval SECONDS] [--disk NUMBER] [--count WINDOWS]");
+        Console.Error.WriteLine("Usage: --collect [--guests] [--resources] [--interval-windows] [--archive DIRECTORY] [--interval SECONDS] [--disk NUMBER] [--count WINDOWS]");
         return 2;
     }
 }

@@ -4,14 +4,21 @@
 <section class="resource-details" aria-label="@($"{Node.Name} details")" @onclick:stopPropagation="true">
     <div class="resource-details-tabs">
         <div class="resource-detail-controls">
-            <button type="button" aria-pressed="@(!Paths ? "true" : "false")" @onclick="() => Show(false)">Processes</button>
-            @if (Disk) { <button type="button" aria-pressed="@(Paths ? "true" : "false")" @onclick="() => Show(true)">Paths</button> }
+            <button type="button" aria-pressed="@(view == ResourceDetailView.Processes ? "true" : "false")"
+                @onclick="() => Show(ResourceDetailView.Processes)">Processes</button>
+            @if (Disk)
+            {
+                <button type="button" aria-pressed="@(view == ResourceDetailView.Paths ? "true" : "false")"
+                    @onclick="() => Show(ResourceDetailView.Paths)">Paths</button>
+                <button type="button" aria-pressed="@(view == ResourceDetailView.Folders ? "true" : "false")"
+                    @onclick="() => Show(ResourceDetailView.Folders)">Folders</button>
+            }
         </div>
         <div class="resource-detail-facts">
             @if (BandPercent > 0 && data?.SortMetric is { } sort && Data.Rows.Length > 0)
             {
                 <span class="resource-band-coverage"
-                    title="Bands use the sorted column's total across all rows in this scope, including rows hidden by search or Top rows. Each row stays whole.">
+                    title="Bands use the sorted column's total before the Top rows limit. Expanded folder contents are included in their parent total.">
                     @if (Data.BandIssue is string issue) { @issue }
                     else
                     {
@@ -37,7 +44,7 @@
     </div>
     @if (Loading)
     {
-        <MeasurementNotice Title="@(Paths ? "Loading paths" : "Loading processes")" Loading="true" />
+        <MeasurementNotice Title="@($"Loading {view.ToString().ToLowerInvariant()}")" Loading="true" />
     }
     else if (Data.Note is string note)
     {
@@ -46,6 +53,7 @@
     @if (!Loading && Data.Rows.Length > 0)
     {
         var labels = Data.LabelColumns;
+        if (view == ResourceDetailView.Folders) labels = ["Process", "File / folder", "Folder", "PID", "Environment"];
         <div class="scroll" tabindex="0" role="region" aria-label="@(Paths ? "Path rankings" : "Process rankings")">
             <table class="@(Paths ? "resource-path-rankings" : null)">
                 <thead><tr>
@@ -65,42 +73,8 @@
                         </th>
                     }
                 </tr></thead>
-                <tbody>
-                @foreach (var group in Data.Bands(BandPercent))
-                {
-                    @if (group.Start is int start)
-                    {
-                        <tr class="resource-band" title="The range shows where these rows start in the running total. The actual share is the sum of these rows divided by the scope total.">
-                            <th colspan="@(Paths ? 2 : labels.Length)" scope="row">
-                                @start–@(Math.Min(100, start + BandPercent))% start · @ResourceDetailTable.FormatShare(group.Weight / Data.TotalWeight) actual
-                            </th>
-                            @if (Paths) { <td colspan="@(labels.Length - 2)" aria-hidden="true"></td> }
-                            @for (int column = 0; column < Data.Metrics.Length; column++)
-                            { <td class="num">@Data.Metrics[column].Display(Data.Metrics[column].Subtotal(group.Rows, column))</td> }
-                        </tr>
-                    }
-                    @foreach (var row in group.Rows)
-                    {
-                        var fullPath = Paths && row.Labels[2].Length > 0 ? row.Labels[2] + row.Labels[1] : null;
-                        <tr data-copy-row="" tabindex="@(fullPath == null ? "0" : null)">
-                            @for (int index = 0; index < row.Labels.Length; index++)
-                            {
-                                var label = row.Labels[index];
-                                <td class="resource-cell" title="@label">
-                                    @if (index == 1 && fullPath != null)
-                                    {
-                                        <button type="button" class="file-path-button" data-full-path="@fullPath"
-                                            aria-label="@($"Show full path for {label}")" aria-haspopup="dialog">@label</button>
-                                    }
-                                    else { @label }
-                                </td>
-                            }
-                            @for (int column = 0; column < Data.Metrics.Length; column++)
-                            { <td class="num">@Data.Metrics[column].Display(row.Values[column])</td> }
-                        </tr>
-                    }
-                }
-                </tbody>
+                <tbody><ResourceDetailRows Data="Data" BandPercent="BandPercent" Expanded="expanded"
+                    Branches="branches" Toggle="ToggleFolder" Scope="OpenFolder" /></tbody>
             </table>
         </div>
     }
@@ -109,29 +83,47 @@
 
 @code {
     [Parameter, EditorRequired] public ResourceNode Node { get; set; } = default!;
-    [Parameter, EditorRequired] public Func<ResourceNode, bool, Task<ResourceDetailTable>> Read { get; set; } = default!;
+    [Parameter, EditorRequired] public Func<ResourceNode, ResourceDetailView, DiskPathFolder?, Task<ResourceDetailTable>> Read { get; set; } = default!;
     [Parameter] public bool Disk { get; set; }
     [Parameter] public int BandPercent { get; set; }
     [Parameter] public EventCallback Close { get; set; }
     [Parameter] public EventCallback<string> SortChanged { get; set; }
-    private bool Paths;
+    [Parameter] public EventCallback<(ResourceNode Node, DiskPathFolder Folder)> FolderSelected { get; set; }
+    private ResourceDetailView view;
+    private bool Paths => view != ResourceDetailView.Processes;
+    private readonly Dictionary<string, DiskPathFolder> expanded = new();
+    private IReadOnlyDictionary<string, ResourceDetailTable> branches = new Dictionary<string, ResourceDetailTable>();
     private ResourceDetailTable? data;
     private ResourceDetailTable Data => data!;
     private bool Loading => data == null;
     private int request;
-    protected override void OnInitialized() => Paths = Disk;
+    protected override void OnInitialized() => view = Node.Kind == ResourceKind.Folder ? ResourceDetailView.Folders :
+        Disk ? ResourceDetailView.Paths : ResourceDetailView.Processes;
     protected override Task OnParametersSetAsync() => Refresh();
-    private Task Show(bool paths)
+    private Task Show(ResourceDetailView next)
     {
-        if (Paths == paths) return Task.CompletedTask;
-        Paths = paths;
+        if (view == next) return Task.CompletedTask;
+        view = next;
+        expanded.Clear();
         data = null;
         return Refresh();
     }
+    private Task ToggleFolder(DiskPathFolder folder)
+    {
+        if (!expanded.TryAdd(folder.Id, folder))
+            foreach (var key in expanded.Keys.Where(key => key.StartsWith(folder.Id, StringComparison.Ordinal)).ToArray())
+                expanded.Remove(key);
+        return Refresh();
+    }
+    private Task OpenFolder(DiskPathFolder folder) => FolderSelected.InvokeAsync((Node, folder));
     private async Task Refresh()
     {
         int version = ++request;
-        var next = await Read(Node, Paths);
-        if (version == request) data = next;
+        var next = Read(Node, view, null);
+        var open = await Task.WhenAll(expanded.Values.Select(async folder => (folder.Id, Table: await Read(Node, view, folder))));
+        var table = await next;
+        if (version != request) return;
+        branches = open.ToDictionary(x => x.Id, x => x.Table);
+        data = table;
     }
 }

@@ -1,6 +1,6 @@
 #nullable enable
 
-public enum ResourceKind { System, Host, CpuGroup, Processor, Disk, WindowsIo, UnattributedIo, VirtualMachine, GuestCpuDistribution, VirtualDisk, GuestDevice }
+public enum ResourceKind { System, Host, CpuGroup, Processor, Disk, WindowsIo, UnattributedIo, VirtualMachine, GuestCpuDistribution, VirtualDisk, GuestDevice, Folder }
 public enum DiskGrouping { Storage, Workloads, Vhdx }
 
 public sealed record ResourceScope(string? Host = null, string? Target = null, string? Machine = null)

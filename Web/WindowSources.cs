@@ -39,12 +39,12 @@ internal sealed class WindowSources : BackgroundService
         var configured = configuration.GetSection("Sources").Get<SourceConfig[]>();
         if (configured == null && OperatingSystem.IsWindows() && configuration["ViewerSourceCheckout"] is { Length: > 0 } checkout)
         {
-            sources = [new(new SourceConfig { Name = "Windows checkout", Arguments = ["--collect", "--guests", "--resources"] }, checkout)];
+            sources = [new(new SourceConfig { Name = "Windows checkout", Arguments = ["--collect", "--guests", "--resources", "--interval-windows"] }, checkout)];
             return;
         }
         if (configured == null && OperatingSystem.IsWindows())
             configured = [new() { Name = "Local Windows", Command = configuration["ViewerCollector"] ?? "aifleet-performance-viewer.exe",
-                Arguments = configuration["ViewerCollector"] == null ? ["--collect", "--guests"] : ["--collect", "--guests", "--resources"] }];
+                Arguments = configuration["ViewerCollector"] == null ? ["--collect", "--guests"] : ["--collect", "--guests", "--resources", "--interval-windows"] }];
         sources = (configured ?? []).Select(c =>
         {
             if (string.IsNullOrWhiteSpace(c.Name) || c.StaleAfterSeconds < 1 ||
